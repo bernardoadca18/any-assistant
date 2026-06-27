@@ -1,17 +1,13 @@
 """
 app/main.py
 ===========
-Ponto de entrada da aplicação FastAPI.
+Ponto de entrada da aplicação FastAPI — Fase 2.
 
-Responsabilidades:
-- Configuração do lifespan (startup / shutdown)
-- Inicialização ordenada das conexões (Qdrant → Redis)
-- Registro dos routers
-- Middleware (CORS, logging de requests)
-- Documentação OpenAPI
+Atualização: lifespan agora inicializa o EmbeddingService (cliente HTTP
+para Ollama) além do Qdrant e Redis.
 
-Princípio: este arquivo é o "composition root" — orquestra dependências,
-mas não contém lógica de negócio.
+Ordem de startup: Qdrant → Redis → EmbeddingService
+Ordem de shutdown (inversa): EmbeddingService → Redis → Qdrant
 """
 
 from __future__ import annotations
@@ -29,32 +25,27 @@ from app.core.config import settings
 from app.core.logging import setup_logging
 from app.db.qdrant import close_qdrant, init_qdrant
 from app.db.redis import close_redis, init_redis
+from app.services.ai.embedding_service import close_embedding_client, init_embedding_client
 
-# ---------------------------------------------------------------------------
-# Logging — configurado ANTES de qualquer outro import que possa logar
-# ---------------------------------------------------------------------------
 setup_logging()
 log = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Lifespan — substitui @app.on_event (deprecated no FastAPI moderno)
-# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     Gerencia o ciclo de vida da aplicação.
 
-    STARTUP (ordem importa — Qdrant antes do Redis para fail-fast):
-        1. Conecta ao Qdrant e valida a coleção 'ue5_docs'
-        2. Conecta ao Redis do agente
+    STARTUP:
+        1. Qdrant  — valida coleção 'ue5_docs'
+        2. Redis   — pool de conexões para sessões
+        3. Ollama  — cliente HTTP para embeddings
 
     SHUTDOWN (ordem inversa):
-        1. Fecha Redis
-        2. Fecha Qdrant
+        1. Ollama client fechado
+        2. Redis fechado
+        3. Qdrant fechado
     """
-    # --- STARTUP ---
     log.info("=" * 60)
     log.info("Iniciando %s v%s [%s]", settings.app_name, settings.app_version, settings.app_env)
     log.info("=" * 60)
@@ -73,35 +64,36 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         log.error("FALHA ao conectar Redis: %s", exc)
         startup_errors.append(f"Redis: {exc}")
 
+    try:
+        await init_embedding_client()
+    except Exception as exc:
+        log.error("FALHA ao inicializar EmbeddingService: %s", exc)
+        startup_errors.append(f"EmbeddingService: {exc}")
+
     if startup_errors:
         log.warning(
-            "Aplicação iniciada com %d erro(s) de dependência. "
-            "Algumas funcionalidades podem estar indisponíveis: %s",
+            "Aplicação iniciada com %d erro(s) de dependência: %s",
             len(startup_errors),
             "; ".join(startup_errors),
         )
     else:
         log.info("Todas as dependências conectadas. Aplicação pronta ✓")
-        log.info("LiteLLM proxy: %s", settings.litellm_base_url)
-        log.info("Qdrant:        %s (coleção: %s)", settings.qdrant_url, settings.qdrant_collection)
-        log.info("Redis:         %s:%d", settings.redis_host, settings.redis_port)
+        log.info("LiteLLM: %s", settings.litellm_base_url)
+        log.info("Qdrant:  %s (coleção: %s)", settings.qdrant_url, settings.qdrant_collection)
+        log.info("Redis:   %s:%d", settings.redis_host, settings.redis_port)
+        log.info("Ollama:  %s (model: %s)", settings.ollama_base_url, settings.embedding_model)
 
-    # Cede controle para a aplicação
     yield
 
-    # --- SHUTDOWN ---
     log.info("Encerrando aplicação...")
+    await close_embedding_client()
     await close_redis()
     await close_qdrant()
     log.info("Shutdown concluído.")
 
 
-# ---------------------------------------------------------------------------
-# Instância da aplicação
-# ---------------------------------------------------------------------------
-
 def create_app() -> FastAPI:
-    """Factory function — facilita testes (cada teste pode criar sua própria app)."""
+    """Factory function — facilita testes unitários."""
 
     app = FastAPI(
         title=settings.app_name,
@@ -112,15 +104,11 @@ def create_app() -> FastAPI:
             "com precisão técnica, acelerado por modelos locais via Ollama/LiteLLM."
         ),
         lifespan=lifespan,
-        # Em produção, desabilita os endpoints de docs para reduzir surface de ataque
         docs_url="/docs" if settings.is_development else None,
         redoc_url="/redoc" if settings.is_development else None,
         openapi_url="/openapi.json" if settings.is_development else None,
     )
 
-    # --- CORS ----------------------------------------------------------------
-    # Para uso pessoal/local, aceita qualquer origem.
-    # Em produção pública, restrinja para o domínio do frontend.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"] if settings.is_development else ["http://localhost:3000"],
@@ -129,13 +117,10 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # --- Routers -------------------------------------------------------------
     app.include_router(api_router, prefix="/v1")
 
-    # --- Exception Handlers --------------------------------------------------
     @app.exception_handler(Exception)
     async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-        """Garante que exceções não tratadas retornem JSON válido (nunca HTML)."""
         log.exception("Exceção não tratada em %s %s", request.method, request.url.path)
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -145,5 +130,4 @@ def create_app() -> FastAPI:
     return app
 
 
-# Instância global usada pelo Uvicorn
 app: FastAPI = create_app()
