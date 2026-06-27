@@ -1,0 +1,30 @@
+# config/qdrant/config.yaml
+# =============================================================================
+# Configurações de produção do Qdrant para o assistente UE5
+# Documentação: https://qdrant.tech/documentation/guides/configuration/
+# =============================================================================
+
+service:
+  http_port: 6333
+  grpc_port: 6334
+  # Permite acesso de qualquer container na rede interna
+  host: "0.0.0.0"
+
+storage:
+  # Persiste payload em disco (vetores grandes para 1024-dim ficam gerenciáveis)
+  on_disk_payload: true
+
+  # Thresholds para mover vetores para disco
+  # Útil quando a coleção ue5_docs cresce com muitos documentos
+  memmap_threshold: 20000
+
+  # Configurações de HNSW (índice de busca aproximada)
+  hnsw_index:
+    # m: número de conexões por nó. 16 é padrão; ↑ = melhor recall, ↑ RAM
+    m: 16
+    # ef_construct: candidatos durante indexação. ↑ = melhor qualidade, ↓ velocidade de ingestão
+    ef_construct: 100
+    # on_disk: indexação em disco para coleções muito grandes
+    on_disk: false
+
+log_level: INFO
