@@ -3,17 +3,22 @@ app/schemas/chat.py
 ===================
 Schemas Pydantic para os endpoints de chat e RAG.
 
-Os campos de `RetrievedChunk` são 1:1 com o payload gerado pelo
-ue5_rag_ingestor.py para garantir compatibilidade sem conversões extras.
+CORREÇÃO: substituído datetime.utcnow() (deprecated Python 3.12) por
+datetime.now(timezone.utc) com aware datetime.
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, Field
+
+
+def _utcnow() -> datetime:
+    """Retorna o datetime atual em UTC com timezone-aware (Python 3.12 safe)."""
+    return datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +80,7 @@ class ChatResponse(BaseModel):
     )
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 # ---------------------------------------------------------------------------
@@ -95,4 +100,4 @@ class HealthResponse(BaseModel):
     version: str
     environment: str
     dependencies: dict[str, DependencyStatus]
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=_utcnow)

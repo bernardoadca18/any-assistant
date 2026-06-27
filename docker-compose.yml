@@ -1,34 +1,9 @@
-# =============================================================================
-# UE5 AI Assistant — docker-compose.yml
-# =============================================================================
-# Conecta à rede litellm_public (externa) para que o FastAPI possa chamar
-# http://litellm-proxy:4000 sem expor o proxy na internet pública.
-#
-# Estratégia de rede:
-#   litellm_public  → rede externa já existente (bridge para o LiteLLM)
-#   assistant_internal → rede interna deste compose (FastAPI ↔ Qdrant ↔ Redis)
-#
-# Para subir:
-#   docker compose up -d
-# Para subir com reload em desenvolvimento:
-#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
-# =============================================================================
-
 networks:
-  # ------------------------------------------------------------------
-  # Rede INTERNA deste stack — nenhum serviço é acessível de fora
-  # exceto pelos ports mapeados explicitamente abaixo.
-  # ------------------------------------------------------------------
   assistant_internal:
     driver: bridge
     internal: true
     name: assistant_internal
 
-  # ------------------------------------------------------------------
-  # Rede EXTERNA já criada pelo stack do LiteLLM.
-  # "external: true" diz ao Compose para NÃO recriar — apenas referenciar.
-  # O FastAPI entra nessa rede para poder resolver "litellm-proxy" por DNS.
-  # ------------------------------------------------------------------
   litellm_public:
     external: true
     name: litellm_public
@@ -41,32 +16,25 @@ volumes:
     labels:
       description: "Redis for agent session memory and conversation history"
 
-# =============================================================================
-# SERVICES
-# =============================================================================
 services:
 
   # ---------------------------------------------------------------------------
   # QDRANT — Vector Database
   # ---------------------------------------------------------------------------
   qdrant:
-    image: qdrant/qdrant:v1.9.2        # pin de versão para reprodutibilidade
+    image: qdrant/qdrant:v1.9.2
     container_name: ue5-qdrant
     restart: unless-stopped
     environment:
       QDRANT__SERVICE__HTTP_PORT: 6333
       QDRANT__SERVICE__GRPC_PORT: 6334
       QDRANT__LOG_LEVEL: INFO
-      # Habilita payload indexing para o campo doc_type (alinhado ao ingestor)
       QDRANT__STORAGE__ON_DISK_PAYLOAD: "true"
     volumes:
       - qdrant-storage:/qdrant/storage
       - ./config/qdrant/config.yaml:/qdrant/config/production.yaml:ro
     ports:
-      # 6333 exposto no host para que o ue5_rag_ingestor.py (fora do Docker)
-      # continue funcionando com QDRANT_URL = "http://localhost:6333"
       - "6333:6333"
-      # gRPC — exposto apenas localmente; útil para cliente de alta performance no futuro
       - "127.0.0.1:6334:6334"
     networks:
       - assistant_internal
@@ -84,7 +52,7 @@ services:
           memory: 512M
 
   # ---------------------------------------------------------------------------
-  # REDIS — Agent Session Memory (isolado do Redis do LiteLLM)
+  # REDIS — Agent Session Memory
   # ---------------------------------------------------------------------------
   agent-redis:
     image: redis:7-alpine
@@ -125,29 +93,25 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: production          # Multi-stage: "development" para dev, "production" para prod
+      target: production
     container_name: ue5-agent-api
     restart: unless-stopped
     ports:
-      - "8000:8000"               # API REST
+      - "8000:8000"
     env_file:
       - .env
     environment:
-      # --- Internos ao stack ---
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6333"
       QDRANT_COLLECTION: "ue5_docs"
       REDIS_HOST: agent-redis
       REDIS_PORT: "6379"
       REDIS_PASSWORD: ${AGENT_REDIS_PASSWORD}
-      # --- Bridge para o LiteLLM (resolve via DNS da rede litellm_public) ---
       LITELLM_BASE_URL: "http://litellm-proxy:4000"
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
-      # --- Embedding (mesmo modelo do ingestor) ---
       EMBEDDING_MODEL: "mxbai-embed-large"
       EMBEDDING_DIM: "1024"
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-      # --- App ---
       APP_ENV: ${APP_ENV:-production}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
@@ -156,14 +120,12 @@ services:
       agent-redis:
         condition: service_healthy
     extra_hosts:
-      # Permite que o container resolva "host.docker.internal" → IP do host
-      # Necessário para chamar o Ollama que roda nativamente na máquina
       - "host.docker.internal:host-gateway"
     networks:
-      - assistant_internal    # fala com Qdrant e Redis
-      - litellm_public        # fala com litellm-proxy:4000
+      - assistant_internal
+      - litellm_public
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 3

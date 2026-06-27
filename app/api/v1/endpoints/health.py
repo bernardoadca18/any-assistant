@@ -4,14 +4,12 @@ app/api/v1/endpoints/health.py
 Endpoint de health check com verificação ativa de todas as dependências.
 Retorna HTTP 200 se tudo OK, 503 se alguma dependência falhar.
 
-Verificações:
-- Qdrant: GET /collections (latência medida)
-- Redis: PING (latência medida)
-- LiteLLM: GET /health/readiness
+CORREÇÃO: importado asyncio no topo do módulo (não dentro da função).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -53,7 +51,8 @@ async def _check_redis(client: Redis) -> DependencyStatus:
 
 
 async def _check_litellm() -> DependencyStatus:
-    url = f"{settings.litellm_base_url}/health/readiness"
+    # str() necessário porque AnyHttpUrl retorna objeto Url, não str pura
+    url = str(settings.litellm_base_url).rstrip("/") + "/health/readiness"
     try:
         start = time.perf_counter()
         async with httpx.AsyncClient(timeout=5.0) as http:
@@ -88,13 +87,10 @@ async def health_check() -> JSONResponse:
     qdrant_client = get_qdrant_client()
     redis_client = get_redis_client()
 
-    # Executa checks em paralelo para minimizar latência total
-    import asyncio
     qdrant_status, redis_status, litellm_status = await asyncio.gather(
         _check_qdrant(qdrant_client),
         _check_redis(redis_client),
         _check_litellm(),
-        return_exceptions=False,
     )
 
     dependencies = {
@@ -103,7 +99,6 @@ async def health_check() -> JSONResponse:
         "litellm": litellm_status,
     }
 
-    # Status global: degraded se qualquer dep falhar
     has_error = any(d.status == "error" for d in dependencies.values())
     has_degraded = any(d.status == "degraded" for d in dependencies.values())
 
