@@ -1,0 +1,32 @@
+# =============================================================================
+# UE5 AI Assistant — Python Dependencies
+# Versões fixadas para builds reprodutíveis.
+# Para atualizar: pip-compile requirements.in --upgrade
+# =============================================================================
+
+# --- Web Framework -----------------------------------------------------------
+fastapi==0.115.5
+uvicorn[standard]==0.32.1        # inclui uvloop e httptools para performance
+pydantic==2.10.3
+pydantic-settings==2.6.1         # leitura de variáveis de ambiente tipadas
+
+# --- Vector Database ---------------------------------------------------------
+qdrant-client==1.12.1            # versão compatível com Qdrant v1.9.x
+
+# --- Cache / Session ---------------------------------------------------------
+redis[hiredis]==5.2.1            # hiredis: parser C para ~10x throughput
+
+# --- HTTP Client (para chamadas ao LiteLLM) ----------------------------------
+httpx==0.28.1                    # async HTTP, compatível com FastAPI ecosystem
+
+# --- Observabilidade ---------------------------------------------------------
+# prometheus-fastapi-instrumentator==7.0.0   # descomente para expor /metrics
+
+# --- Segurança ---------------------------------------------------------------
+# python-jose[cryptography]==3.3.0   # JWT auth — adicionar na Fase 3
+
+# --- Dev / Test (instalar separadamente em dev) ------------------------------
+# pytest==8.3.4
+# pytest-asyncio==0.24.0
+# httpx==0.28.1                  # já declarado acima (compartilhado)
+# watchfiles==1.0.3              # hot reload do Uvicorn em dev
