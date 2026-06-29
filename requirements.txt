@@ -1,32 +1,31 @@
 # =============================================================================
-# UE5 AI Assistant — Python Dependencies
+# UE5 AI Assistant — Python Dependencies (Fase 2)
 # Versões fixadas para builds reprodutíveis.
-# Para atualizar: pip-compile requirements.in --upgrade
 # =============================================================================
 
 # --- Web Framework -----------------------------------------------------------
 fastapi==0.115.5
-uvicorn[standard]==0.32.1        # inclui uvloop e httptools para performance
+uvicorn[standard]==0.32.1
 pydantic==2.10.3
-pydantic-settings==2.6.1         # leitura de variáveis de ambiente tipadas
+pydantic-settings==2.6.1
 
 # --- Vector Database ---------------------------------------------------------
-qdrant-client==1.12.1            # versão compatível com Qdrant v1.9.x
+qdrant-client==1.12.1
 
 # --- Cache / Session ---------------------------------------------------------
-redis[hiredis]==5.2.1            # hiredis: parser C para ~10x throughput
+redis[hiredis]==5.2.1
 
-# --- HTTP Client (para chamadas ao LiteLLM) ----------------------------------
-httpx==0.28.1                    # async HTTP, compatível com FastAPI ecosystem
+# --- HTTP Client (LiteLLM + Ollama — ambos usam httpx) ----------------------
+httpx==0.28.1
 
-# --- Observabilidade ---------------------------------------------------------
-# prometheus-fastapi-instrumentator==7.0.0   # descomente para expor /metrics
-
-# --- Segurança ---------------------------------------------------------------
-# python-jose[cryptography]==3.3.0   # JWT auth — adicionar na Fase 3
-
-# --- Dev / Test (instalar separadamente em dev) ------------------------------
+# --- Dev / Test --------------------------------------------------------------
+# Descomente para desenvolvimento local (não incluir no container de produção):
 # pytest==8.3.4
 # pytest-asyncio==0.24.0
-# httpx==0.28.1                  # já declarado acima (compartilhado)
-# watchfiles==1.0.3              # hot reload do Uvicorn em dev
+# watchfiles==1.0.3
+
+# --- Observabilidade (opcional) -----------------------------------------------
+# prometheus-fastapi-instrumentator==7.0.0
+
+# --- Segurança ------------------------------------------------------
+# python-jose[cryptography]==3.3.0
