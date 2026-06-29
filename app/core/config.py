@@ -6,6 +6,7 @@ Fonte única de verdade para configurações da aplicação.
 Arquitetura de chamadas de modelo (toda via LiteLLM):
 - Embeddings: FastAPI → LiteLLM /embeddings → Ollama (Windows)
 - Chat/LLM:   FastAPI → LiteLLM /chat/completions → Ollama (Windows)
+- Decomposição: FastAPI → LiteLLM → Gemini 2.0 Flash Lite (query decomposer)
 
 O campo ollama_base_url foi removido do FastAPI — não é mais necessário
 porque o FastAPI nunca chama o Ollama diretamente. Toda comunicação com
@@ -31,7 +32,7 @@ class Settings(BaseSettings):
 
     # --- Aplicação -----------------------------------------------------------
     app_name: str = "UE5 AI Assistant"
-    app_version: str = "0.1.0"
+    app_version: str = "0.2.0"
     app_env: Literal["production", "development", "test"] = "production"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
@@ -63,8 +64,8 @@ class Settings(BaseSettings):
         return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
 
     # --- LiteLLM Proxy -------------------------------------------------------
-    # Ponto único de entrada para TODOS os modelos: LLM + embeddings.
-    # O LiteLLM roteia internamente para o Ollama no Windows.
+    # Ponto único de entrada para TODOS os modelos: LLM + embeddings + decomposição.
+    # O LiteLLM roteia internamente para o Ollama (Windows) ou Gemini (cloud).
     litellm_base_url: str = Field(
         default="http://litellm-proxy:4000",
         description="URL interna do LiteLLM proxy (resolve via DNS da rede litellm_public)",
@@ -96,9 +97,70 @@ class Settings(BaseSettings):
             raise ValueError(f"embedding_dim deve ser um de {allowed}; recebido: {v}")
         return v
 
-    # --- RAG -----------------------------------------------------------------
+    # --- RAG (configurações gerais) ------------------------------------------
     rag_top_k: int = Field(default=5, ge=1, le=20)
-    rag_score_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    rag_score_threshold: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Score mínimo de similaridade coseno para o Naive RAG. "
+            "Não usado no Advanced RAG (o reranker substitui este filtro)."
+        ),
+    )
+
+    # --- Advanced RAG — Query Decomposition ----------------------------------
+    rag_decomposition_enabled: bool = Field(
+        default=True,
+        description=(
+            "Habilita a decomposição de query via LLM. "
+            "Desabilitar faz o pipeline rodar como Naive RAG puro."
+        ),
+    )
+    rag_decomposition_model: str = Field(
+        default="gemini/gemini-2.0-flash-lite",
+        description="Modelo LiteLLM para decomposição de queries (deve ser rápido e barato).",
+    )
+    rag_decomposition_timeout: float = Field(
+        default=12.0,
+        ge=1.0,
+        le=30.0,
+        description="Timeout em segundos para a chamada de decomposição.",
+    )
+
+    # --- Advanced RAG — Retrieval Expansion ----------------------------------
+    rag_retrieval_limit_per_query: int = Field(
+        default=15,
+        ge=5,
+        le=50,
+        description=(
+            "Número de chunks buscados por query no Qdrant antes do reranking. "
+            "Maior = melhor recall, maior latência de rede."
+        ),
+    )
+
+    # --- Advanced RAG — FlashRank Reranker -----------------------------------
+    rag_reranker_enabled: bool = Field(
+        default=True,
+        description=(
+            "Habilita o reranking via FlashRank. "
+            "Requer o pacote 'flashrank' instalado. "
+            "Se falhar, faz fallback para a ordem original do Qdrant."
+        ),
+    )
+    rag_reranker_model: str = Field(
+        default="ms-marco-MiniLM-L-12-v2",
+        description=(
+            "Modelo FlashRank para Cross-Encoder reranking. "
+            "Opções: ms-marco-MiniLM-L-12-v2 (equilibrado), "
+            "ms-marco-MultiBERT-L-12 (multilíngue, maior), "
+            "rank-T5-flan (maior precisão, mais lento)."
+        ),
+    )
+    rag_reranker_cache_dir: str = Field(
+        default="/tmp/flashrank_cache",
+        description="Diretório para cache dos modelos FlashRank (ONNX).",
+    )
 
 
 @lru_cache(maxsize=1)
