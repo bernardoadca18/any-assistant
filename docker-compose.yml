@@ -1,7 +1,6 @@
 networks:
   assistant_internal:
     driver: bridge
-    internal: true
     name: assistant_internal
 
   litellm_public:
