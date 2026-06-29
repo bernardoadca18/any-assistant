@@ -5,28 +5,17 @@ Pipeline de Ingestão RAG — Documentação Unreal Engine 5 (formato .INT.udn)
 
 Este script roda no HOST (WSL/Linux), não dentro do Docker.
 Acessa diretamente:
-  - Ollama em localhost:11434 (ou URL configurável via --ollama-url)
-  - Qdrant em localhost:6333  (ou URL configurável via --qdrant-url)
+  - LiteLLM Proxy em localhost:4000/v1 (ou URL configurável via --litellm-url)
+  - Qdrant em localhost:6333         (ou URL configurável via --qdrant-url)
 
-CORREÇÃO — usa httpx em vez do SDK ollama:
-O SDK ollama tenta conectar em localhost por default e não aceita URL
-customizada de forma simples. Usando httpx com URL configurável, o script
-funciona sem depender do Ollama estar no localhost padrão — basta apontar
-para onde o Ollama estiver acessível (ex: localhost:11434 no WSL).
-
-Uso:
-    python ue5_rag_ingestor.py --docs-dir /caminho/para/UDN
-    python ue5_rag_ingestor.py --docs-dir /caminho/para/UDN --ollama-url http://localhost:11434
-    python ue5_rag_ingestor.py --test "Lumen global illumination"
-
-Dependências (instalar no .venv do host):
-    pip install qdrant-client langchain-text-splitters httpx
+Mapeia automaticamente a chave LITELLM_MASTER_KEY se estiver definida no ambiente.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import sys
 import uuid
@@ -44,7 +33,7 @@ from qdrant_client.http import models as qdrant_models
 # ---------------------------------------------------------------------------
 
 QDRANT_URL: str = "http://localhost:6333"
-OLLAMA_URL: str = "http://localhost:11434"
+LITELLM_URL: str = "http://localhost:4000/v1"
 COLLECTION_NAME: str = "ue5_docs"
 EMBEDDING_MODEL: str = "mxbai-embed-large"
 EMBEDDING_DIM: int = 1024
@@ -105,59 +94,43 @@ class QdrantPoint:
 
 
 # ---------------------------------------------------------------------------
-# Embedding via httpx (Ollama API direta)
+# Embedding via LiteLLM (Padrão OpenAI)
 # ---------------------------------------------------------------------------
 
-def get_embedding(text: str, ollama_url: str) -> list[float]:
+def get_embedding(text: str, litellm_url: str) -> list[float]:
     """
-    Gera embedding chamando a API do Ollama diretamente via httpx.
-
-    Usa a API nativa do Ollama: POST /api/embeddings
-    com body {"model": "...", "prompt": "..."}.
-
-    Args:
-        text: Texto a ser embedado.
-        ollama_url: URL base do Ollama (ex: http://localhost:11434).
-
-    Returns:
-        Lista de floats com dimensão EMBEDDING_DIM.
-
-    Raises:
-        RuntimeError: se o Ollama retornar erro ou resposta inesperada.
+    Gera embedding chamando o LiteLLM proxy usando o padrão OpenAI: POST /v1/embeddings
     """
+    headers = {}
+    master_key = os.getenv("LITELLM_MASTER_KEY")
+    if master_key:
+        headers["Authorization"] = f"Bearer {master_key}"
+
     try:
         resp = httpx.post(
-            f"{ollama_url.rstrip('/')}/api/embeddings",
-            json={"model": EMBEDDING_MODEL, "prompt": text},
+            f"{litellm_url.rstrip('/')}/embeddings",
+            headers=headers,
+            json={"model": EMBEDDING_MODEL, "input": text},
             timeout=120.0,
         )
         resp.raise_for_status()
     except httpx.ConnectError as exc:
         raise RuntimeError(
-            f"Não foi possível conectar ao Ollama em {ollama_url}. "
-            "Verifique se o Ollama está rodando e acessível."
+            f"Não foi possível conectar ao LiteLLM em {litellm_url}. "
+            "Verifique se o container do LiteLLM está rodando de forma saudável."
         ) from exc
     except httpx.HTTPStatusError as exc:
         raise RuntimeError(
-            f"Ollama retornou HTTP {exc.response.status_code}: {exc.response.text[:200]}"
-        ) from exc
-    except httpx.TimeoutException as exc:
-        raise RuntimeError(
-            f"Timeout ao chamar Ollama (model={EMBEDDING_MODEL}). "
-            "O modelo pode estar sendo carregado pela primeira vez."
+            f"LiteLLM retornou HTTP {exc.response.status_code}: {exc.response.text[:200]}"
         ) from exc
 
     data = resp.json()
-    vector = data.get("embedding")
-
-    if not vector or not isinstance(vector, list):
-        raise RuntimeError(f"Ollama retornou resposta sem embedding válido: {data}")
-
-    # Suporte a ambos os formatos (lista plana ou lista de listas)
-    if isinstance(vector[0], list):
-        vector = vector[0]
-
-    return vector
+    try:
+        # Padrão OpenAI: data.data[0].embedding
+        vector = data["data"][0]["embedding"]
+        return vector
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"LiteLLM retornou resposta sem formato OpenAI válido: {data}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -256,13 +229,13 @@ def ensure_collection(client: QdrantClient) -> None:
 def build_points(
     doc: UDNDocument,
     chunks: list[str],
-    ollama_url: str,
+    litellm_url: str,
 ) -> list[QdrantPoint]:
     points: list[QdrantPoint] = []
 
     for idx, chunk in enumerate(chunks):
         try:
-            vector = get_embedding(chunk, ollama_url)
+            vector = get_embedding(chunk, litellm_url)
         except RuntimeError as exc:
             log.warning(
                 "  [SKIP] Chunk %d de '%s' descartado por erro de embedding: %s",
@@ -315,30 +288,28 @@ def flush_batch(client: QdrantClient, batch: list[QdrantPoint]) -> None:
 # Pipeline principal
 # ---------------------------------------------------------------------------
 
-def run_ingestion(docs_dir: Path, qdrant_url: str, ollama_url: str) -> None:
+def run_ingestion(docs_dir: Path, qdrant_url: str, litellm_url: str) -> None:
     log.info("Conectando ao Qdrant em %s...", qdrant_url)
     try:
         qdrant = QdrantClient(url=qdrant_url)
-        # Testa a conexão
         qdrant.get_collections()
     except Exception as exc:
         log.critical("Não foi possível conectar ao Qdrant: %s", exc)
         sys.exit(1)
 
-    log.info("Testando conexão com Ollama em %s...", ollama_url)
+    log.info("Testando conexão com LiteLLM em %s...", litellm_url)
+    headers = {}
+    master_key = os.getenv("LITELLM_MASTER_KEY")
+    if master_key:
+        headers["Authorization"] = f"Bearer {master_key}"
+
     try:
-        r = httpx.get(f"{ollama_url.rstrip('/')}/api/tags", timeout=10.0)
+        r = httpx.get(f"{litellm_url.rstrip('/')}/models", headers=headers, timeout=10.0)
         r.raise_for_status()
-        models = [m["name"] for m in r.json().get("models", [])]
-        log.info("Ollama conectado. Modelos disponíveis: %s", models[:5])
-        if EMBEDDING_MODEL not in " ".join(models):
-            log.warning(
-                "Modelo '%s' pode não estar disponível. "
-                "Execute: ollama pull %s",
-                EMBEDDING_MODEL, EMBEDDING_MODEL,
-            )
+        models = [m["id"] for m in r.json().get("data", [])]
+        log.info("LiteLLM conectado. Modelos disponíveis: %s", models)
     except Exception as exc:
-        log.critical("Não foi possível conectar ao Ollama em %s: %s", ollama_url, exc)
+        log.critical("Não foi possível conectar ao LiteLLM em %s: %s", litellm_url, exc)
         sys.exit(1)
 
     ensure_collection(qdrant)
@@ -384,7 +355,7 @@ def run_ingestion(docs_dir: Path, qdrant_url: str, ollama_url: str) -> None:
         stats["files_processed"] += 1
         stats["total_chunks"] += len(chunks)
 
-        points = build_points(doc, chunks, ollama_url)
+        points = build_points(doc, chunks, litellm_url)
         pending_batch.extend(points)
         flush_if_needed()
 
@@ -404,12 +375,12 @@ def run_ingestion(docs_dir: Path, qdrant_url: str, ollama_url: str) -> None:
 # Busca de validação
 # ---------------------------------------------------------------------------
 
-def test_search(query: str, qdrant_url: str, ollama_url: str, top_k: int = 5) -> None:
+def test_search(query: str, qdrant_url: str, litellm_url: str, top_k: int = 5) -> None:
     log.info("Executando busca de validação: '%s'", query)
 
     try:
         qdrant = QdrantClient(url=qdrant_url)
-        vector = get_embedding(query, ollama_url)
+        vector = get_embedding(query, litellm_url)
     except Exception as exc:
         log.error("Erro durante a busca: %s", exc)
         return
@@ -444,7 +415,7 @@ def test_search(query: str, qdrant_url: str, ollama_url: str, top_k: int = 5) ->
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Pipeline de ingestão RAG para documentação UE5 (.INT.udn) → Qdrant."
+        description="Pipeline de ingestão RAG para documentação UE5 (.INT.udn) → Qdrant via LiteLLM."
     )
     parser.add_argument(
         "--qdrant-url",
@@ -452,9 +423,9 @@ def parse_args() -> argparse.Namespace:
         help=f"URL do Qdrant (padrão: {QDRANT_URL})",
     )
     parser.add_argument(
-        "--ollama-url",
-        default=OLLAMA_URL,
-        help=f"URL do Ollama (padrão: {OLLAMA_URL})",
+        "--litellm-url",
+        default=LITELLM_URL,
+        help=f"URL do LiteLLM Proxy (padrão: {LITELLM_URL})",
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
@@ -477,11 +448,11 @@ if __name__ == "__main__":
     args = parse_args()
 
     if args.test:
-        test_search(args.test, qdrant_url=args.qdrant_url, ollama_url=args.ollama_url)
+        test_search(args.test, qdrant_url=args.qdrant_url, litellm_url=args.litellm_url)
     else:
         docs_path = args.docs_dir.resolve()
         if not docs_path.is_dir():
             log.critical("Diretório não encontrado: %s", docs_path)
             sys.exit(1)
         log.info("Iniciando ingestão a partir de: %s", docs_path)
-        run_ingestion(docs_path, qdrant_url=args.qdrant_url, ollama_url=args.ollama_url)
+        run_ingestion(docs_path, qdrant_url=args.qdrant_url, litellm_url=args.litellm_url)
