@@ -1,5 +1,5 @@
 # =============================================================================
-# UE5 AI Assistant — Python Dependencies (Fase 2)
+# UE5 AI Assistant — Python Dependencies (Fase 3 — Advanced RAG)
 # Versões fixadas para builds reprodutíveis.
 # =============================================================================
 
@@ -18,6 +18,13 @@ redis[hiredis]==5.2.1
 # --- HTTP Client (LiteLLM + Ollama — ambos usam httpx) ----------------------
 httpx==0.28.1
 
+# --- Advanced RAG — Cross-Encoder Reranker -----------------------------------
+# FlashRank: reranker Cross-Encoder extremamente leve, roda em CPU em ~10-50ms.
+# Modelos ONNX embutidos, sem dependência de GPU, sem chamada de API externa.
+# Modelo padrão usado: ms-marco-MiniLM-L-12-v2
+# Documentação: https://github.com/PrithivirajDamodaran/FlashRank
+flashrank==0.2.9
+
 # --- Dev / Test --------------------------------------------------------------
 # Descomente para desenvolvimento local (não incluir no container de produção):
 # pytest==8.3.4
@@ -27,5 +34,5 @@ httpx==0.28.1
 # --- Observabilidade (opcional) -----------------------------------------------
 # prometheus-fastapi-instrumentator==7.0.0
 
-# --- Segurança ------------------------------------------------------
+# --- Segurança ----------------------------------------------------------------
 # python-jose[cryptography]==3.3.0
