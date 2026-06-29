@@ -1,3 +1,7 @@
+# =============================================================================
+# UE5 AI Assistant — docker-compose.yml
+# =============================================================================
+
 networks:
   assistant_internal:
     driver: bridge
@@ -39,11 +43,15 @@ services:
     networks:
       - assistant_internal
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      test: >
+        CMD-SHELL
+        curl -sf http://localhost:6333/healthz
+        && echo "OK"
+        || (curl -s http://localhost:6333/healthz; exit 1)
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      start_period: 20s
     deploy:
       resources:
         limits:
@@ -101,23 +109,18 @@ services:
     env_file:
       - .env
     environment:
-      # --- Internos ao stack ---
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6333"
       QDRANT_COLLECTION: "ue5_docs"
       REDIS_HOST: agent-redis
       REDIS_PORT: "6379"
       REDIS_PASSWORD: ${AGENT_REDIS_PASSWORD}
-      # --- LiteLLM: ponto único para LLM + embeddings ---
       LITELLM_BASE_URL: "http://litellm-proxy:4000"
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
-      # --- Embedding model
       EMBEDDING_MODEL: "mxbai-embed-large"
       EMBEDDING_DIM: "1024"
-      # --- App ---
       APP_ENV: ${APP_ENV:-production}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-
     depends_on:
       qdrant:
         condition: service_healthy
