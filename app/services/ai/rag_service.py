@@ -44,7 +44,7 @@ from redis.asyncio import Redis
 from app.core.config import settings
 from app.schemas.chat import ChatRequest, ChatResponse, RetrievedChunk
 from app.services.ai.embedding_service import embed_text
-from app.services.cache.session_service import build_messages_for_llm, save_turn
+from app.services.ai.session_service import build_messages_for_llm, save_turn
 
 log = logging.getLogger(__name__)
 
