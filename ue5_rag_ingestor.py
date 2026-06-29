@@ -35,7 +35,7 @@ from qdrant_client.http import models as qdrant_models
 QDRANT_URL: str = "http://localhost:6333"
 LITELLM_URL: str = "http://localhost:4000/v1"
 COLLECTION_NAME: str = "ue5_docs"
-EMBEDDING_MODEL: str = "mxbai-embed-large"
+EMBEDDING_MODEL: str = "ollama-embed"
 EMBEDDING_DIM: int = 1024
 
 CHUNK_SIZE: int = 1200
