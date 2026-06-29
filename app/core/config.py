@@ -3,13 +3,15 @@ app/core/config.py
 ==================
 Fonte única de verdade para configurações da aplicação.
 
-CORREÇÕES:
-- litellm_base_url e ollama_base_url agora são str (não AnyHttpUrl).
-  No Pydantic v2, AnyHttpUrl retorna um objeto Url, não str — qualquer
-  f-string ou concatenação com ele produz URLs malformadas silenciosamente.
-  A validação de formato é mantida via field_validator explícito.
-- .python-version indica Python 3.11.9, mas Dockerfile usa 3.12-slim.
-  Adicionado comentário e campo para rastreabilidade.
+Arquitetura de chamadas de modelo (toda via LiteLLM):
+- Embeddings: FastAPI → LiteLLM /embeddings → Ollama (Windows)
+- Chat/LLM:   FastAPI → LiteLLM /chat/completions → Ollama (Windows)
+
+O campo ollama_base_url foi removido do FastAPI — não é mais necessário
+porque o FastAPI nunca chama o Ollama diretamente. Toda comunicação com
+modelos passa pelo LiteLLM proxy, que já tem o Ollama configurado.
+O ingestor (que roda no host WSL) ainda acessa o Ollama diretamente via
+localhost:11434 — isso está correto e não passa por aqui.
 """
 
 from functools import lru_cache
@@ -30,8 +32,6 @@ class Settings(BaseSettings):
     # --- Aplicação -----------------------------------------------------------
     app_name: str = "UE5 AI Assistant"
     app_version: str = "0.1.0"
-    # NOTA: .python-version indica 3.11.9 mas Dockerfile usa python:3.12-slim.
-    # Recomendado: alinhe o .python-version para 3.12.x para evitar divergências.
     app_env: Literal["production", "development", "test"] = "production"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
@@ -63,12 +63,11 @@ class Settings(BaseSettings):
         return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
 
     # --- LiteLLM Proxy -------------------------------------------------------
-    # IMPORTANTE: str, não AnyHttpUrl. No Pydantic v2, AnyHttpUrl não é str
-    # e f-strings com ele geram URLs quebradas (ex: "http://litellm-proxy:4000/health"
-    # vira "http://litellm-proxy:4000//health" com trailing slash inesperado).
+    # Ponto único de entrada para TODOS os modelos: LLM + embeddings.
+    # O LiteLLM roteia internamente para o Ollama no Windows.
     litellm_base_url: str = Field(
         default="http://litellm-proxy:4000",
-        description="URL interna do LiteLLM proxy",
+        description="URL interna do LiteLLM proxy (resolve via DNS da rede litellm_public)",
     )
     litellm_master_key: str = Field(..., description="Master key do LiteLLM — obrigatória")
 
@@ -77,31 +76,17 @@ class Settings(BaseSettings):
     def validate_litellm_url(cls, v: str) -> str:
         if not v.startswith(("http://", "https://")):
             raise ValueError(f"litellm_base_url deve começar com http:// ou https://: {v!r}")
-        return v.rstrip("/")  # remove trailing slash para concatenação segura
+        return v.rstrip("/")
 
     @property
     def litellm_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.litellm_master_key}"}
 
     # --- Embeddings ----------------------------------------------------------
+    # O modelo deve estar configurado no LiteLLM config.yml como um modelo
+    # de embedding (ex: provider = ollama, model = mxbai-embed-large).
     embedding_model: str = "mxbai-embed-large"
     embedding_dim: int = 1024
-    # str, não AnyHttpUrl — mesma razão acima
-    ollama_base_url: str = Field(
-        default="http://host.docker.internal:11434",
-        description="URL do Ollama — host.docker.internal aponta para o host da máquina",
-    )
-
-    @field_validator("ollama_base_url")
-    @classmethod
-    def validate_ollama_url(cls, v: str) -> str:
-        if not v.startswith(("http://", "https://")):
-            raise ValueError(f"ollama_base_url deve começar com http:// ou https://: {v!r}")
-        return v.rstrip("/")
-
-    # --- RAG -----------------------------------------------------------------
-    rag_top_k: int = Field(default=5, ge=1, le=20)
-    rag_score_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
 
     @field_validator("embedding_dim")
     @classmethod
@@ -110,6 +95,10 @@ class Settings(BaseSettings):
         if v not in allowed:
             raise ValueError(f"embedding_dim deve ser um de {allowed}; recebido: {v}")
         return v
+
+    # --- RAG -----------------------------------------------------------------
+    rag_top_k: int = Field(default=5, ge=1, le=20)
+    rag_score_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
 
 
 @lru_cache(maxsize=1)

@@ -1,13 +1,10 @@
 """
 app/main.py
 ===========
-Ponto de entrada da aplicação FastAPI — Fase 2.
+Ponto de entrada da aplicação FastAPI.
 
-Atualização: lifespan agora inicializa o EmbeddingService (cliente HTTP
-para Ollama) além do Qdrant e Redis.
-
-Ordem de startup: Qdrant → Redis → EmbeddingService
-Ordem de shutdown (inversa): EmbeddingService → Redis → Qdrant
+Arquitetura simplificada: todo acesso a modelos (LLM + embeddings)
+passa pelo LiteLLM proxy. Não há mais conexão direta ao Ollama.
 """
 
 from __future__ import annotations
@@ -39,10 +36,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     STARTUP:
         1. Qdrant  — valida coleção 'ue5_docs'
         2. Redis   — pool de conexões para sessões
-        3. Ollama  — cliente HTTP para embeddings
+        3. LiteLLM — cliente HTTP para embeddings e LLM (mesmo proxy)
 
     SHUTDOWN (ordem inversa):
-        1. Ollama client fechado
+        1. LiteLLM client fechado
         2. Redis fechado
         3. Qdrant fechado
     """
@@ -78,10 +75,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
     else:
         log.info("Todas as dependências conectadas. Aplicação pronta ✓")
-        log.info("LiteLLM: %s", settings.litellm_base_url)
+        log.info("LiteLLM: %s (embeddings + LLM)", settings.litellm_base_url)
         log.info("Qdrant:  %s (coleção: %s)", settings.qdrant_url, settings.qdrant_collection)
         log.info("Redis:   %s:%d", settings.redis_host, settings.redis_port)
-        log.info("Ollama:  %s (model: %s)", settings.ollama_base_url, settings.embedding_model)
+        log.info("Embedding model: %s (dim=%d)", settings.embedding_model, settings.embedding_dim)
 
     yield
 
@@ -101,7 +98,7 @@ def create_app() -> FastAPI:
         description=(
             "Assistente de IA especializado em Unreal Engine 5. "
             "Usa RAG sobre a documentação oficial UE5 para responder perguntas "
-            "com precisão técnica, acelerado por modelos locais via Ollama/LiteLLM."
+            "com precisão técnica. Todos os modelos são servidos via LiteLLM proxy."
         ),
         lifespan=lifespan,
         docs_url="/docs" if settings.is_development else None,
