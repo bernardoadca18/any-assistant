@@ -7,12 +7,13 @@ Arquitetura de chamadas de modelo (toda via LiteLLM):
 - Embeddings: FastAPI → LiteLLM /embeddings → Ollama (Windows)
 - Chat/LLM:   FastAPI → LiteLLM /chat/completions → Ollama (Windows)
 - Decomposição: FastAPI → LiteLLM → Gemini 2.0 Flash Lite (query decomposer)
+- Ingestão (Code-to-Doc): FastAPI → LiteLLM → modelo documentador rápido
+  (ver seção "Ingestão" abaixo). Roda DENTRO do próprio container ue5-agent,
+  diferente do antigo ingestor externo que rodava no host WSL.
 
 O campo ollama_base_url foi removido do FastAPI — não é mais necessário
 porque o FastAPI nunca chama o Ollama diretamente. Toda comunicação com
 modelos passa pelo LiteLLM proxy, que já tem o Ollama configurado.
-O ingestor (que roda no host WSL) ainda acessa o Ollama diretamente via
-localhost:11434 — isso está correto e não passa por aqui.
 """
 
 from functools import lru_cache
@@ -160,6 +161,57 @@ class Settings(BaseSettings):
     rag_reranker_cache_dir: str = Field(
         default="/tmp/flashrank_cache",
         description="Diretório para cache dos modelos FlashRank (ONNX).",
+    )
+
+    # --- Ingestão — Pipeline ETL Code-to-Doc ----------------------------------
+    # Endpoint: POST /v1/ingest/process-folder (ver app/services/ai/ingestion_service.py).
+    # Roda DENTRO do próprio container ue5-agent — substitui os antigos
+    # scripts externos de ingestão que rodavam no host WSL.
+    ingestion_documenter_model: str = Field(
+        default="gemini/gemini-2.0-flash-lite",
+        description=(
+            "Modelo LiteLLM usado para transformar headers C++ (.h) em "
+            "documentação Markdown educacional orientada a gameplay (Canal A). "
+            "Deve ser rápido e barato — é chamado uma vez por header relevante."
+        ),
+    )
+    ingestion_batch_size: int = Field(
+        default=32,
+        ge=1,
+        le=256,
+        description=(
+            "Quantidade de chunks acumulados antes de gerar embeddings e "
+            "fazer upsert em lote no Qdrant. Equilibra throughput de rede "
+            "contra uso de memória durante a ingestão."
+        ),
+    )
+    ingestion_embedding_concurrency: int = Field(
+        default=8,
+        ge=1,
+        le=32,
+        description=(
+            "Número máximo de chamadas de embedding simultâneas dentro de "
+            "um mesmo lote. Evita sobrecarregar um Ollama local, que costuma "
+            "ter baixa concorrência efetiva em hardware de desenvolvimento."
+        ),
+    )
+    ingestion_max_chunk_chars: int = Field(
+        default=3000,
+        ge=500,
+        le=20_000,
+        description=(
+            "Rede de segurança: tamanho máximo (em caracteres) de um chunk "
+            "após o split estrutural por headers Markdown. Seções "
+            "excepcionalmente longas são subdivididas por parágrafo para "
+            "não estourar o contexto do modelo de embedding."
+        ),
+    )
+    ingestion_default_ue_version: str = Field(
+        default="5.8",
+        description=(
+            "Versão UE5 usada como fallback quando não é possível extrair "
+            "automaticamente um padrão 'X.Y' do caminho da pasta ingerida."
+        ),
     )
 
 
