@@ -151,3 +151,5 @@ services:
         limits:
           memory: 2G
           cpus: '2.0'
+    volumes:
+      - /mnt/c/Program Files/Epic Games/UE_5.8/Engine:/data/ue5_engine_root:ro
