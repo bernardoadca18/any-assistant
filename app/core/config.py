@@ -86,7 +86,7 @@ class Settings(BaseSettings):
     # --- Embeddings ----------------------------------------------------------
     # O modelo deve estar configurado no LiteLLM config.yml como um modelo
     # de embedding (ex: provider = ollama, model = mxbai-embed-large).
-    embedding_model: str = "mxbai-embed-large"
+    embedding_model: str = "ollama-embed"
     embedding_dim: int = 1024
 
     @field_validator("embedding_dim")
@@ -118,7 +118,7 @@ class Settings(BaseSettings):
         ),
     )
     rag_decomposition_model: str = Field(
-        default="gemini/gemini-2.0-flash-lite",
+        default="gemini/gemini-3.1-flash-lite",
         description="Modelo LiteLLM para decomposição de queries (deve ser rápido e barato).",
     )
     rag_decomposition_timeout: float = Field(

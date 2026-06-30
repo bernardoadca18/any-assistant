@@ -128,7 +128,7 @@ services:
       REDIS_PASSWORD: ${AGENT_REDIS_PASSWORD}
       LITELLM_BASE_URL: "http://litellm-proxy:4000"
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
-      EMBEDDING_MODEL: "mxbai-embed-large"
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-ollama-embed}
       EMBEDDING_DIM: "1024"
       APP_ENV: ${APP_ENV:-production}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
