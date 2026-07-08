@@ -394,10 +394,7 @@ def _split_by_markdown_headers(markdown_text: str) -> list[str]:
 
 def _enforce_max_chunk_size(sections: list[str], max_chars: int) -> list[str]:
     """
-    Rede de segurança (não a estratégia primária de chunking): se uma
-    seção entre headers for excepcionalmente longa, subdivide por
-    parágrafos (linha em branco dupla) agrupando até o limite, para não
-    estourar o contexto do modelo de embedding.
+    Rede de segurança aprimorada: garante que textos nunca sejam cortados e perdidos.
     """
     result: list[str] = []
     for section in sections:
@@ -408,6 +405,14 @@ def _enforce_max_chunk_size(sections: list[str], max_chars: int) -> list[str]:
         paragraphs = section.split("\n\n")
         buffer = ""
         for paragraph in paragraphs:
+            if len(paragraph) > max_chars:
+                if buffer:
+                    result.append(buffer.strip())
+                    buffer = ""
+                for i in range(0, len(paragraph), max_chars):
+                    result.append(paragraph[i:i+max_chars].strip())
+                continue
+
             candidate = f"{buffer}\n\n{paragraph}".strip() if buffer else paragraph
             if len(candidate) > max_chars and buffer:
                 result.append(buffer.strip())
