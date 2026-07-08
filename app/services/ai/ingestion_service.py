@@ -28,6 +28,18 @@ Ambos os canais convergem para o mesmo pipeline de chunking estrutural
 (por headers Markdown), enriquecimento de metadados, geração de embeddings
 em lote e upsert idempotente no Qdrant.
 
+NOTA DE ARQUITETURA — Hybrid RAG com Payload Enriquecido:
+    O embedding em si SEMPRE é gerado a partir do texto semântico em
+    Markdown (via `chunk["text"]`), exatamente como antes — isso preserva
+    a qualidade da busca vetorial. A mudança está no PAYLOAD: cada chunk
+    agora carrega também `raw_content`, o conteúdo ORIGINAL e integral do
+    arquivo-fonte (o header C++ já limpo no Canal A, ou o Markdown .udn já
+    sanitizado no Canal B), sem NUNCA ser embedado. O rag_service.py
+    recupera esse campo junto do resto do payload e o injeta no prompt
+    final como "Referência Direta" — uma segunda fonte, soberana para
+    sintaxe exata (assinaturas, tipos, UPROPERTY/UFUNCTION), que
+    complementa o resumo conceitual gerado pela LLM documentadora.
+
 NOTA DE ARQUITETURA — idioma da documentação gerada:
     O `_DECOMPOSITION_SYSTEM_PROMPT` em rag_service.py já força as
     sub-queries de busca a serem em INGLÊS técnico, porque a documentação
@@ -307,6 +319,7 @@ async def _process_header_file(path: Path, ue_version: str) -> list[dict]:
         doc_type="C++ Source API",
         title=title,
         ue_version=ue_version,
+        raw_content=cleaned,
     )
 
 
@@ -356,6 +369,7 @@ async def _process_udn_file(path: Path, ue_version: str) -> list[dict]:
         doc_type="Official Documentation (.udn)",
         title=title or path.stem,
         ue_version=ue_version,
+        raw_content=clean_text,
     )
 
 
@@ -442,11 +456,32 @@ def _build_chunks_with_metadata(
     doc_type: str,
     title: str,
     ue_version: str,
+    raw_content: str,
 ) -> list[dict]:
     """
     Aplica o chunking estrutural + rede de segurança e monta o payload
     final de cada chunk, já no formato esperado pelo Qdrant (compatível
     com o schema RetrievedChunk consumido por rag_service.py).
+
+    HYBRID RAG — PAYLOAD ENRIQUECIDO:
+        `raw_content` é o conteúdo ORIGINAL e INTEGRAL do arquivo-fonte já
+        limpo (o header C++ inteiro no Canal A, ou o Markdown .udn inteiro
+        já sanitizado no Canal B) — não é fatiado junto com `markdown_text`.
+        Ele é replicado em TODOS os chunks gerados a partir deste arquivo,
+        de propósito: cada chunk continua sendo uma unidade de busca
+        semântica independente (via `text`), mas qualquer um deles, ao ser
+        recuperado, carrega consigo a referência bruta completa para
+        validação sintática em rag_service.py. `raw_content` NUNCA é
+        passado para embed_text() — apenas `text` é embedado.
+
+        Trade-off consciente: para arquivos grandes com muitas seções
+        Markdown, isso duplica `raw_content` entre os chunks do mesmo
+        arquivo (mais espaço em disco no Qdrant, mais tokens no prompt
+        final quando vários chunks do mesmo arquivo são recuperados
+        simultaneamente). Se isso se tornar um problema de custo/latência,
+        uma evolução natural seria armazenar `raw_content` uma única vez
+        por `source_file` (ex: numa coleção/tabela auxiliar) em vez de
+        replicá-lo por chunk.
     """
     sections = _split_by_markdown_headers(markdown_text)
     sections = _enforce_max_chunk_size(sections, settings.ingestion_max_chunk_chars)
@@ -462,6 +497,7 @@ def _build_chunks_with_metadata(
                 "chunk_id": chunk_id,
                 "ue_version": ue_version,
                 "description": "",  # mantém compatibilidade com RetrievedChunk
+                "raw_content": raw_content,
             }
         )
     return chunks
