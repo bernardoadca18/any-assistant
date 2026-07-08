@@ -57,10 +57,10 @@ log = logging.getLogger(__name__)
 _RETRIEVAL_LIMIT_PER_QUERY: int = 15
 
 # Modelo de decomposição padrão (pode ser sobrescrito via settings)
-_DECOMPOSITION_MODEL: str = "gemini/gemini-2.0-flash-lite"
+_DECOMPOSITION_MODEL: str = "gemini-3.1-flash-lite"
 
 # Fallback: se o modelo de decomposição principal retornar erro 4xx/5xx
-_DECOMPOSITION_MODEL_FALLBACK: str = "gemini/gemini-2.0-flash"
+_DECOMPOSITION_MODEL_FALLBACK: str = "gemini-3.1-flash-lite"
 
 # Timeout dedicado para a chamada de decomposição (deve ser rápida)
 _DECOMPOSITION_TIMEOUT: float = 12.0
