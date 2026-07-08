@@ -87,7 +87,18 @@ World Partition, Data Layer).
 4. Quando relevante, mencione qual arquivo de documentação originou a informação.
 5. Responda em Português Brasileiro a menos que o usuário escreva em outro idioma.
 6. Para trechos de código C++ ou Blueprint, use blocos de código formatados.
-7. Nunca invente funções, classes ou parâmetros que não estejam na documentação.\
+7. Nunca invente funções, classes ou parâmetros que não estejam na documentação.
+8. Cada documento de contexto pode conter duas camadas, claramente rotuladas: \
+(A) ANÁLISE SEMÂNTICA — um resumo conceitual gerado a partir do código ou da \
+documentação oficial, que explica a INTENÇÃO e o uso prático dentro do \
+framework do UE5 — e (B) REFERÊNCIA DIRETA — um bloco de código com o \
+conteúdo original e literal (C++ bruto ou Markdown .udn bruto), sem \
+resumo ou interpretação. Use a Análise Semântica para entender COMO e \
+POR QUE algo é usado, mas trate a Referência Direta como a fonte \
+soberana e absoluta sempre que houver qualquer divergência sobre \
+assinaturas exatas de função, tipos de dado, nomes de propriedades \
+(UPROPERTY/UFUNCTION) ou parâmetros — nunca corrija ou substitua o que \
+está na Referência Direta com base na Análise Semântica.\
 """
 
 # ---------------------------------------------------------------------------
@@ -350,6 +361,9 @@ async def retrieve_chunks_for_query(
                     chunk_id=payload.get("chunk_id", 0),
                     ue_version=payload.get("ue_version", ""),
                     doc_type=payload.get("doc_type", ""),
+                    # HYBRID RAG: payload enriquecido — "" para pontos antigos
+                    # ingeridos antes desta mudança (compatibilidade retroativa).
+                    raw_content=payload.get("raw_content", ""),
                 )
             )
         except Exception as exc:
@@ -567,6 +581,9 @@ async def retrieve_chunks(
                     chunk_id=payload.get("chunk_id", 0),
                     ue_version=payload.get("ue_version", ""),
                     doc_type=payload.get("doc_type", ""),
+                    # HYBRID RAG: payload enriquecido — "" para pontos antigos
+                    # ingeridos antes desta mudança (compatibilidade retroativa).
+                    raw_content=payload.get("raw_content", ""),
                 )
             )
         except Exception as exc:
@@ -585,28 +602,77 @@ async def retrieve_chunks(
 # Funções auxiliares de formatação de prompt
 # ---------------------------------------------------------------------------
 
-def _format_context(chunks: list[RetrievedChunk]) -> str:
+def _get_chunk_field(chunk: RetrievedChunk | dict, field: str, default: Any = "") -> Any:
+    """
+    Extração defensiva de um campo de chunk, aceitando tanto instâncias
+    Pydantic de RetrievedChunk quanto dicts brutos (ex: payload cru vindo
+    diretamente do Qdrant em algum caminho alternativo/debug/legado).
+
+    Isolar essa lógica aqui evita duplicar o `isinstance` em todo ponto de
+    _format_context e mantém a função principal legível.
+    """
+    if isinstance(chunk, dict):
+        return chunk.get(field, default)
+    return getattr(chunk, field, default)
+
+
+def _format_context(chunks: list) -> str:
     """
     Formata os chunks recuperados em um bloco de contexto legível para o LLM.
-    Cada chunk inclui título, arquivo de origem e o texto, separados por delimitadores.
+
+    HYBRID RAG COM PAYLOAD ENRIQUECIDO:
+        Cada documento de contexto agora é dividido em duas seções
+        claramente isoladas, para permitir dupla validação pela LLM final:
+
+        A) ANÁLISE SEMÂNTICA — o texto (`chunk.text`) gerado/sanitizado na
+           ingestão, que é o que efetivamente foi embedado e trouxe este
+           chunk para o topo do reranking. Ajuda o modelo a entender a
+           INTENÇÃO de uso da classe/framework.
+        B) REFERÊNCIA DIRETA — o `raw_content` armazenado no payload (código
+           C++ limpo no Canal A, ou Markdown .udn limpo no Canal B),
+           envelopado num bloco de código com a linguagem correta. Só é
+           incluído quando o campo existe e não está vazio (chunks antigos,
+           ingeridos antes desta mudança, simplesmente não têm essa seção).
+
+    Aceita chunks como instâncias de RetrievedChunk (Pydantic) OU como dicts
+    brutos — extração feita via `_get_chunk_field` para tolerar os dois
+    formatos sem levantar AttributeError/KeyError.
     """
     if not chunks:
         return "Nenhum contexto de documentação relevante encontrado."
 
     parts: list[str] = []
     for i, chunk in enumerate(chunks, start=1):
-        source = (
-            chunk.source_file.split("/")[-1]
-            if "/" in chunk.source_file
-            else chunk.source_file
-        )
-        parts.append(
+        text = _get_chunk_field(chunk, "text", "")
+        title = _get_chunk_field(chunk, "title", "Sem título")
+        source_file = _get_chunk_field(chunk, "source_file", "")
+        score = _get_chunk_field(chunk, "score", 0.0)
+        doc_type = _get_chunk_field(chunk, "doc_type", "")
+        raw_content = (_get_chunk_field(chunk, "raw_content", "") or "").strip()
+
+        source = source_file.split("/")[-1] if "/" in source_file else source_file
+
+        block = (
             f"--- DOCUMENTO {i} ---\n"
-            f"Título: {chunk.title}\n"
+            f"Título: {title}\n"
             f"Arquivo: {source}\n"
-            f"Score de relevância: {chunk.score:.4f}\n\n"
-            f"{chunk.text}"
+            f"Score de relevância: {score:.4f}\n\n"
+            f"[A) ANÁLISE SEMÂNTICA]\n"
+            f"{text}"
         )
+
+        if raw_content:
+            # Canal A ("C++ Source API") usa fence ```cpp; qualquer outro
+            # doc_type (Canal B / documentação oficial .udn) usa ```markdown.
+            fence_lang = "cpp" if doc_type == "C++ Source API" else "markdown"
+            block += (
+                f"\n\n[B) REFERÊNCIA DIRETA — verdade absoluta para sintaxe, "
+                f"assinaturas e tipos]\n"
+                f"```{fence_lang}\n{raw_content}\n```"
+            )
+
+        parts.append(block)
+
     return "\n\n".join(parts)
 
 
