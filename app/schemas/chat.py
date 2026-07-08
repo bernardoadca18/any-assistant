@@ -67,6 +67,18 @@ class RetrievedChunk(BaseModel):
     chunk_id: int
     ue_version: str
     doc_type: str
+    raw_content: str = Field(
+        default="",
+        description=(
+            "HYBRID RAG — Conteúdo original bruto (código C++ limpo no "
+            "Canal A, ou Markdown .udn limpo no Canal B) armazenado no "
+            "payload enriquecido do Qdrant. Usado por rag_service.py como "
+            "'Referência Direta' — verdade soberana para assinaturas, "
+            "tipos e nomes exatos. Default '' garante compatibilidade "
+            "retroativa com pontos antigos do Qdrant, ingeridos antes "
+            "desta mudança, que não possuem esse campo no payload."
+        ),
+    )
 
 
 class ChatResponse(BaseModel):
