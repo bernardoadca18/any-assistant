@@ -24,8 +24,10 @@ from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from qdrant_client import AsyncQdrantClient
+from redis.asyncio import Redis
 
 from app.db.qdrant import get_qdrant_client
+from app.db.redis import get_redis_client
 from app.schemas.ingestion import IngestAcceptedResponse, IngestRequest
 from app.services.ai.ingestion_service import process_folder_ingestion
 
@@ -45,7 +47,9 @@ router = APIRouter()
         "uma LLM rápida via LiteLLM para gerar documentação Markdown "
         "educacional; Canal B (.udn) sanitiza a documentação oficial via "
         "regex, sem chamada de LLM. O processamento roda em background — "
-        "esta chamada retorna imediatamente (HTTP 202)."
+        "esta chamada retorna imediatamente (HTTP 202). Um manifesto de "
+        "checkpoint no Redis garante que arquivos já indexados (hash "
+        "inalterado) sejam ignorados em reingestões subsequentes."
     ),
     tags=["ingestion"],
 )
@@ -53,6 +57,7 @@ async def process_folder(
     payload: IngestRequest,
     background_tasks: BackgroundTasks,
     qdrant: AsyncQdrantClient = Depends(get_qdrant_client),
+    redis: Redis = Depends(get_redis_client),
 ) -> IngestAcceptedResponse:
     """
     - **folder_path**: caminho ABSOLUTO dentro do container `ue5-agent`
@@ -85,6 +90,7 @@ async def process_folder(
         folder_path=str(folder),
         content_type=payload.content_type,
         qdrant=qdrant,
+        redis=redis,
         ue_version_override=payload.ue_version,
     )
 
