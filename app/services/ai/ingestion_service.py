@@ -79,30 +79,6 @@ NOTA DE ARQUITETURA — Manifesto de Checkpoint via Redis (idempotência):
     disso, o arquivo simplesmente não aparece (ou aparece com o hash
     antigo) no manifesto, e será reprocessado integralmente na próxima
     execução — nunca há um "meio-termo" mentiroso no checkpoint.
-
-    TRADE-OFF CONSCIENTE — ordem "deletar órfãos antes de reprocessar":
-        Para um arquivo cujo hash mudou, os chunks antigos são removidos
-        do Qdrant (filtro por `source_file`) ANTES de a nova versão ser
-        processada e re-inserida. Isso evita definitivamente chunks órfãos
-        (ex: a versão antiga gerava 5 seções/chunks, a nova gera 3 — os 2
-        excedentes nunca seriam sobrescritos pelos IDs determinísticos
-        uuid5, pois esses IDs dependem do índice do chunk). O preço é uma
-        janela transitória em que, se o reprocessamento falhar (timeout de
-        LLM, etc.), o arquivo fica temporariamente SEM chunks no Qdrant.
-        O manifesto não é atualizado nesse cenário (o hash antigo é
-        mantido ou removido, nunca o novo), então a próxima execução
-        detecta a divergência de hash novamente e tenta o ciclo completo
-        de remoção+reprocessamento uma vez mais — o sistema se autocorrige,
-        mas a lacuna de retrieval para aquele arquivo específico persiste
-        até a próxima ingestão bem-sucedida.
-
-    LIMITAÇÃO CONHECIDA — custo de I/O do hash: o SHA-256 é calculado a
-    partir dos bytes crus do arquivo, o que exige ler o arquivo inteiro do
-    disco mesmo quando ele acaba sendo pulado por já estar no manifesto.
-    Uma evolução futura natural seria um pré-filtro barato por
-    st_size/st_mtime antes do hash — fora do escopo desta entrega, que
-    prioriza a garantia de correção (detectar QUALQUER mudança de
-    conteúdo) sobre o menor custo possível de I/O.
 """
 
 from __future__ import annotations
@@ -130,14 +106,11 @@ log = logging.getLogger(__name__)
 
 
 # =============================================================================
-# CONSTANTES — Filtros do motor de duplo canal
+# CONSTANTES — Filtros do motor de duplo canal e Chunking
 # =============================================================================
 
-# Diretórios cujo conteúdo nunca tem valor semântico para um assistente de
-# gameplay — são detalhes de build, implementação interna ou bibliotecas
-# de terceiros. Os 4 primeiros foram explicitamente pedidos; os demais são
-# ruído clássico de árvores de projeto/engine UE5 e foram incluídos como
-# extensão natural do mesmo filtro.
+MIN_BODY_CHARS: int = 100  # Quantidade mínima de caracteres de corpo para emitir um chunk isolado
+
 _IGNORED_DIR_NAMES: frozenset[str] = frozenset(
     {
         "Private",
@@ -156,11 +129,6 @@ _IGNORED_DIR_NAMES: frozenset[str] = frozenset(
     }
 )
 
-# Palavras-chave de classes/conceitos centrais de gameplay no UE5. Usadas
-# tanto para checar a declaração de herança (`class AMyPawn : public APawn`)
-# quanto como fallback pelo nome do arquivo. A lista pedida explicitamente
-# foi estendida com bases igualmente centrais (PlayerController, HUD,
-# Subsystem, Interface, GameInstance) — mesmo espírito do "etc." do pedido.
 _GAMEPLAY_KEYWORDS: tuple[str, ...] = (
     "Character",
     "Pawn",
@@ -180,8 +148,6 @@ _GAMEPLAY_KEYWORDS: tuple[str, ...] = (
     "Interface",
 )
 
-# Detecta `class [MACRO_API] NomeDaClasse : public Base1, public Base2 ...`
-# Cobre o padrão UE5 com macro de exportação (ex: ENGINE_API, MYGAME_API).
 _CLASS_DECL_RE = re.compile(
     r"class\s+(?:[A-Z][A-Z0-9_]*_API\s+)?(\w+)\s*:\s*"
     r"((?:public|protected|private)\s+\w+(?:\s*,\s*(?:public|protected|private)\s+\w+)*)"
@@ -190,11 +156,6 @@ _CLASS_DECL_RE = re.compile(
 _INCLUDE_RE = re.compile(r"^\s*#include\s+.*$", re.MULTILINE)
 _EXCESS_BLANK_LINES_RE = re.compile(r"\n{3,}")
 
-# --- Sanitização .udn -------------------------------------------------------
-
-# Campos de metadados estruturais conhecidos do formato .udn da Epic.
-# Removidos por nome explícito (em vez de "qualquer linha com ':'") para
-# não destruir prosa legítima do tipo "Nota: configure isso antes de...".
 _UDN_METADATA_RE = re.compile(
     r"^(?:Availability|Title|Crumbs|Description|Navigation|Parent|Order|"
     r"Type|Tags|SkillLevel|Version|topic-image|social-image|social-title|"
@@ -203,11 +164,6 @@ _UDN_METADATA_RE = re.compile(
 )
 _UDN_TITLE_RE = re.compile(r"^Title\s*:\s*(.+)$", re.MULTILINE | re.IGNORECASE)
 
-# Macros proprietárias da Epic no formato [TAG], [TAG:valor], [/TAG],
-# [TAG(args)] e [@id]. Três padrões cobrem os formatos vistos na prática:
-#   [DIR(output...)]        -> tag com parênteses
-#   [REGION:valor] / [/REGION] -> tag com dois-pontos ou fechamento
-#   [@some.id]               -> âncoras internas
 _UDN_MACRO_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\[/?[A-Z][A-Z0-9_]*\([^)]*\)\]"),
     re.compile(r"\[/?[A-Z][A-Z0-9_]*(?::[^\]]*)?\]"),
@@ -215,7 +171,6 @@ _UDN_MACRO_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 _UE_VERSION_RE = re.compile(r"(\d+\.\d+(?:\.\d+)?)")
-_MARKDOWN_HEADING_SPLIT_RE = re.compile(r"(?m)^(?=#{2,3}\s+)")
 
 
 # =============================================================================
@@ -255,15 +210,10 @@ the provided header.\
 
 
 # =============================================================================
-# UTILITÁRIOS DE I/O (despachados para thread — ver nota de performance acima)
+# UTILITÁRIOS DE I/O (despachados para thread)
 # =============================================================================
 
 def _walk_files(root: Path, extension: str) -> Iterator[Path]:
-    """
-    Geração síncrona dos caminhos de arquivo com a extensão informada,
-    podando diretórios ignorados durante a própria varredura (evita
-    descer em árvores gigantes e irrelevantes como ThirdParty/Intermediate).
-    """
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in _IGNORED_DIR_NAMES]
         for fname in filenames:
@@ -272,32 +222,14 @@ def _walk_files(root: Path, extension: str) -> Iterator[Path]:
 
 
 async def _discover_files(root: Path, extension: str) -> list[Path]:
-    """Varredura recursiva da pasta, executada em thread separada."""
     return await asyncio.to_thread(lambda: list(_walk_files(root, extension)))
 
 
 async def _read_file_bytes(path: Path) -> bytes:
-    """
-    Leitura de arquivo em modo BINÁRIO, em thread separada. É a ÚNICA
-    leitura de disco por arquivo: os mesmos bytes crus servem tanto para
-    o hash SHA-256 do manifesto de checkpoint (identidade de conteúdo,
-    calculada ANTES de qualquer decodificação/limpeza) quanto — via
-    `.decode(..., errors="ignore")` no chamador — como fonte do texto
-    usado no processamento semântico (Canal A/B). Evita ler o mesmo
-    arquivo duas vezes do disco.
-    """
     return await asyncio.to_thread(path.read_bytes)
 
 
 def _compute_file_hash(raw_bytes: bytes) -> str:
-    """
-    SHA-256 (hexdigest) do conteúdo bruto de um arquivo — a identidade de
-    conteúdo usada como valor no manifesto de checkpoint `manifest:{collection}`.
-    Calculado a partir dos bytes crus para detectar qualquer alteração
-    binária real do arquivo-fonte, independentemente de como o texto é
-    posteriormente decodificado para envio à LLM documentadora ou ao
-    sanitizador .udn.
-    """
     return hashlib.sha256(raw_bytes).hexdigest()
 
 
@@ -306,16 +238,6 @@ def _compute_file_hash(raw_bytes: bytes) -> str:
 # =============================================================================
 
 def _is_gameplay_relevant_header(content: str, filename: str) -> tuple[bool, str]:
-    """
-    Heurística de relevância: primeiro tenta achar uma declaração de classe
-    cujo nome OU cuja(s) classe(s)-base contenha(m) uma keyword de gameplay
-    (ex: `class MYGAME_API AMyWeapon : public AActor`). Se nenhuma
-    declaração de classe bater, cai para um fallback pelo nome do arquivo
-    (cobre casos como structs/enums em arquivos como "GameplayTags.h").
-
-    Returns:
-        (relevante, nome_da_classe_detectado) — nome vazio se não relevante.
-    """
     for match in _CLASS_DECL_RE.finditer(content):
         class_name = match.group(1)
         inheritance_blob = match.group(2)
@@ -335,29 +257,12 @@ def _is_gameplay_relevant_header(content: str, filename: str) -> tuple[bool, str
 
 
 def _clean_cpp_header(content: str) -> str:
-    """
-    Remove diretivas #include e colapsa linhas em branco excessivas antes
-    de enviar o header para a LLM — economiza tokens de contexto sem
-    perder nenhuma informação semântica relevante (UPROPERTY/UFUNCTION,
-    comentários Doxygen e a declaração da classe são todos preservados).
-    """
     cleaned = _INCLUDE_RE.sub("", content)
     cleaned = _EXCESS_BLANK_LINES_RE.sub("\n\n", cleaned)
     return cleaned.strip()
 
 
 async def _process_header_file(path: Path, raw: str, ue_version: str) -> list[dict]:
-    """
-    Processa um único header .h: filtra, limpa, envia para a LLM
-    documentadora e quebra o Markdown resultante em chunks com metadados.
-
-    `raw` já vem lido e decodificado do orquestrador (process_folder_ingestion),
-    que reaproveita os mesmos bytes usados para o hash do checkpoint —
-    este método não faz I/O de disco.
-
-    Retorna lista vazia (sem levantar exceção) se o arquivo não for
-    relevante — isso NÃO é um erro, é o filtro de ruído funcionando.
-    """
     relevant, class_name = _is_gameplay_relevant_header(raw, path.name)
     if not relevant:
         log.debug("Header ignorado (sem relevância de gameplay): %s", path)
@@ -376,9 +281,6 @@ async def _process_header_file(path: Path, raw: str, ue_version: str) -> list[di
         {"role": "user", "content": user_message},
     ]
 
-    # Reaproveita a infraestrutura de chamada ao LiteLLM já validada em
-    # rag_service.py — mesmo client HTTP, mesmos headers, mesmo tratamento
-    # de erro de timeout/HTTP. Evita duplicar lógica de transporte.
     markdown, _prompt_tokens, _completion_tokens = await call_litellm(
         messages=messages,
         model=settings.ingestion_documenter_model,
@@ -399,12 +301,6 @@ async def _process_header_file(path: Path, raw: str, ue_version: str) -> list[di
 # =============================================================================
 
 def _sanitize_udn(content: str) -> tuple[str, str]:
-    """
-    Remove metadados estruturais (Title:, Availability:, Crumbs:, ...) e
-    macros proprietárias da Epic ([REGION], [DIR(...)], [@id], ...) via
-    regex, preservando a hierarquia de títulos Markdown (#, ##, ###) e o
-    texto corrido. Retorna (texto_limpo, título_extraído).
-    """
     title_match = _UDN_TITLE_RE.search(content)
     title = title_match.group(1).strip() if title_match else ""
 
@@ -422,15 +318,6 @@ def _sanitize_udn(content: str) -> tuple[str, str]:
 
 
 async def _process_udn_file(path: Path, raw: str, ue_version: str) -> list[dict]:
-    """
-    Processa um único arquivo .udn: sanitização via regex (sem LLM — é
-    documentação oficial, já bem escrita, só precisa de limpeza estrutural)
-    seguida de chunking estrutural e enriquecimento de metadados.
-
-    `raw` já vem lido e decodificado do orquestrador (process_folder_ingestion),
-    que reaproveita os mesmos bytes usados para o hash do checkpoint —
-    este método não faz I/O de disco.
-    """
     clean_text, title = _sanitize_udn(raw)
     if not clean_text:
         log.debug("Documento .udn vazio após sanitização, ignorado: %s", path)
@@ -447,41 +334,87 @@ async def _process_udn_file(path: Path, raw: str, ue_version: str) -> list[dict]
 
 
 # =============================================================================
-# CHUNKING ESTRUTURAL (compartilhado pelos dois canais)
+# CHUNKING ESTRUTURAL
 # =============================================================================
 
-def _split_by_markdown_headers(markdown_text: str) -> list[str]:
+def _hierarchical_markdown_chunker(markdown_text: str, root_title: str) -> list[str]:
     """
-    Divide o Markdown pelas suas seções de subtítulo (## ou ###), em vez de
-    um corte cego por número de caracteres — garante que cada chunk tenha
-    começo, meio e fim lógicos (ex: a seção inteira "Como configurar as
-    transições do AnimGraph" vira um único chunk coeso).
-
-    O texto antes do primeiro ## (tipicamente o título H1 + parágrafo de
-    abertura) vira o chunk 0. Se esse trecho de abertura for trivialmente
-    curto (só o título, sem corpo), ele é fundido à primeira seção real
-    para evitar um chunk "órfão" sem contexto suficiente para o reranker.
+    Varredura sequencial do documento construindo breadcrumbs hierárquicos
+    (até H3). Resolve o problema de fragmentação garantindo contexto contínuo
+    para seções pequenas e unificando chunks órfãos.
     """
-    raw_sections = _MARKDOWN_HEADING_SPLIT_RE.split(markdown_text)
-    sections = [s.strip() for s in raw_sections if s.strip()]
+    stack: dict[int, str] = {1: root_title}
+    chunks: list[str] = []
+    current_body: list[str] = []
+    carried_text: str = ""  # Acumula textos de seções curtas anteriores para fluir para a próxima
+    in_code_block: bool = False
 
-    if not sections:
-        return []
+    def _build_breadcrumb() -> str:
+        parts = []
+        for lvl in sorted(stack.keys()):
+            if stack[lvl]:
+                parts.append(f"{'#' * lvl} {stack[lvl]}")
+        return " > ".join(parts)
 
-    INTRO_MERGE_THRESHOLD_CHARS = 100
-    if (
-        len(sections) > 1
-        and not sections[0].lstrip().startswith("##")
-        and len(sections[0]) < INTRO_MERGE_THRESHOLD_CHARS
-    ):
-        sections = [f"{sections[0]}\n\n{sections[1]}", *sections[2:]]
+    def _flush_section(is_end_of_doc: bool = False) -> None:
+        nonlocal current_body, carried_text
+        if not current_body and not carried_text:
+            return
 
-    return sections
+        raw_body = "\n".join(current_body).strip()
+        # Mescla o texto acumulado de seções curtas anteriores com o corpo atual
+        body_text = f"{carried_text}\n\n{raw_body}".strip() if carried_text else raw_body
+        current_body = []
+        carried_text = ""
+
+        if not body_text:
+            return
+
+        if len(body_text) >= MIN_BODY_CHARS:
+            breadcrumb = _build_breadcrumb()
+            chunks.append(f"{breadcrumb}\n\n{body_text}")
+        else:
+            # Correção: Se for o fim do documento, aplica a estratégia de segurança
+            if is_end_of_doc:
+                if chunks:
+                    chunks[-1] += f"\n\n{body_text}"  # Merge para trás
+                else:
+                    breadcrumb = _build_breadcrumb()
+                    chunks.append(f"{breadcrumb}\n\n{body_text}")  # Documento inteiro é curto
+            else:
+                # Se for no meio do documento, segura o texto para fluir para a próxima seção
+                carried_text = body_text
+
+    header_re = re.compile(r"^(#{1,3})\s+(.+)$")
+    
+    for line in markdown_text.splitlines():
+        if line.strip().startswith("```"):
+            in_code_block = not in_code_block
+            current_body.append(line)
+            continue
+
+        match = header_re.match(line) if not in_code_block else None
+        if match:
+            _flush_section(is_end_of_doc=False)
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            
+            for k in list(stack.keys()):
+                if k >= level:
+                    stack.pop(k, None)
+            
+            stack[level] = title
+        else:
+            current_body.append(line)
+            
+    _flush_section(is_end_of_doc=True)
+    return chunks
 
 
 def _enforce_max_chunk_size(sections: list[str], max_chars: int) -> list[str]:
     """
-    Rede de segurança aprimorada: garante que textos nunca sejam cortados e perdidos.
+    Garante que chunks maiores que o limite sejam fatiados, mas preservando e
+    replicando o breadcrumb hierárquico estruturado no topo de CADA fatia.
     """
     result: list[str] = []
     for section in sections:
@@ -489,36 +422,56 @@ def _enforce_max_chunk_size(sections: list[str], max_chars: int) -> list[str]:
             result.append(section)
             continue
 
-        paragraphs = section.split("\n\n")
+        parts = section.split("\n\n", 1)
+        if len(parts) == 2 and parts[0].startswith("#"):
+            breadcrumb = parts[0]
+            body = parts[1]
+        else:
+            breadcrumb = ""
+            body = section
+            
+        breadcrumb_len = len(breadcrumb) + 2 if breadcrumb else 0
+        effective_max = max_chars - breadcrumb_len
+
+        # Fallback de segurança caso o breadcrumb consuma espaço demais
+        if effective_max <= 50:
+            effective_max = max_chars
+
+        paragraphs = body.split("\n\n")
         buffer = ""
+        
         for paragraph in paragraphs:
-            if len(paragraph) > max_chars:
+            # Correção: Avalia o tamanho usando o teto efetivo disponível
+            if len(paragraph) > effective_max:
                 if buffer:
-                    result.append(buffer.strip())
+                    final_chunk = f"{breadcrumb}\n\n{buffer.strip()}".strip() if breadcrumb else buffer.strip()
+                    result.append(final_chunk)
                     buffer = ""
-                for i in range(0, len(paragraph), max_chars):
-                    result.append(paragraph[i:i+max_chars].strip())
+                # Fatiamento forçado intra-parágrafo respeitando o effective_max
+                for i in range(0, len(paragraph), effective_max):
+                    slice_text = paragraph[i:i+effective_max].strip()
+                    if slice_text:
+                        final_chunk = f"{breadcrumb}\n\n{slice_text}".strip() if breadcrumb else slice_text
+                        result.append(final_chunk)
                 continue
 
             candidate = f"{buffer}\n\n{paragraph}".strip() if buffer else paragraph
-            if len(candidate) > max_chars and buffer:
-                result.append(buffer.strip())
+            # Correção: O acumulador testa contra o limite efetivo com breadcrumb somado
+            if len(candidate) > effective_max and buffer:
+                final_chunk = f"{breadcrumb}\n\n{buffer.strip()}".strip() if breadcrumb else buffer.strip()
+                result.append(final_chunk)
                 buffer = paragraph
             else:
                 buffer = candidate
+                
         if buffer.strip():
-            result.append(buffer.strip())
+            final_chunk = f"{breadcrumb}\n\n{buffer.strip()}".strip() if breadcrumb else buffer.strip()
+            result.append(final_chunk)
 
     return result
 
 
 def _extract_ue_version(path_str: str) -> str:
-    """
-    Extrai um padrão "X.Y" (ou "X.Y.Z") do caminho informado — cobre
-    convenções comuns como ".../UE_5.8/Engine/..." ou ".../5.8/Source/...".
-    É uma heurística best-effort; cai no fallback configurável quando não
-    encontra nada.
-    """
     match = _UE_VERSION_RE.search(path_str)
     return match.group(1) if match else settings.ingestion_default_ue_version
 
@@ -531,32 +484,7 @@ def _build_chunks_with_metadata(
     ue_version: str,
     raw_content: str,
 ) -> list[dict]:
-    """
-    Aplica o chunking estrutural + rede de segurança e monta o payload
-    final de cada chunk, já no formato esperado pelo Qdrant (compatível
-    com o schema RetrievedChunk consumido por rag_service.py).
-
-    HYBRID RAG — PAYLOAD ENRIQUECIDO:
-        `raw_content` é o conteúdo ORIGINAL e INTEGRAL do arquivo-fonte já
-        limpo (o header C++ inteiro no Canal A, ou o Markdown .udn inteiro
-        já sanitizado no Canal B) — não é fatiado junto com `markdown_text`.
-        Ele é replicado em TODOS os chunks gerados a partir deste arquivo,
-        de propósito: cada chunk continua sendo uma unidade de busca
-        semântica independente (via `text`), mas qualquer um deles, ao ser
-        recuperado, carrega consigo a referência bruta completa para
-        validação sintática em rag_service.py. `raw_content` NUNCA é
-        passado para embed_text() — apenas `text` é embedado.
-
-        Trade-off consciente: para arquivos grandes com muitas seções
-        Markdown, isso duplica `raw_content` entre os chunks do mesmo
-        arquivo (mais espaço em disco no Qdrant, mais tokens no prompt
-        final quando vários chunks do mesmo arquivo são recuperados
-        simultaneamente). Se isso se tornar um problema de custo/latência,
-        uma evolução natural seria armazenar `raw_content` uma única vez
-        por `source_file` (ex: numa coleção/tabela auxiliar) em vez de
-        replicá-lo por chunk.
-    """
-    sections = _split_by_markdown_headers(markdown_text)
+    sections = _hierarchical_markdown_chunker(markdown_text, title)
     sections = _enforce_max_chunk_size(sections, settings.ingestion_max_chunk_chars)
 
     chunks: list[dict] = []
@@ -569,7 +497,7 @@ def _build_chunks_with_metadata(
                 "title": title,
                 "chunk_id": chunk_id,
                 "ue_version": ue_version,
-                "description": "",  # mantém compatibilidade com RetrievedChunk
+                "description": "",  
                 "raw_content": raw_content,
             }
         )
@@ -581,12 +509,6 @@ def _build_chunks_with_metadata(
 # =============================================================================
 
 async def ensure_collection_exists(qdrant: AsyncQdrantClient) -> None:
-    """
-    Garante que a coleção configurada em settings.qdrant_collection existe,
-    criando-a automaticamente (vetores de tamanho settings.embedding_dim,
-    distância COSINE) caso ainda não exista. Idempotente: chamadas
-    repetidas em uma coleção já existente são no-ops seguros.
-    """
     collection_name = settings.qdrant_collection
 
     exists = await qdrant.collection_exists(collection_name)
@@ -618,20 +540,6 @@ async def ensure_collection_exists(qdrant: AsyncQdrantClient) -> None:
 
 @dataclass
 class _PendingFileCommit:
-    """
-    Estado de commit pendente de UM arquivo cujos chunks já foram gerados
-    e colocados no buffer compartilhado `pending`, mas que ainda não
-    tiveram TODOS os seus chunks confirmados como persistidos no Qdrant.
-
-    Enquanto `confirmed_chunks < total_chunks`, o arquivo está "em voo":
-    já foi processado (chamada à LLM documentadora ou sanitização já
-    ocorreu), mas o manifesto no Redis NÃO pode ser atualizado, porque
-    ainda não há garantia de que 100% dos seus chunks sobreviveram a um
-    upsert bem-sucedido no Qdrant — é justamente essa distinção entre
-    "gerado" e "confirmado" que torna o checkpoint seguro mesmo quando um
-    lote mistura chunks de vários arquivos diferentes.
-    """
-
     relative_key: str
     file_hash: str
     total_chunks: int
@@ -639,19 +547,6 @@ class _PendingFileCommit:
 
 
 async def _load_manifest_cache(redis: Redis, manifest_key: str) -> dict[str, str]:
-    """
-    Carrega o manifesto inteiro de uma coleção em uma única chamada
-    (HGETALL) para servir como cache de leitura local durante toda a
-    ingestão — evita um round-trip de rede por arquivo em pastas com
-    dezenas de milhares de arquivos. As ESCRITAS de checkpoint continuam
-    granulares (HSET por arquivo, feitas em `_commit_confirmed_files`),
-    apenas a leitura inicial é agregada.
-
-    Falha ao contatar o Redis não aborta a ingestão: degrada de forma
-    segura para "nenhum arquivo está no manifesto" (todo arquivo é tratado
-    como novo), o que na pior das hipóteses causa reprocessamento
-    desnecessário — nunca perda de dados.
-    """
     try:
         cache = await redis.hgetall(manifest_key)
         log.info(
@@ -663,8 +558,7 @@ async def _load_manifest_cache(redis: Redis, manifest_key: str) -> dict[str, str
     except Exception as exc:
         log.error(
             "Falha ao carregar manifesto '%s' do Redis: %s. Prosseguindo sem "
-            "cache — todo arquivo será tratado como novo (nenhum dado é "
-            "perdido, apenas reprocessamento desnecessário nesta execução).",
+            "cache — todo arquivo será tratado como novo.",
             manifest_key,
             exc,
             exc_info=True,
@@ -677,21 +571,6 @@ async def _delete_file_chunks(
     collection_name: str,
     source_file: str,
 ) -> None:
-    """
-    Remove do Qdrant TODOS os pontos cujo payload `source_file` corresponda
-    ao arquivo informado. Chamado antes de reprocessar um arquivo cujo hash
-    mudou desde a última ingestão (detectado via manifesto), para eliminar
-    chunks órfãos da versão anterior — por exemplo, se a versão antiga
-    gerava 5 seções/chunks e a nova gera apenas 3, os 2 chunks excedentes
-    da versão antiga NUNCA seriam sobrescritos pelos IDs determinísticos
-    (uuid5 de `source_file::chunk_id`) da nova versão, pois esses IDs
-    dependem do índice do chunk dentro do arquivo.
-
-    Propaga a exceção em caso de falha (não a engole) — o chamador deve
-    tratar isso como falha de processamento do arquivo (stats["errors"]) e
-    NÃO atualizar o manifesto, garantindo que o ciclo de
-    remoção+reprocessamento seja tentado novamente na próxima execução.
-    """
     result = await qdrant.delete(
         collection_name=collection_name,
         points_selector=qdrant_models.FilterSelector(
@@ -707,7 +586,7 @@ async def _delete_file_chunks(
         wait=True,
     )
     log.info(
-        "Chunks antigos removidos (arquivo modificado) | arquivo=%s status=%s",
+        "Limpeza defensiva executada (chunks anteriores removidos) | arquivo=%s status=%s",
         source_file,
         result.status,
     )
@@ -719,30 +598,9 @@ async def _commit_confirmed_files(
     tracking: dict[str, _PendingFileCommit],
     per_file_counts: dict[str, int],
 ) -> None:
-    """
-    Aplica os créditos de chunks confirmados (retornados por `_flush_batch`
-    após um upsert bem-sucedido no Qdrant) ao rastreador de cada arquivo em
-    voo, e faz o "commit" do manifesto de checkpoint (HSET) para todo
-    arquivo cujo total de chunks gerados já foi 100% persistido.
-
-    ESTA é a fronteira de atomicidade do sistema: o Redis só é atualizado
-    aqui, depois que `_flush_batch` confirma (via `wait=True`) que o Qdrant
-    persistiu os pontos. Se o processo morrer a qualquer momento antes
-    desta função rodar para um dado arquivo, esse arquivo simplesmente não
-    é commitado — nunca fica um estado parcial mentiroso no manifesto.
-
-    Uma falha ao escrever o HSET (ex: Redis momentaneamente indisponível)
-    é logada e NÃO interrompe a ingestão: os dados já estão salvos no
-    Qdrant, apenas o checkpoint fica pendente, e o arquivo será
-    (redundantemente, mas corretamente) reprocessado na próxima execução.
-    """
     for source_file, confirmed in per_file_counts.items():
         tracker = tracking.get(source_file)
         if tracker is None:
-            # Chunk pertence a um arquivo que não está mais sendo
-            # rastreado (ex: já foi commitado por um flush anterior, ou o
-            # arquivo teve seu processamento abortado por exceção). Não há
-            # nada a fazer aqui — apenas ignora.
             continue
 
         tracker.confirmed_chunks += confirmed
@@ -753,9 +611,7 @@ async def _commit_confirmed_files(
             await redis.hset(manifest_key, tracker.relative_key, tracker.file_hash)
         except Exception as exc:
             log.error(
-                "Falha ao commitar checkpoint para '%s' (chunks JÁ persistidos "
-                "no Qdrant, mas o manifesto não foi atualizado — o arquivo "
-                "será reprocessado na próxima ingestão): %s",
+                "Falha ao commitar checkpoint para '%s': %s",
                 tracker.relative_key,
                 exc,
                 exc_info=True,
@@ -781,30 +637,6 @@ async def _flush_batch(
     collection_name: str,
     batch: list[dict],
 ) -> dict[str, int]:
-    """
-    Gera embeddings para um lote de chunks (em paralelo, limitado por
-    settings.ingestion_embedding_concurrency para não sobrecarregar um
-    Ollama local rodando em hardware de desenvolvimento) e faz UM único
-    upsert no Qdrant para o lote inteiro — minimiza chamadas de rede.
-
-    IDs determinísticos (uuid5 a partir de source_file + chunk_id): uma
-    reingestão da mesma pasta SOBRESCREVE os pontos existentes em vez de
-    duplicá-los, estendendo a idempotência também ao nível do chunk.
-
-    Falha no embedding de um chunk individual não derruba o lote inteiro
-    — o chunk problemático é pulado e logado; o restante segue normalmente.
-
-    Returns:
-        Um dict {source_file: quantidade_de_chunks_efetivamente_upsertados}
-        para ESTE lote. É a granularidade exigida pelo checkpoint: como um
-        lote pode misturar chunks de N arquivos diferentes, o chamador
-        (process_folder_ingestion) precisa saber exatamente quantos chunks
-        de CADA arquivo sobreviveram, para só commitar o manifesto quando
-        o total de um arquivo específico bater 100%. Se o upsert do lote
-        falhar como um todo, o dict retornado é vazio — nenhum arquivo
-        recebe crédito algum, o que é correto: não podemos confirmar a
-        persistência de nada nesse lote.
-    """
     if not batch:
         return {}
 
@@ -838,10 +670,7 @@ async def _flush_batch(
         )
 
     if not points:
-        log.warning(
-            "Lote descartado: todos os %d embeddings falharam neste lote.",
-            len(batch),
-        )
+        log.warning("Lote descartado: todos os %d embeddings falharam.", len(batch))
         return {}
 
     try:
@@ -861,10 +690,6 @@ async def _flush_batch(
         collection_name,
     )
 
-    # O upsert é atômico do ponto de vista do chamador: ou toda a lista
-    # `points` foi persistida (chegamos aqui sem exceção), ou nenhuma foi
-    # (capturado no except acima). Por isso é seguro creditar TODOS os
-    # pontos da lista aos seus respectivos arquivos.
     per_file_counts: dict[str, int] = {}
     for point in points:
         source_file = point.payload["source_file"]
@@ -884,24 +709,6 @@ async def process_folder_ingestion(
     redis: Redis,
     ue_version_override: str | None = None,
 ) -> None:
-    """
-    Executa o pipeline de ETL Code-to-Doc completo para uma pasta, com
-    checkpoint/idempotência via manifesto no Redis (ver NOTA DE
-    ARQUITETURA no topo do módulo).
-
-    Roda como BackgroundTask — não tem valor de retorno consumido por
-    ninguém, então toda a comunicação de progresso/resultado acontece via
-    logs estruturados em nível INFO (arquivos encontrados, progresso por
-    arquivo, lotes inseridos, checkpoints commitados) e ERROR (falhas
-    pontuais, sem propagar).
-
-    Robustez: a falha catastrófica em UM arquivo (ex: header malformado,
-    timeout da LLM documentadora, falha ao limpar órfãos no Qdrant) é
-    capturada e logada, e o loop continua para o próximo arquivo — a pasta
-    inteira nunca é abortada por causa de um único arquivo problemático.
-    Nesses casos, o manifesto simplesmente não é atualizado para o arquivo
-    afetado, garantindo que ele seja retentado na próxima execução.
-    """
     root = Path(folder_path)
     collection_name = settings.qdrant_collection
     batch_size = settings.ingestion_batch_size
@@ -919,7 +726,7 @@ async def process_folder_ingestion(
         await ensure_collection_exists(qdrant)
     except Exception as exc:
         log.error(
-            "Falha catastrófica ao garantir a coleção '%s': %s. Abortando ingestão.",
+            "Falha catastrófica ao garantir a coleção '%s': %s",
             collection_name,
             exc,
             exc_info=True,
@@ -927,10 +734,9 @@ async def process_folder_ingestion(
         return
 
     manifest_cache = await _load_manifest_cache(redis, manifest_key)
-
     ue_version = ue_version_override or _extract_ue_version(str(root))
-
     extension = ".h" if content_type == "source_code" else ".udn"
+    
     files = await _discover_files(root, extension)
     total_files = len(files)
 
@@ -944,12 +750,12 @@ async def process_folder_ingestion(
     pending: list[dict] = []
     tracking: dict[str, _PendingFileCommit] = {}
     stats = {
-        "processed": 0,        # arquivos (re)processados nesta execução (novos ou modificados)
-        "modified": 0,         # subconjunto de 'processed': já existiam no manifesto com hash diferente
-        "skipped": 0,          # ignorados: checkpoint (hash idêntico) OU sem conteúdo semântico relevante
-        "errors": 0,           # falhas de leitura, limpeza de órfãos, chamada de LLM ou parsing
-        "chunks_indexed": 0,   # total de chunks efetivamente upsertados no Qdrant nesta execução
-        "partial_failures": 0, # processados mas NÃO commitados no manifesto (persistência incompleta)
+        "processed": 0,
+        "modified": 0,
+        "skipped": 0,
+        "errors": 0,
+        "chunks_indexed": 0,
+        "partial_failures": 0,
     }
 
     for i, file_path in enumerate(files, start=1):
@@ -959,57 +765,39 @@ async def process_folder_ingestion(
             raw_bytes = await _read_file_bytes(file_path)
         except Exception as exc:
             stats["errors"] += 1
-            log.error(
-                "Falha ao ler '%s' do disco — pulando para o próximo arquivo: %s",
-                file_path,
-                exc,
-                exc_info=True,
-            )
+            log.error("Falha ao ler '%s' do disco: %s", file_path, exc, exc_info=True)
             continue
 
         file_hash = _compute_file_hash(raw_bytes)
-
+        source_file_str = str(file_path)
+        
         try:
             relative_key = file_path.relative_to(root).as_posix()
         except ValueError:
-            # Defensivo: só ocorreria se `file_path` não estivesse de fato
-            # sob `root` (ex: symlink incomum). Cai para o caminho absoluto
-            # como chave em vez de abortar o arquivo.
             relative_key = file_path.as_posix()
-            log.warning(
-                "Não foi possível calcular caminho relativo de '%s' em relação "
-                "a '%s' — usando caminho absoluto como chave do manifesto.",
-                file_path,
-                root,
-            )
+            log.warning("Caminho relativo falhou para '%s' — usando absoluto.", file_path)
 
-        source_file_str = str(file_path)
         existing_hash = manifest_cache.get(relative_key)
 
-        # --- Checkpoint: arquivo inalterado desde a última ingestão -----
+        # Checkpoint: Ignora apenas se confirmadamente inalterado
         if existing_hash == file_hash:
             stats["skipped"] += 1
-            log.info(
-                "[%d/%d] Ignorado — checkpoint OK (hash inalterado): %s",
-                i,
-                total_files,
-                file_path,
-            )
+            log.info("[%d/%d] Ignorado — checkpoint OK (hash inalterado).", i, total_files)
             continue
 
-        is_modification = existing_hash is not None
-
+        # Gatilho de Limpeza Unificado (sempre executa se for processar)
         try:
-            # --- Arquivo modificado: limpa órfãos ANTES de reprocessar ---
-            if is_modification:
-                log.info(
-                    "Arquivo modificado detectado (hash difere do manifesto) — "
-                    "removendo chunks antigos antes de reindexar: %s",
-                    file_path,
-                )
-                await _delete_file_chunks(qdrant, collection_name, source_file_str)
+            log.info("Limpando órfãos do Qdrant para garantir idempotência: %s", file_path)
+            await _delete_file_chunks(qdrant, collection_name, source_file_str)
+            if existing_hash is not None:
                 stats["modified"] += 1
+        except Exception as exc:
+            stats["errors"] += 1
+            log.error("Falha na limpeza de órfãos para '%s' — ignorando: %s", file_path, exc)
+            continue
 
+        # Processamento e Geração de Chunks
+        try:
             raw_text = raw_bytes.decode("utf-8", errors="ignore")
 
             if content_type == "source_code":
@@ -1029,9 +817,7 @@ async def process_folder_ingestion(
             )
             pending.extend(chunks)
 
-            # Esvazia o buffer em lotes de tamanho batch_size sempre que
-            # atinge (ou ultrapassa) o limite — loop, não "if", porque um
-            # único arquivo grande pode gerar mais chunks que um lote inteiro.
+            # Flush condicionado ao buffer > batch_size (atomicidade do commit)
             while len(pending) >= batch_size:
                 batch, pending = pending[:batch_size], pending[batch_size:]
                 per_file_counts = await _flush_batch(qdrant, collection_name, batch)
@@ -1040,30 +826,17 @@ async def process_folder_ingestion(
 
         except Exception as exc:
             stats["errors"] += 1
-            # Descarta qualquer rastreamento parcial deste arquivo: como o
-            # manifesto mantém o hash antigo (ou nenhum), a próxima
-            # execução detectará a divergência de hash novamente e tentará
-            # o ciclo completo de remoção+reprocessamento uma vez mais.
             tracking.pop(source_file_str, None)
-            log.error(
-                "Erro ao processar '%s' — pulando para o próximo arquivo: %s",
-                file_path,
-                exc,
-                exc_info=True,
-            )
+            log.error("Erro processando '%s' — ignorando: %s", file_path, exc, exc_info=True)
             continue
 
-    # Flush final do que restou no buffer (menor que batch_size).
+    # Flush de resíduos finais
     if pending:
         per_file_counts = await _flush_batch(qdrant, collection_name, pending)
         stats["chunks_indexed"] += sum(per_file_counts.values())
         await _commit_confirmed_files(redis, manifest_key, tracking, per_file_counts)
 
-    # Qualquer arquivo que ainda reste em `tracking` neste ponto teve
-    # persistência PARCIAL (ex: falha de embedding em algum chunk, ou
-    # falha do upsert do lote correspondente) — nunca atingiu 100% dos
-    # seus chunks confirmados, portanto o manifesto NUNCA foi atualizado
-    # para ele. Será reprocessado integralmente na próxima ingestão.
+    # Identificação de falhas parciais (chunks perdidos no embedding/upsert limitaram commit)
     for source_file, tracker in tracking.items():
         stats["partial_failures"] += 1
         log.warning(
