@@ -6,11 +6,15 @@ Gerenciamento do ciclo de vida do cliente Redis para memória do agente.
 Responsabilidades:
 - Armazenar histórico de conversas por session_id (TTL configurável)
 - Armazenar contextos e metadados de sessão
+- Armazenar o manifesto de checkpoint/idempotência da ingestão (ver
+  app/services/ai/ingestion_service.py)
 - NÃO é o Redis do LiteLLM — este é exclusivo do agente UE5
 
 Estrutura de chaves:
     session:{session_id}:history  → lista JSON de mensagens
     session:{session_id}:meta     → hash com metadados (created_at, model usado etc.)
+    manifest:{collection_name}    → hash (caminho_relativo → sha256 do arquivo),
+                                     o checkpoint de ingestão por coleção Qdrant
 """
 
 from __future__ import annotations
@@ -107,3 +111,17 @@ def session_history_key(session_id: str) -> str:
 def session_meta_key(session_id: str) -> str:
     """Chave Redis para metadados de uma sessão."""
     return f"session:{session_id}:meta"
+
+
+def ingestion_manifest_key(collection_name: str) -> str:
+    """
+    Chave Redis (Hash) do manifesto de checkpoint/idempotência de ingestão
+    de uma coleção Qdrant específica — isola os checkpoints entre coleções
+    diferentes (ex: `manifest:ue5_docs`, `manifest:ue5_docs_v2`).
+
+    Campos da hash: caminho relativo do arquivo (à raiz da pasta ingerida)
+    → SHA-256 hexdigest do conteúdo bruto do arquivo na última ingestão
+    bem-sucedida. Ver app/services/ai/ingestion_service.py para o fluxo
+    completo de leitura/escrita.
+    """
+    return f"manifest:{collection_name}"
