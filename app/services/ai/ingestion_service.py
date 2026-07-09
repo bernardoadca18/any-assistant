@@ -56,22 +56,73 @@ NOTA DE PERFORMANCE — por que asyncio.to_thread():
     outros usuários do assistente durante a ingestão. Por isso, toda
     operação de I/O de disco potencialmente pesada (os.walk, leitura de
     arquivo) é despachada para uma thread separada via asyncio.to_thread().
+
+NOTA DE ARQUITETURA — Manifesto de Checkpoint via Redis (idempotência):
+    Cada arquivo-fonte tem sua identidade de conteúdo rastreada em uma
+    Hash do Redis `manifest:{collection_name}` (HSET caminho_relativo →
+    sha256_hexdigest). Isso permite interromper e retomar uma ingestão
+    grande sem reprocessar (e sem chamar a LLM documentadora de novo para)
+    arquivos já indexados, e detectar automaticamente arquivos novos,
+    inalterados ou modificados entre execuções.
+
+    FRONTEIRA DE ATOMICIDADE ("o commit"): como os chunks de vários
+    arquivos são acumulados em um buffer compartilhado (`pending`) e
+    inseridos em lotes por `_flush_batch` (para minimizar chamadas de rede
+    ao Qdrant), o manifesto NUNCA pode ser atualizado apenas por termos
+    gerado os chunks de um arquivo — isso mapearia incorretamente "chunks
+    na memória" para "chunks persistidos". Cada arquivo em voo é
+    rastreado por um `_PendingFileCommit` (total de chunks gerados vs.
+    chunks efetivamente confirmados por upserts bem-sucedidos). Só quando
+    `confirmed_chunks == total_chunks` de um arquivo específico o HSET do
+    seu hash é disparado — nunca antes, e nunca com base em contagens
+    agregadas do lote. Se o processo morrer a qualquer momento antes
+    disso, o arquivo simplesmente não aparece (ou aparece com o hash
+    antigo) no manifesto, e será reprocessado integralmente na próxima
+    execução — nunca há um "meio-termo" mentiroso no checkpoint.
+
+    TRADE-OFF CONSCIENTE — ordem "deletar órfãos antes de reprocessar":
+        Para um arquivo cujo hash mudou, os chunks antigos são removidos
+        do Qdrant (filtro por `source_file`) ANTES de a nova versão ser
+        processada e re-inserida. Isso evita definitivamente chunks órfãos
+        (ex: a versão antiga gerava 5 seções/chunks, a nova gera 3 — os 2
+        excedentes nunca seriam sobrescritos pelos IDs determinísticos
+        uuid5, pois esses IDs dependem do índice do chunk). O preço é uma
+        janela transitória em que, se o reprocessamento falhar (timeout de
+        LLM, etc.), o arquivo fica temporariamente SEM chunks no Qdrant.
+        O manifesto não é atualizado nesse cenário (o hash antigo é
+        mantido ou removido, nunca o novo), então a próxima execução
+        detecta a divergência de hash novamente e tenta o ciclo completo
+        de remoção+reprocessamento uma vez mais — o sistema se autocorrige,
+        mas a lacuna de retrieval para aquele arquivo específico persiste
+        até a próxima ingestão bem-sucedida.
+
+    LIMITAÇÃO CONHECIDA — custo de I/O do hash: o SHA-256 é calculado a
+    partir dos bytes crus do arquivo, o que exige ler o arquivo inteiro do
+    disco mesmo quando ele acaba sendo pulado por já estar no manifesto.
+    Uma evolução futura natural seria um pré-filtro barato por
+    st_size/st_mtime antes do hash — fora do escopo desta entrega, que
+    prioriza a garantia de correção (detectar QUALQUER mudança de
+    conteúdo) sobre o menor custo possível de I/O.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qdrant_models
+from redis.asyncio import Redis
 
 from app.core.config import settings
+from app.db.redis import ingestion_manifest_key
 from app.services.ai.embedding_service import embed_text
 from app.services.ai.rag_service import call_litellm
 
@@ -225,11 +276,29 @@ async def _discover_files(root: Path, extension: str) -> list[Path]:
     return await asyncio.to_thread(lambda: list(_walk_files(root, extension)))
 
 
-async def _read_file_text(path: Path) -> str:
-    """Leitura de arquivo em thread separada, tolerante a encoding."""
-    return await asyncio.to_thread(
-        path.read_text, encoding="utf-8", errors="ignore"
-    )
+async def _read_file_bytes(path: Path) -> bytes:
+    """
+    Leitura de arquivo em modo BINÁRIO, em thread separada. É a ÚNICA
+    leitura de disco por arquivo: os mesmos bytes crus servem tanto para
+    o hash SHA-256 do manifesto de checkpoint (identidade de conteúdo,
+    calculada ANTES de qualquer decodificação/limpeza) quanto — via
+    `.decode(..., errors="ignore")` no chamador — como fonte do texto
+    usado no processamento semântico (Canal A/B). Evita ler o mesmo
+    arquivo duas vezes do disco.
+    """
+    return await asyncio.to_thread(path.read_bytes)
+
+
+def _compute_file_hash(raw_bytes: bytes) -> str:
+    """
+    SHA-256 (hexdigest) do conteúdo bruto de um arquivo — a identidade de
+    conteúdo usada como valor no manifesto de checkpoint `manifest:{collection}`.
+    Calculado a partir dos bytes crus para detectar qualquer alteração
+    binária real do arquivo-fonte, independentemente de como o texto é
+    posteriormente decodificado para envio à LLM documentadora ou ao
+    sanitizador .udn.
+    """
+    return hashlib.sha256(raw_bytes).hexdigest()
 
 
 # =============================================================================
@@ -277,16 +346,18 @@ def _clean_cpp_header(content: str) -> str:
     return cleaned.strip()
 
 
-async def _process_header_file(path: Path, ue_version: str) -> list[dict]:
+async def _process_header_file(path: Path, raw: str, ue_version: str) -> list[dict]:
     """
     Processa um único header .h: filtra, limpa, envia para a LLM
     documentadora e quebra o Markdown resultante em chunks com metadados.
 
+    `raw` já vem lido e decodificado do orquestrador (process_folder_ingestion),
+    que reaproveita os mesmos bytes usados para o hash do checkpoint —
+    este método não faz I/O de disco.
+
     Retorna lista vazia (sem levantar exceção) se o arquivo não for
     relevante — isso NÃO é um erro, é o filtro de ruído funcionando.
     """
-    raw = await _read_file_text(path)
-
     relevant, class_name = _is_gameplay_relevant_header(raw, path.name)
     if not relevant:
         log.debug("Header ignorado (sem relevância de gameplay): %s", path)
@@ -350,14 +421,16 @@ def _sanitize_udn(content: str) -> tuple[str, str]:
     return cleaned, title
 
 
-async def _process_udn_file(path: Path, ue_version: str) -> list[dict]:
+async def _process_udn_file(path: Path, raw: str, ue_version: str) -> list[dict]:
     """
     Processa um único arquivo .udn: sanitização via regex (sem LLM — é
     documentação oficial, já bem escrita, só precisa de limpeza estrutural)
     seguida de chunking estrutural e enriquecimento de metadados.
-    """
-    raw = await _read_file_text(path)
 
+    `raw` já vem lido e decodificado do orquestrador (process_folder_ingestion),
+    que reaproveita os mesmos bytes usados para o hash do checkpoint —
+    este método não faz I/O de disco.
+    """
     clean_text, title = _sanitize_udn(raw)
     if not clean_text:
         log.debug("Documento .udn vazio após sanitização, ignorado: %s", path)
@@ -540,6 +613,166 @@ async def ensure_collection_exists(qdrant: AsyncQdrantClient) -> None:
 
 
 # =============================================================================
+# CHECKPOINT / MANIFESTO DE INGESTÃO (idempotência via Redis)
+# =============================================================================
+
+@dataclass
+class _PendingFileCommit:
+    """
+    Estado de commit pendente de UM arquivo cujos chunks já foram gerados
+    e colocados no buffer compartilhado `pending`, mas que ainda não
+    tiveram TODOS os seus chunks confirmados como persistidos no Qdrant.
+
+    Enquanto `confirmed_chunks < total_chunks`, o arquivo está "em voo":
+    já foi processado (chamada à LLM documentadora ou sanitização já
+    ocorreu), mas o manifesto no Redis NÃO pode ser atualizado, porque
+    ainda não há garantia de que 100% dos seus chunks sobreviveram a um
+    upsert bem-sucedido no Qdrant — é justamente essa distinção entre
+    "gerado" e "confirmado" que torna o checkpoint seguro mesmo quando um
+    lote mistura chunks de vários arquivos diferentes.
+    """
+
+    relative_key: str
+    file_hash: str
+    total_chunks: int
+    confirmed_chunks: int = 0
+
+
+async def _load_manifest_cache(redis: Redis, manifest_key: str) -> dict[str, str]:
+    """
+    Carrega o manifesto inteiro de uma coleção em uma única chamada
+    (HGETALL) para servir como cache de leitura local durante toda a
+    ingestão — evita um round-trip de rede por arquivo em pastas com
+    dezenas de milhares de arquivos. As ESCRITAS de checkpoint continuam
+    granulares (HSET por arquivo, feitas em `_commit_confirmed_files`),
+    apenas a leitura inicial é agregada.
+
+    Falha ao contatar o Redis não aborta a ingestão: degrada de forma
+    segura para "nenhum arquivo está no manifesto" (todo arquivo é tratado
+    como novo), o que na pior das hipóteses causa reprocessamento
+    desnecessário — nunca perda de dados.
+    """
+    try:
+        cache = await redis.hgetall(manifest_key)
+        log.info(
+            "Manifesto de checkpoint carregado | chave=%s arquivos_conhecidos=%d",
+            manifest_key,
+            len(cache),
+        )
+        return cache
+    except Exception as exc:
+        log.error(
+            "Falha ao carregar manifesto '%s' do Redis: %s. Prosseguindo sem "
+            "cache — todo arquivo será tratado como novo (nenhum dado é "
+            "perdido, apenas reprocessamento desnecessário nesta execução).",
+            manifest_key,
+            exc,
+            exc_info=True,
+        )
+        return {}
+
+
+async def _delete_file_chunks(
+    qdrant: AsyncQdrantClient,
+    collection_name: str,
+    source_file: str,
+) -> None:
+    """
+    Remove do Qdrant TODOS os pontos cujo payload `source_file` corresponda
+    ao arquivo informado. Chamado antes de reprocessar um arquivo cujo hash
+    mudou desde a última ingestão (detectado via manifesto), para eliminar
+    chunks órfãos da versão anterior — por exemplo, se a versão antiga
+    gerava 5 seções/chunks e a nova gera apenas 3, os 2 chunks excedentes
+    da versão antiga NUNCA seriam sobrescritos pelos IDs determinísticos
+    (uuid5 de `source_file::chunk_id`) da nova versão, pois esses IDs
+    dependem do índice do chunk dentro do arquivo.
+
+    Propaga a exceção em caso de falha (não a engole) — o chamador deve
+    tratar isso como falha de processamento do arquivo (stats["errors"]) e
+    NÃO atualizar o manifesto, garantindo que o ciclo de
+    remoção+reprocessamento seja tentado novamente na próxima execução.
+    """
+    result = await qdrant.delete(
+        collection_name=collection_name,
+        points_selector=qdrant_models.FilterSelector(
+            filter=qdrant_models.Filter(
+                must=[
+                    qdrant_models.FieldCondition(
+                        key="source_file",
+                        match=qdrant_models.MatchValue(value=source_file),
+                    )
+                ]
+            )
+        ),
+        wait=True,
+    )
+    log.info(
+        "Chunks antigos removidos (arquivo modificado) | arquivo=%s status=%s",
+        source_file,
+        result.status,
+    )
+
+
+async def _commit_confirmed_files(
+    redis: Redis,
+    manifest_key: str,
+    tracking: dict[str, _PendingFileCommit],
+    per_file_counts: dict[str, int],
+) -> None:
+    """
+    Aplica os créditos de chunks confirmados (retornados por `_flush_batch`
+    após um upsert bem-sucedido no Qdrant) ao rastreador de cada arquivo em
+    voo, e faz o "commit" do manifesto de checkpoint (HSET) para todo
+    arquivo cujo total de chunks gerados já foi 100% persistido.
+
+    ESTA é a fronteira de atomicidade do sistema: o Redis só é atualizado
+    aqui, depois que `_flush_batch` confirma (via `wait=True`) que o Qdrant
+    persistiu os pontos. Se o processo morrer a qualquer momento antes
+    desta função rodar para um dado arquivo, esse arquivo simplesmente não
+    é commitado — nunca fica um estado parcial mentiroso no manifesto.
+
+    Uma falha ao escrever o HSET (ex: Redis momentaneamente indisponível)
+    é logada e NÃO interrompe a ingestão: os dados já estão salvos no
+    Qdrant, apenas o checkpoint fica pendente, e o arquivo será
+    (redundantemente, mas corretamente) reprocessado na próxima execução.
+    """
+    for source_file, confirmed in per_file_counts.items():
+        tracker = tracking.get(source_file)
+        if tracker is None:
+            # Chunk pertence a um arquivo que não está mais sendo
+            # rastreado (ex: já foi commitado por um flush anterior, ou o
+            # arquivo teve seu processamento abortado por exceção). Não há
+            # nada a fazer aqui — apenas ignora.
+            continue
+
+        tracker.confirmed_chunks += confirmed
+        if tracker.confirmed_chunks < tracker.total_chunks:
+            continue
+
+        try:
+            await redis.hset(manifest_key, tracker.relative_key, tracker.file_hash)
+        except Exception as exc:
+            log.error(
+                "Falha ao commitar checkpoint para '%s' (chunks JÁ persistidos "
+                "no Qdrant, mas o manifesto não foi atualizado — o arquivo "
+                "será reprocessado na próxima ingestão): %s",
+                tracker.relative_key,
+                exc,
+                exc_info=True,
+            )
+            continue
+
+        log.info(
+            "Checkpoint commitado | arquivo=%s hash=%s chunks=%d/%d",
+            tracker.relative_key,
+            tracker.file_hash[:12],
+            tracker.confirmed_chunks,
+            tracker.total_chunks,
+        )
+        del tracking[source_file]
+
+
+# =============================================================================
 # EMBEDDING EM LOTE + UPSERT
 # =============================================================================
 
@@ -547,7 +780,7 @@ async def _flush_batch(
     qdrant: AsyncQdrantClient,
     collection_name: str,
     batch: list[dict],
-) -> int:
+) -> dict[str, int]:
     """
     Gera embeddings para um lote de chunks (em paralelo, limitado por
     settings.ingestion_embedding_concurrency para não sobrecarregar um
@@ -560,9 +793,20 @@ async def _flush_batch(
 
     Falha no embedding de um chunk individual não derruba o lote inteiro
     — o chunk problemático é pulado e logado; o restante segue normalmente.
+
+    Returns:
+        Um dict {source_file: quantidade_de_chunks_efetivamente_upsertados}
+        para ESTE lote. É a granularidade exigida pelo checkpoint: como um
+        lote pode misturar chunks de N arquivos diferentes, o chamador
+        (process_folder_ingestion) precisa saber exatamente quantos chunks
+        de CADA arquivo sobreviveram, para só commitar o manifesto quando
+        o total de um arquivo específico bater 100%. Se o upsert do lote
+        falhar como um todo, o dict retornado é vazio — nenhum arquivo
+        recebe crédito algum, o que é correto: não podemos confirmar a
+        persistência de nada nesse lote.
     """
     if not batch:
-        return 0
+        return {}
 
     semaphore = asyncio.Semaphore(settings.ingestion_embedding_concurrency)
 
@@ -598,7 +842,7 @@ async def _flush_batch(
             "Lote descartado: todos os %d embeddings falharam neste lote.",
             len(batch),
         )
-        return 0
+        return {}
 
     try:
         await qdrant.upsert(collection_name=collection_name, points=points, wait=True)
@@ -609,14 +853,24 @@ async def _flush_batch(
             collection_name,
             exc,
         )
-        return 0
+        return {}
 
     log.info(
         "Batch inserido com sucesso | %d pontos | coleção=%s",
         len(points),
         collection_name,
     )
-    return len(points)
+
+    # O upsert é atômico do ponto de vista do chamador: ou toda a lista
+    # `points` foi persistida (chegamos aqui sem exceção), ou nenhuma foi
+    # (capturado no except acima). Por isso é seguro creditar TODOS os
+    # pontos da lista aos seus respectivos arquivos.
+    per_file_counts: dict[str, int] = {}
+    for point in points:
+        source_file = point.payload["source_file"]
+        per_file_counts[source_file] = per_file_counts.get(source_file, 0) + 1
+
+    return per_file_counts
 
 
 # =============================================================================
@@ -627,30 +881,38 @@ async def process_folder_ingestion(
     folder_path: str,
     content_type: str,
     qdrant: AsyncQdrantClient,
+    redis: Redis,
     ue_version_override: str | None = None,
 ) -> None:
     """
-    Executa o pipeline de ETL Code-to-Doc completo para uma pasta.
+    Executa o pipeline de ETL Code-to-Doc completo para uma pasta, com
+    checkpoint/idempotência via manifesto no Redis (ver NOTA DE
+    ARQUITETURA no topo do módulo).
 
     Roda como BackgroundTask — não tem valor de retorno consumido por
     ninguém, então toda a comunicação de progresso/resultado acontece via
     logs estruturados em nível INFO (arquivos encontrados, progresso por
-    arquivo, lotes inseridos) e ERROR (falhas pontuais, sem propagar).
+    arquivo, lotes inseridos, checkpoints commitados) e ERROR (falhas
+    pontuais, sem propagar).
 
     Robustez: a falha catastrófica em UM arquivo (ex: header malformado,
-    timeout da LLM documentadora) é capturada e logada, e o loop continua
-    para o próximo arquivo — a pasta inteira nunca é abortada por causa de
-    um único arquivo problemático.
+    timeout da LLM documentadora, falha ao limpar órfãos no Qdrant) é
+    capturada e logada, e o loop continua para o próximo arquivo — a pasta
+    inteira nunca é abortada por causa de um único arquivo problemático.
+    Nesses casos, o manifesto simplesmente não é atualizado para o arquivo
+    afetado, garantindo que ele seja retentado na próxima execução.
     """
     root = Path(folder_path)
     collection_name = settings.qdrant_collection
     batch_size = settings.ingestion_batch_size
+    manifest_key = ingestion_manifest_key(collection_name)
 
     log.info(
-        "Ingestão iniciada | pasta=%s tipo=%s coleção=%s",
+        "Ingestão iniciada | pasta=%s tipo=%s coleção=%s manifesto=%s",
         root,
         content_type,
         collection_name,
+        manifest_key,
     )
 
     try:
@@ -663,6 +925,8 @@ async def process_folder_ingestion(
             exc_info=True,
         )
         return
+
+    manifest_cache = await _load_manifest_cache(redis, manifest_key)
 
     ue_version = ue_version_override or _extract_ue_version(str(root))
 
@@ -678,33 +942,109 @@ async def process_folder_ingestion(
     )
 
     pending: list[dict] = []
-    stats = {"processed": 0, "skipped": 0, "errors": 0, "chunks_indexed": 0}
+    tracking: dict[str, _PendingFileCommit] = {}
+    stats = {
+        "processed": 0,        # arquivos (re)processados nesta execução (novos ou modificados)
+        "modified": 0,         # subconjunto de 'processed': já existiam no manifesto com hash diferente
+        "skipped": 0,          # ignorados: checkpoint (hash idêntico) OU sem conteúdo semântico relevante
+        "errors": 0,           # falhas de leitura, limpeza de órfãos, chamada de LLM ou parsing
+        "chunks_indexed": 0,   # total de chunks efetivamente upsertados no Qdrant nesta execução
+        "partial_failures": 0, # processados mas NÃO commitados no manifesto (persistência incompleta)
+    }
 
     for i, file_path in enumerate(files, start=1):
-        log.info("[%d/%d] Processando arquivo: %s", i, total_files, file_path)
+        log.info("[%d/%d] Avaliando arquivo: %s", i, total_files, file_path)
+
         try:
+            raw_bytes = await _read_file_bytes(file_path)
+        except Exception as exc:
+            stats["errors"] += 1
+            log.error(
+                "Falha ao ler '%s' do disco — pulando para o próximo arquivo: %s",
+                file_path,
+                exc,
+                exc_info=True,
+            )
+            continue
+
+        file_hash = _compute_file_hash(raw_bytes)
+
+        try:
+            relative_key = file_path.relative_to(root).as_posix()
+        except ValueError:
+            # Defensivo: só ocorreria se `file_path` não estivesse de fato
+            # sob `root` (ex: symlink incomum). Cai para o caminho absoluto
+            # como chave em vez de abortar o arquivo.
+            relative_key = file_path.as_posix()
+            log.warning(
+                "Não foi possível calcular caminho relativo de '%s' em relação "
+                "a '%s' — usando caminho absoluto como chave do manifesto.",
+                file_path,
+                root,
+            )
+
+        source_file_str = str(file_path)
+        existing_hash = manifest_cache.get(relative_key)
+
+        # --- Checkpoint: arquivo inalterado desde a última ingestão -----
+        if existing_hash == file_hash:
+            stats["skipped"] += 1
+            log.info(
+                "[%d/%d] Ignorado — checkpoint OK (hash inalterado): %s",
+                i,
+                total_files,
+                file_path,
+            )
+            continue
+
+        is_modification = existing_hash is not None
+
+        try:
+            # --- Arquivo modificado: limpa órfãos ANTES de reprocessar ---
+            if is_modification:
+                log.info(
+                    "Arquivo modificado detectado (hash difere do manifesto) — "
+                    "removendo chunks antigos antes de reindexar: %s",
+                    file_path,
+                )
+                await _delete_file_chunks(qdrant, collection_name, source_file_str)
+                stats["modified"] += 1
+
+            raw_text = raw_bytes.decode("utf-8", errors="ignore")
+
             if content_type == "source_code":
-                chunks = await _process_header_file(file_path, ue_version)
+                chunks = await _process_header_file(file_path, raw_text, ue_version)
             else:
-                chunks = await _process_udn_file(file_path, ue_version)
+                chunks = await _process_udn_file(file_path, raw_text, ue_version)
 
             if not chunks:
                 stats["skipped"] += 1
                 continue
 
             stats["processed"] += 1
+            tracking[source_file_str] = _PendingFileCommit(
+                relative_key=relative_key,
+                file_hash=file_hash,
+                total_chunks=len(chunks),
+            )
             pending.extend(chunks)
 
             # Esvazia o buffer em lotes de tamanho batch_size sempre que
             # atinge (ou ultrapassa) o limite — loop, não "if", porque um
             # único arquivo grande pode gerar mais chunks que um lote inteiro.
             while len(pending) >= batch_size:
-                inserted = await _flush_batch(qdrant, collection_name, pending[:batch_size])
-                stats["chunks_indexed"] += inserted
-                pending = pending[batch_size:]
+                batch, pending = pending[:batch_size], pending[batch_size:]
+                per_file_counts = await _flush_batch(qdrant, collection_name, batch)
+                stats["chunks_indexed"] += sum(per_file_counts.values())
+                await _commit_confirmed_files(redis, manifest_key, tracking, per_file_counts)
 
         except Exception as exc:
             stats["errors"] += 1
+            # Descarta qualquer rastreamento parcial deste arquivo: como o
+            # manifesto mantém o hash antigo (ou nenhum), a próxima
+            # execução detectará a divergência de hash novamente e tentará
+            # o ciclo completo de remoção+reprocessamento uma vez mais.
+            tracking.pop(source_file_str, None)
             log.error(
                 "Erro ao processar '%s' — pulando para o próximo arquivo: %s",
                 file_path,
@@ -715,16 +1055,34 @@ async def process_folder_ingestion(
 
     # Flush final do que restou no buffer (menor que batch_size).
     if pending:
-        inserted = await _flush_batch(qdrant, collection_name, pending)
-        stats["chunks_indexed"] += inserted
+        per_file_counts = await _flush_batch(qdrant, collection_name, pending)
+        stats["chunks_indexed"] += sum(per_file_counts.values())
+        await _commit_confirmed_files(redis, manifest_key, tracking, per_file_counts)
+
+    # Qualquer arquivo que ainda reste em `tracking` neste ponto teve
+    # persistência PARCIAL (ex: falha de embedding em algum chunk, ou
+    # falha do upsert do lote correspondente) — nunca atingiu 100% dos
+    # seus chunks confirmados, portanto o manifesto NUNCA foi atualizado
+    # para ele. Será reprocessado integralmente na próxima ingestão.
+    for source_file, tracker in tracking.items():
+        stats["partial_failures"] += 1
+        log.warning(
+            "Arquivo NÃO commitado no manifesto (persistência parcial) | "
+            "arquivo=%s confirmados=%d/%d — será reprocessado na próxima ingestão.",
+            source_file,
+            tracker.confirmed_chunks,
+            tracker.total_chunks,
+        )
 
     log.info(
         "Ingestão concluída | pasta=%s arquivos_encontrados=%d processados=%d "
-        "ignorados=%d erros=%d chunks_indexados=%d",
+        "modificados=%d ignorados=%d erros=%d parciais=%d chunks_indexados=%d",
         root,
         total_files,
         stats["processed"],
+        stats["modified"],
         stats["skipped"],
         stats["errors"],
+        stats["partial_failures"],
         stats["chunks_indexed"],
     )
