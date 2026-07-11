@@ -96,9 +96,10 @@ from typing import Iterator
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qdrant_models
 from redis.asyncio import Redis
+from redis.asyncio.lock import Lock
 
 from app.core.config import settings
-from app.db.redis import ingestion_manifest_key
+from app.db.redis import ingestion_failures_key, ingestion_lock_key, ingestion_manifest_key
 from app.services.ai.embedding_service import embed_text
 from app.services.ai.rag_service import call_litellm
 
@@ -272,6 +273,21 @@ async def _process_header_file(path: Path, raw: str, ue_version: str) -> list[di
     if not cleaned:
         log.debug("Header vazio após limpeza, ignorado: %s", path)
         return []
+
+    # Rede de segurança: um header excepcionalmente grande pode estourar o
+    # contexto da LLM documentadora (erro context_length_exceeded). Sem
+    # truncar aqui, esse arquivo falharia sempre no mesmo ponto e seria
+    # reprocessado do zero em toda ingestão futura, sem jamais conseguir um
+    # checkpoint no manifesto. Cortar defensivamente é preferível a perder o
+    # arquivo inteiro — a documentação gerada cobre a parte inicial da classe.
+    max_chars = settings.ingestion_max_header_chars
+    if len(cleaned) > max_chars:
+        log.warning(
+            "Header '%s' tem %d chars após limpeza (limite=%d) — truncando "
+            "antes de enviar à LLM documentadora para evitar estouro de contexto.",
+            path, len(cleaned), max_chars,
+        )
+        cleaned = cleaned[:max_chars]
 
     title = class_name or path.stem
 
@@ -565,33 +581,70 @@ async def _load_manifest_cache(redis: Redis, manifest_key: str) -> dict[str, str
         )
         return {}
 
-def filter_orphan_headers(chunks: list[str]) -> list[str]:
-    """
-    Filtra chunks que são apenas linhas de cabeçalho Markdown órfãs,
-    evitando o envio de pontos sem substância semântica para o Qdrant.
-    """
-    cleaned_chunks = []
-    for chunk in chunks:
-        text_stripped = chunk.strip()
-        
-        # Divide o chunk em linhas válidas (removendo linhas vazias)
-        lines = [line.strip() for line in text_stripped.split('\n') if line.strip()]
-        
-        # Se o chunk está vazio, pula
-        if not lines:
-            continue
-            
-        # Caso 1: O chunk só tem UMA linha e ela começa com '#' (Cabeçalho puro)
-        if len(lines) == 1 and lines[0].startswith('#'):
-            continue
-            
-        # Caso 2: Proteção extra por tamanho (chunks menores que 60 caracteres que começam com #)
-        if len(text_stripped) < 60 and text_stripped.startswith('#'):
-            continue
-            
-        cleaned_chunks.append(chunk)
-        
-    return cleaned_chunks
+
+# =============================================================================
+# QUARENTENA — falhas consecutivas por arquivo
+# =============================================================================
+# Sem isso, um arquivo permanentemente quebrado (ex: um chunk que sempre
+# falha no embedding, ou um erro de parsing determinístico) nunca alcança
+# `confirmed_chunks == total_chunks`, nunca entra no manifesto, e é
+# reprocessado do zero — chamando a LLM documentadora de novo — em TODA
+# ingestão futura, para sempre. Rastreamos falhas consecutivas por arquivo
+# num hash separado do manifesto e paramos de tentar após N falhas seguidas,
+# até intervenção manual.
+
+async def _load_failures_cache(redis: Redis, failures_key: str) -> dict[str, int]:
+    try:
+        raw = await redis.hgetall(failures_key)
+        return {key: int(value) for key, value in raw.items()}
+    except Exception as exc:
+        log.error(
+            "Falha ao carregar contador de falhas '%s' do Redis: %s. "
+            "Prosseguindo sem cache de quarentena.",
+            failures_key,
+            exc,
+            exc_info=True,
+        )
+        return {}
+
+
+async def _record_failure(
+    redis: Redis,
+    failures_key: str,
+    failures_cache: dict[str, int],
+    relative_key: str,
+) -> int:
+    new_count = failures_cache.get(relative_key, 0) + 1
+    failures_cache[relative_key] = new_count
+    try:
+        await redis.hset(failures_key, relative_key, new_count)
+    except Exception as exc:
+        log.error(
+            "Falha ao persistir contador de falhas para '%s': %s",
+            relative_key,
+            exc,
+            exc_info=True,
+        )
+    return new_count
+
+
+async def _clear_failure(
+    redis: Redis,
+    failures_key: str,
+    failures_cache: dict[str, int],
+    relative_key: str,
+) -> None:
+    if relative_key not in failures_cache:
+        return
+    failures_cache.pop(relative_key, None)
+    try:
+        await redis.hdel(failures_key, relative_key)
+    except Exception as exc:
+        log.warning(
+            "Falha ao limpar contador de falhas para '%s' (não crítico): %s",
+            relative_key,
+            exc,
+        )
 
 async def _delete_file_chunks(
     qdrant: AsyncQdrantClient,
@@ -624,6 +677,8 @@ async def _commit_confirmed_files(
     manifest_key: str,
     tracking: dict[str, _PendingFileCommit],
     per_file_counts: dict[str, int],
+    failures_key: str | None = None,
+    failures_cache: dict[str, int] | None = None,
 ) -> None:
     for source_file, confirmed in per_file_counts.items():
         tracker = tracking.get(source_file)
@@ -644,6 +699,10 @@ async def _commit_confirmed_files(
                 exc_info=True,
             )
             continue
+
+        # Sucesso confirmado — o arquivo sai de quarentena, se estava nela.
+        if failures_key is not None and failures_cache is not None:
+            await _clear_failure(redis, failures_key, failures_cache, tracker.relative_key)
 
         log.info(
             "Checkpoint commitado | arquivo=%s hash=%s chunks=%d/%d",
@@ -736,10 +795,78 @@ async def process_folder_ingestion(
     redis: Redis,
     ue_version_override: str | None = None,
 ) -> None:
-    root = Path(folder_path)
+    """
+    Entrypoint chamado pelo BackgroundTasks. Serializa a execução por
+    coleção via lock distribuído no Redis antes de delegar o trabalho para
+    `_run_ingestion`.
+
+    NOTA DE CONCORRÊNCIA: sem esse lock, duas ingestões concorrentes para a
+    mesma coleção (ex: um retry acidental do operador, ou dois canais
+    disparados em paralelo) podem intercalar o ciclo
+    delete-antigo → gera-chunks → upsert-novo do MESMO arquivo. Isso pode
+    fazer uma execução apagar pontos que a outra acabou de inserir, enquanto
+    o manifesto é commitado como se tudo estivesse íntegro — uma perda
+    silenciosa de dados que só aparece depois, como um buraco na base
+    vetorial. O lock evita esse cenário aceitando apenas uma execução por
+    vez por coleção; uma segunda tentativa concorrente é simplesmente
+    rejeitada com um aviso, em vez de rodar em paralelo.
+    """
     collection_name = settings.qdrant_collection
+    lock_key = ingestion_lock_key(collection_name)
+    lock = Lock(
+        redis,
+        lock_key,
+        timeout=settings.ingestion_lock_timeout_seconds,
+        blocking=False,
+    )
+
+    acquired = await lock.acquire()
+    if not acquired:
+        log.warning(
+            "Ingestão para a coleção '%s' já está em andamento (lock '%s' "
+            "ocupado) — descartando esta chamada duplicada em vez de rodar "
+            "em paralelo.",
+            collection_name,
+            lock_key,
+        )
+        return
+
+    try:
+        await _run_ingestion(
+            folder_path=folder_path,
+            content_type=content_type,
+            qdrant=qdrant,
+            redis=redis,
+            collection_name=collection_name,
+            ue_version_override=ue_version_override,
+        )
+    finally:
+        try:
+            await lock.release()
+        except Exception as exc:
+            # Não crítico: se o lock já expirou por TTL (ingestion_lock_timeout_seconds),
+            # release() pode falhar por já não pertencer mais a este processo.
+            log.warning(
+                "Falha ao liberar lock '%s' (provavelmente já expirou por TTL): %s",
+                lock_key,
+                exc,
+            )
+
+
+async def _run_ingestion(
+    folder_path: str,
+    content_type: str,
+    qdrant: AsyncQdrantClient,
+    redis: Redis,
+    collection_name: str,
+    ue_version_override: str | None = None,
+) -> None:
+    """Corpo real do pipeline de ingestão, protegido pelo lock do chamador."""
+    root = Path(folder_path)
     batch_size = settings.ingestion_batch_size
     manifest_key = ingestion_manifest_key(collection_name)
+    failures_key = ingestion_failures_key(collection_name)
+    max_failures = settings.ingestion_max_consecutive_failures
 
     log.info(
         "Ingestão iniciada | pasta=%s tipo=%s coleção=%s manifesto=%s",
@@ -761,6 +888,7 @@ async def process_folder_ingestion(
         return
 
     manifest_cache = await _load_manifest_cache(redis, manifest_key)
+    failures_cache = await _load_failures_cache(redis, failures_key)
     ue_version = ue_version_override or _extract_ue_version(str(root))
     extension = ".h" if content_type == "source_code" else ".udn"
     
@@ -781,6 +909,7 @@ async def process_folder_ingestion(
         "modified": 0,
         "skipped": 0,
         "errors": 0,
+        "quarantined": 0,
         "chunks_indexed": 0,
         "partial_failures": 0,
     }
@@ -788,22 +917,36 @@ async def process_folder_ingestion(
     for i, file_path in enumerate(files, start=1):
         log.info("[%d/%d] Avaliando arquivo: %s", i, total_files, file_path)
 
-        try:
-            raw_bytes = await _read_file_bytes(file_path)
-        except Exception as exc:
-            stats["errors"] += 1
-            log.error("Falha ao ler '%s' do disco: %s", file_path, exc, exc_info=True)
-            continue
-
-        file_hash = _compute_file_hash(raw_bytes)
         source_file_str = str(file_path)
-        
+
         try:
             relative_key = file_path.relative_to(root).as_posix()
         except ValueError:
             relative_key = file_path.as_posix()
             log.warning("Caminho relativo falhou para '%s' — usando absoluto.", file_path)
 
+        # Quarentena: arquivo já falhou de forma consecutiva N vezes — não
+        # tenta de novo automaticamente até que o contador seja limpo
+        # manualmente (HDEL na chave de falhas) ou o arquivo seja corrigido
+        # e reingestão manual disparada.
+        if failures_cache.get(relative_key, 0) >= max_failures:
+            stats["quarantined"] += 1
+            log.error(
+                "[%d/%d] Arquivo em quarentena (%d falhas consecutivas) — "
+                "pulando sem tentar novamente: %s",
+                i, total_files, failures_cache[relative_key], file_path,
+            )
+            continue
+
+        try:
+            raw_bytes = await _read_file_bytes(file_path)
+        except Exception as exc:
+            stats["errors"] += 1
+            await _record_failure(redis, failures_key, failures_cache, relative_key)
+            log.error("Falha ao ler '%s' do disco: %s", file_path, exc, exc_info=True)
+            continue
+
+        file_hash = _compute_file_hash(raw_bytes)
         existing_hash = manifest_cache.get(relative_key)
 
         # Checkpoint: Ignora apenas se confirmadamente inalterado
@@ -820,6 +963,7 @@ async def process_folder_ingestion(
                 stats["modified"] += 1
         except Exception as exc:
             stats["errors"] += 1
+            await _record_failure(redis, failures_key, failures_cache, relative_key)
             log.error("Falha na limpeza de órfãos para '%s' — ignorando: %s", file_path, exc)
             continue
 
@@ -877,11 +1021,15 @@ async def process_folder_ingestion(
                 batch, pending = pending[:batch_size], pending[batch_size:]
                 per_file_counts = await _flush_batch(qdrant, collection_name, batch)
                 stats["chunks_indexed"] += sum(per_file_counts.values())
-                await _commit_confirmed_files(redis, manifest_key, tracking, per_file_counts)
+                await _commit_confirmed_files(
+                    redis, manifest_key, tracking, per_file_counts,
+                    failures_key=failures_key, failures_cache=failures_cache,
+                )
 
         except Exception as exc:
             stats["errors"] += 1
             tracking.pop(source_file_str, None)
+            await _record_failure(redis, failures_key, failures_cache, relative_key)
             log.error("Erro processando '%s' — ignorando: %s", file_path, exc, exc_info=True)
             continue
 
@@ -889,7 +1037,10 @@ async def process_folder_ingestion(
     if pending:
         per_file_counts = await _flush_batch(qdrant, collection_name, pending)
         stats["chunks_indexed"] += sum(per_file_counts.values())
-        await _commit_confirmed_files(redis, manifest_key, tracking, per_file_counts)
+        await _commit_confirmed_files(
+            redis, manifest_key, tracking, per_file_counts,
+            failures_key=failures_key, failures_cache=failures_cache,
+        )
 
     # Identificação de falhas parciais (chunks perdidos no embedding/upsert limitaram commit)
     for source_file, tracker in tracking.items():
@@ -904,13 +1055,14 @@ async def process_folder_ingestion(
 
     log.info(
         "Ingestão concluída | pasta=%s arquivos_encontrados=%d processados=%d "
-        "modificados=%d ignorados=%d erros=%d parciais=%d chunks_indexados=%d",
+        "modificados=%d ignorados=%d erros=%d quarentena=%d parciais=%d chunks_indexados=%d",
         root,
         total_files,
         stats["processed"],
         stats["modified"],
         stats["skipped"],
         stats["errors"],
+        stats["quarantined"],
         stats["partial_failures"],
         stats["chunks_indexed"],
     )

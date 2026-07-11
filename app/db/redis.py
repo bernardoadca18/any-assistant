@@ -125,3 +125,24 @@ def ingestion_manifest_key(collection_name: str) -> str:
     completo de leitura/escrita.
     """
     return f"manifest:{collection_name}"
+
+
+def ingestion_lock_key(collection_name: str) -> str:
+    """
+    Chave Redis do lock distribuído que serializa execuções de
+    `process_folder_ingestion` para uma mesma coleção, evitando que duas
+    ingestões concorrentes intercalem delete/upsert do mesmo arquivo e
+    corrompam silenciosamente o manifesto (ver ingestion_service.py).
+    """
+    return f"lock:ingestion:{collection_name}"
+
+
+def ingestion_failures_key(collection_name: str) -> str:
+    """
+    Chave Redis (Hash) que rastreia falhas consecutivas por arquivo durante
+    a ingestão: caminho relativo → contador de falhas. Usada para colocar em
+    quarentena arquivos permanentemente quebrados (ex: estouro de contexto,
+    embedding malformado) após N tentativas, evitando reprocessamento
+    infinito. Zerada para um arquivo assim que ele é commitado com sucesso.
+    """
+    return f"ingestion_failures:{collection_name}"

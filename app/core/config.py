@@ -213,6 +213,50 @@ class Settings(BaseSettings):
             "automaticamente um padrão 'X.Y' do caminho da pasta ingerida."
         ),
     )
+    ingestion_lock_timeout_seconds: int = Field(
+        default=3600,
+        ge=60,
+        description=(
+            "TTL (em segundos) do lock distribuído no Redis que serializa "
+            "execuções de `process_folder_ingestion` por coleção. Age como "
+            "rede de segurança: se o processo morrer sem liberar o lock, ele "
+            "expira sozinho após esse tempo em vez de travar ingestões futuras "
+            "para sempre."
+        ),
+    )
+    ingestion_max_header_chars: int = Field(
+        default=12_000,
+        ge=1_000,
+        description=(
+            "Tamanho máximo (em caracteres) do header C++ já limpo enviado à "
+            "LLM documentadora do Canal A. Headers acima desse limite são "
+            "truncados antes da chamada para evitar erros de estouro de "
+            "contexto (context_length_exceeded), que sem esse corte fariam o "
+            "arquivo falhar e ser reprocessado do zero em toda ingestão futura."
+        ),
+    )
+    ingestion_max_consecutive_failures: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description=(
+            "Número de falhas consecutivas de um mesmo arquivo (erro de "
+            "leitura, LLM ou embedding) antes de colocá-lo em quarentena — "
+            "ele para de ser reprocessado automaticamente até intervenção "
+            "manual, evitando desperdiçar chamadas de LLM/embedding em loop "
+            "por um arquivo permanentemente quebrado."
+        ),
+    )
+    litellm_max_retries: int = Field(
+        default=4,
+        ge=1,
+        le=10,
+        description=(
+            "Número máximo de tentativas (incluindo a primeira) para chamadas "
+            "ao LiteLLM (chat/completions e embeddings) em caso de erro "
+            "transitório (HTTP 429/500/502/503/504 ou timeout)."
+        ),
+    )
 
 
 @lru_cache(maxsize=1)

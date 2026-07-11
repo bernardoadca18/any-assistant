@@ -40,6 +40,12 @@ from typing import Any
 import httpx
 from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 from app.core.config import settings
 from app.schemas.chat import ChatRequest, ChatResponse, RetrievedChunk
@@ -691,6 +697,82 @@ def _build_augmented_message(user_question: str, context: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Client HTTP compartilhado — chat/completions do LiteLLM
+# ---------------------------------------------------------------------------
+# NOTA DE PERFORMANCE: `call_litellm()` costumava abrir um httpx.AsyncClient
+# novo a cada chamada (handshake TCP/TLS do zero a cada request). Isso é
+# caro quando a função é chamada em volume alto — por exemplo, uma vez por
+# header C++ durante a ingestão Code-to-Doc (potencialmente milhares de
+# chamadas numa única execução de `process_folder_ingestion`). Agora
+# reutilizamos um client singleton com connection pooling, no mesmo padrão
+# já usado pelo EmbeddingService (ver embedding_service.py).
+
+_litellm_client: httpx.AsyncClient | None = None
+
+
+async def init_litellm_client() -> httpx.AsyncClient:
+    """
+    Cria o client HTTP compartilhado para chamadas de chat/completions ao
+    LiteLLM. Deve ser chamado no lifespan startup do FastAPI (ver main.py).
+    """
+    global _litellm_client
+    _litellm_client = httpx.AsyncClient(
+        base_url=settings.litellm_base_url,
+        headers=settings.litellm_headers,
+        timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0),
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    )
+    log.info("Client HTTP do LiteLLM (chat/completions) inicializado.")
+    return _litellm_client
+
+
+async def close_litellm_client() -> None:
+    """Fecha o client HTTP compartilhado do LiteLLM. Chamado no shutdown."""
+    global _litellm_client
+    if _litellm_client:
+        await _litellm_client.aclose()
+        _litellm_client = None
+        log.info("Client HTTP do LiteLLM (chat/completions) encerrado.")
+
+
+def _get_litellm_client() -> httpx.AsyncClient:
+    if _litellm_client is None:
+        raise RuntimeError(
+            "Client HTTP do LiteLLM não inicializado. Verifique o lifespan."
+        )
+    return _litellm_client
+
+
+def _is_retryable_litellm_error(exc: BaseException) -> bool:
+    """
+    Define quais falhas justificam retry com backoff exponencial: timeouts e
+    erros HTTP tipicamente transitórios (rate limit e 5xx). Erros 4xx que não
+    sejam 429 (payload malformado, modelo inexistente, etc.) NÃO são
+    retentados — insistir não resolve um erro de requisição malformada, só
+    atrasa a falha e desperdiça tentativas.
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (429, 500, 502, 503, 504)
+    return False
+
+
+@retry(
+    retry=retry_if_exception(_is_retryable_litellm_error),
+    wait=wait_exponential_jitter(initial=2, max=30),
+    stop=stop_after_attempt(settings.litellm_max_retries),
+    reraise=True,
+)
+async def _post_chat_completion(
+    client: httpx.AsyncClient, path: str, payload: dict
+) -> httpx.Response:
+    resp = await client.post(path, json=payload)
+    resp.raise_for_status()
+    return resp
+
+
+# ---------------------------------------------------------------------------
 # Chamada ao LiteLLM
 # ---------------------------------------------------------------------------
 
@@ -701,14 +783,20 @@ async def call_litellm(
     """
     Chama o LiteLLM proxy com o histórico de mensagens e retorna a resposta.
 
+    Reutiliza o client HTTP compartilhado (ver init_litellm_client) e tenta
+    novamente com backoff exponencial + jitter em caso de erro transitório
+    (timeout, HTTP 429 ou 5xx) — até `settings.litellm_max_retries`
+    tentativas antes de desistir.
+
     Returns:
         Tupla (resposta_texto, prompt_tokens, completion_tokens).
         Os tokens podem ser None se o modelo não reportar usage.
 
     Raises:
-        RuntimeError: em caso de erro HTTP ou resposta malformada.
+        RuntimeError: em caso de erro HTTP persistente (após as tentativas
+            de retry) ou resposta malformada.
     """
-    url = f"{settings.litellm_base_url}/chat/completions"
+    client = _get_litellm_client()
     payload = {
         "model": model,
         "messages": messages,
@@ -716,22 +804,18 @@ async def call_litellm(
         "max_tokens": 2048,
     }
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
-    ) as client:
-        try:
-            resp = await client.post(url, json=payload, headers=settings.litellm_headers)
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise RuntimeError(
-                f"LiteLLM retornou HTTP {exc.response.status_code}: "
-                f"{exc.response.text[:300]}"
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise RuntimeError(
-                f"Timeout ao chamar LiteLLM (model={model}). "
-                "Verifique se o modelo está carregado."
-            ) from exc
+    try:
+        resp = await _post_chat_completion(client, "/chat/completions", payload)
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(
+            f"LiteLLM retornou HTTP {exc.response.status_code} (model={model}) "
+            f"após esgotar as tentativas de retry: {exc.response.text[:300]}"
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(
+            f"Timeout ao chamar LiteLLM (model={model}) após esgotar as "
+            "tentativas de retry. Verifique se o modelo está carregado."
+        ) from exc
 
     data = resp.json()
 

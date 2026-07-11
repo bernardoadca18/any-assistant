@@ -23,6 +23,7 @@ from app.core.logging import setup_logging
 from app.db.qdrant import close_qdrant, init_qdrant
 from app.db.redis import close_redis, init_redis
 from app.services.ai.embedding_service import close_embedding_client, init_embedding_client
+from app.services.ai.rag_service import close_litellm_client, init_litellm_client
 
 setup_logging()
 log = logging.getLogger(__name__)
@@ -36,12 +37,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     STARTUP:
         1. Qdrant  — valida coleção 'ue5_docs'
         2. Redis   — pool de conexões para sessões
-        3. LiteLLM — cliente HTTP para embeddings e LLM (mesmo proxy)
+        3. LiteLLM — cliente HTTP para embeddings (mesmo proxy)
+        4. LiteLLM — cliente HTTP para chat/completions (mesmo proxy)
 
     SHUTDOWN (ordem inversa):
-        1. LiteLLM client fechado
-        2. Redis fechado
-        3. Qdrant fechado
+        1. LiteLLM client de chat/completions fechado
+        2. LiteLLM client de embeddings fechado
+        3. Redis fechado
+        4. Qdrant fechado
     """
     log.info("=" * 60)
     log.info("Iniciando %s v%s [%s]", settings.app_name, settings.app_version, settings.app_env)
@@ -67,6 +70,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         log.error("FALHA ao inicializar EmbeddingService: %s", exc)
         startup_errors.append(f"EmbeddingService: {exc}")
 
+    try:
+        await init_litellm_client()
+    except Exception as exc:
+        log.error("FALHA ao inicializar client de chat/completions do LiteLLM: %s", exc)
+        startup_errors.append(f"LiteLLM (chat): {exc}")
+
     if startup_errors:
         log.warning(
             "Aplicação iniciada com %d erro(s) de dependência: %s",
@@ -83,6 +92,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     log.info("Encerrando aplicação...")
+    await close_litellm_client()
     await close_embedding_client()
     await close_redis()
     await close_qdrant()

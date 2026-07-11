@@ -24,6 +24,12 @@ from __future__ import annotations
 import logging
 
 import httpx
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 from app.core.config import settings
 
@@ -77,6 +83,37 @@ def get_embedding_client() -> httpx.AsyncClient:
 
 
 # ---------------------------------------------------------------------------
+# Retry / backoff para erros transitórios
+# ---------------------------------------------------------------------------
+# NOTA: durante a ingestão em lote (ver ingestion_service.py), esta função é
+# chamada dezenas de milhares de vezes numa única execução. Sem retry, um
+# rate limit (429) ou uma falha momentânea do Ollama/LiteLLM derruba o chunk
+# inteiro na hora — o loop principal segue imediatamente para o próximo
+# chunk sem pausa, o que pode transformar um soluço passageiro numa cascata
+# de falhas por todo o restante do lote. O backoff exponencial + jitter dá
+# tempo do serviço se recuperar antes de desistir do chunk.
+
+def _is_retryable_embedding_error(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (429, 500, 502, 503, 504)
+    return False
+
+
+@retry(
+    retry=retry_if_exception(_is_retryable_embedding_error),
+    wait=wait_exponential_jitter(initial=2, max=30),
+    stop=stop_after_attempt(settings.litellm_max_retries),
+    reraise=True,
+)
+async def _post_embedding(client: httpx.AsyncClient, payload: dict) -> httpx.Response:
+    resp = await client.post("/embeddings", json=payload)
+    resp.raise_for_status()
+    return resp
+
+
+# ---------------------------------------------------------------------------
 # Função principal de embedding
 # ---------------------------------------------------------------------------
 
@@ -94,7 +131,8 @@ async def embed_text(text: str) -> list[float]:
         Lista de floats com dimensão 1024 (mxbai-embed-large).
 
     Raises:
-        RuntimeError: se o LiteLLM/Ollama retornar erro ou resposta inesperada.
+        RuntimeError: se o LiteLLM/Ollama retornar erro persistente (após as
+            tentativas de retry) ou resposta inesperada.
     """
     if _http_client is None:
         raise RuntimeError("EmbeddingService não inicializado. Verifique o lifespan.")
@@ -106,18 +144,17 @@ async def embed_text(text: str) -> list[float]:
     }
 
     try:
-        resp = await _http_client.post("/embeddings", json=payload)
-        resp.raise_for_status()
+        resp = await _post_embedding(_http_client, payload)
     except httpx.HTTPStatusError as exc:
         raise RuntimeError(
-            f"LiteLLM retornou HTTP {exc.response.status_code} ao gerar embedding: "
-            f"{exc.response.text[:400]}"
+            f"LiteLLM retornou HTTP {exc.response.status_code} ao gerar embedding "
+            f"após esgotar as tentativas de retry: {exc.response.text[:400]}"
         ) from exc
     except httpx.TimeoutException as exc:
         raise RuntimeError(
-            f"Timeout ao gerar embedding via LiteLLM "
-            f"(model={settings.embedding_model}). "
-            "Verifique se o LiteLLM e o Ollama estão respondendo."
+            f"Timeout ao gerar embedding via LiteLLM (model={settings.embedding_model}) "
+            "após esgotar as tentativas de retry. Verifique se o LiteLLM e o "
+            "Ollama estão respondendo."
         ) from exc
 
     data = resp.json()

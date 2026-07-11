@@ -18,6 +18,12 @@ redis[hiredis]==5.2.1
 # --- HTTP Client (LiteLLM + Ollama — ambos usam httpx) ----------------------
 httpx==0.28.1
 
+# --- Retry / Backoff ----------------------------------------------------------
+# Usado nas chamadas ao LiteLLM (chat/completions e embeddings) para tolerar
+# erros transitórios (rate limit 429, 5xx, timeout) com backoff exponencial +
+# jitter, em vez de falhar imediatamente e martelar a API em loop apertado.
+tenacity==9.0.0
+
 # --- Advanced RAG — Cross-Encoder Reranker -----------------------------------
 # FlashRank: reranker Cross-Encoder extremamente leve, roda em CPU em ~10-50ms.
 # Modelos ONNX embutidos, sem dependência de GPU, sem chamada de API externa.
