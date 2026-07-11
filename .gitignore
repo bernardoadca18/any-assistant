@@ -4,3 +4,5 @@
 node_modules
 repomix*
 logs
+report.json
+report.md
