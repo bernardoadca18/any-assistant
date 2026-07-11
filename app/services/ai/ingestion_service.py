@@ -565,6 +565,33 @@ async def _load_manifest_cache(redis: Redis, manifest_key: str) -> dict[str, str
         )
         return {}
 
+def filter_orphan_headers(chunks: list[str]) -> list[str]:
+    """
+    Filtra chunks que são apenas linhas de cabeçalho Markdown órfãs,
+    evitando o envio de pontos sem substância semântica para o Qdrant.
+    """
+    cleaned_chunks = []
+    for chunk in chunks:
+        text_stripped = chunk.strip()
+        
+        # Divide o chunk em linhas válidas (removendo linhas vazias)
+        lines = [line.strip() for line in text_stripped.split('\n') if line.strip()]
+        
+        # Se o chunk está vazio, pula
+        if not lines:
+            continue
+            
+        # Caso 1: O chunk só tem UMA linha e ela começa com '#' (Cabeçalho puro)
+        if len(lines) == 1 and lines[0].startswith('#'):
+            continue
+            
+        # Caso 2: Proteção extra por tamanho (chunks menores que 60 caracteres que começam com #)
+        if len(text_stripped) < 60 and text_stripped.startswith('#'):
+            continue
+            
+        cleaned_chunks.append(chunk)
+        
+    return cleaned_chunks
 
 async def _delete_file_chunks(
     qdrant: AsyncQdrantClient,
@@ -808,6 +835,34 @@ async def process_folder_ingestion(
             if not chunks:
                 stats["skipped"] += 1
                 continue
+
+            # --- FILTRAGEM DE CHUNKS VAZIOS / CABEÇALHOS ÓRFÃOS ---
+            filtered_chunks = []
+            for chunk in chunks:
+                # Extrai o texto do chunk tratando de forma segura se ele for dict ou objeto
+                text = chunk.get("text", "") if isinstance(chunk, dict) else getattr(chunk, "text", "")
+                
+                # Divide em linhas reais e limpa os espaços em branco das extremidades
+                lines = [line.strip() for line in text.split("\n") if line.strip()]
+                
+                # Se o chunk não tiver nenhuma linha válida, descarta
+                if not lines:
+                    continue
+                
+                # Se só tem 1 linha e ela começa com '#', é um cabeçalho cortado/órfão. Descarta.
+                if len(lines) == 1 and lines[0].startswith("#"):
+                    log.info("Dropando cabeçalho órfão do pipeline: '%s'", lines[0])
+                    continue
+                
+                filtered_chunks.append(chunk)
+            
+            # Substitui a lista original pela lista filtrada limpa
+            chunks = filtered_chunks
+
+            if not chunks:
+                stats["skipped"] += 1
+                continue
+            # -----------------------------------------------------
 
             stats["processed"] += 1
             tracking[source_file_str] = _PendingFileCommit(
