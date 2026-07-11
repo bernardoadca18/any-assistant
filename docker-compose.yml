@@ -21,7 +21,7 @@ services:
   # QDRANT — Vector Database (sem healthcheck interno — imagem distroless)
   # ---------------------------------------------------------------------------
   qdrant:
-    image: qdrant/qdrant:v1.9.2
+    image: qdrant/qdrant:v1.10.1
     container_name: ue5-qdrant
     restart: unless-stopped
     environment:
@@ -53,7 +53,6 @@ services:
     image: alpine:3.19
     container_name: ue5-qdrant-healthcheck
     restart: unless-stopped
-    # Mantém o container vivo — o healthcheck é o que importa
     command: ["sh", "-c", "while true; do sleep 30; done"]
     networks:
       - assistant_internal
