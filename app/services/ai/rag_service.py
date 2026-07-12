@@ -112,34 +112,49 @@ está na Referência Direta com base na Análise Semântica.\
 # ---------------------------------------------------------------------------
 
 _DECOMPOSITION_SYSTEM_PROMPT = """\
-Você é um sistema especializado em decomposição de queries para busca vetorial \
-em documentação técnica da Unreal Engine 5.
+Você é um sistema especializado em tradução e decomposição de queries para \
+busca vetorial em documentação técnica da Unreal Engine 5.
 
-Sua única função é analisar a pergunta do usuário e quebrá-la em sub-queries \
-técnicas e concisas, cada uma otimizada para recuperar um conjunto específico \
-de chunks da documentação UE5 via similaridade semântica.
+A base vetorial (Qdrant) é 100% em INGLÊS TÉCNICO — tanto os headers C++ \
+documentados quanto a documentação oficial .udn da Epic. Se qualquer query \
+usada para gerar embedding chegar em português, ela sofre de mismatch \
+cross-lingual contra o corpus e recupera chunks ruins ou nenhum chunk. \
+Por isso NENHUMA query em português pode ser usada para embedding — \
+inclusive a "query 0" (tradução literal) abaixo.
+
+Sua função tem DUAS partes:
+1. TRADUÇÃO LITERAL (query 0): traduza a pergunta do usuário para inglês \
+técnico da forma mais fiel possível, preservando a intenção original sem \
+reformular ou expandir. Esta é a âncora usada como substituta da query \
+original nas buscas.
+2. SUB-QUERIES TÉCNICAS (1 a 3 adicionais): decomponha em sub-queries \
+técnicas e concisas, cada uma otimizada para recuperar um conjunto \
+específico de chunks via similaridade semântica.
 
 REGRAS ESTRITAS:
-1. Gere no MÁXIMO 3 sub-queries. Se a pergunta já for simples e focada, \
-gere apenas 1 ou 2.
-2. Cada sub-query deve ser em inglês técnico, curta (5-12 palavras) e \
+1. "translated_query" é OBRIGATÓRIA em todo resultado — é a tradução \
+literal em inglês da pergunta do usuário, nunca vazia.
+2. Gere no MÁXIMO 3 "sub_queries" técnicas. Se a pergunta já for simples e \
+focada, gere apenas 1 ou 2 (pode ser até 0 se a tradução literal já cobrir \
+tudo).
+3. Cada sub-query deve ser em inglês técnico, curta (5-12 palavras) e \
 focada em um único conceito ou tarefa da UE5.
-3. Use terminologia UE5 precisa: ACharacter, UMovementComponent, AnimBlueprint, \
+4. Use terminologia UE5 precisa: ACharacter, UMovementComponent, AnimBlueprint, \
 AnimInstance, BlueprintCallable, UFUNCTION, etc.
-4. NÃO inclua explicações, numeração ou texto extra. Retorne APENAS JSON válido.
-5. Formato de saída OBRIGATÓRIO (JSON puro, sem markdown, sem texto extra):
-{"sub_queries": ["query técnica 1", "query técnica 2", "query técnica 3"]}
+5. NÃO inclua explicações, numeração ou texto extra. Retorne APENAS JSON válido.
+6. Formato de saída OBRIGATÓRIO (JSON puro, sem markdown, sem texto extra):
+{"translated_query": "tradução literal em inglês", "sub_queries": ["query técnica 1", "query técnica 2"]}
 
 EXEMPLOS:
 
 Pergunta: "Como programar o pulo em C++ e configurar a animação de salto?"
-Saída: {"sub_queries": ["ACharacter Jump input binding C++ AddMovementInput", "UE5 Animation Blueprint state machine jump transition", "AnimNotify jump landing C++ Blueprint integration"]}
+Saída: {"translated_query": "How to program jumping in C++ and set up the jump animation?", "sub_queries": ["ACharacter Jump input binding C++ AddMovementInput", "UE5 Animation Blueprint state machine jump transition", "AnimNotify jump landing C++ Blueprint integration"]}
 
 Pergunta: "O que é o Lumen e como ativar GI global no UE5?"
-Saída: {"sub_queries": ["Lumen Global Illumination system UE5 architecture", "enable dynamic global illumination Lumen project settings"]}
+Saída: {"translated_query": "What is Lumen and how to enable global GI in UE5?", "sub_queries": ["Lumen Global Illumination system UE5 architecture", "enable dynamic global illumination Lumen project settings"]}
 
 Pergunta: "Como usar Niagara para efeitos de partícula de fogo?"
-Saída: {"sub_queries": ["Niagara particle system fire emitter UE5 setup"]}
+Saída: {"translated_query": "How to use Niagara for fire particle effects?", "sub_queries": ["Niagara particle system fire emitter UE5 setup"]}
 """
 
 
@@ -149,18 +164,32 @@ Saída: {"sub_queries": ["Niagara particle system fire emitter UE5 setup"]}
 
 async def decompose_query(user_question: str) -> list[str]:
     """
-    Decompõe a query do usuário em sub-queries técnicas para busca vetorial.
+    Traduz a query do usuário para inglês técnico e a decompõe em sub-queries
+    técnicas para busca vetorial.
+
+    CORREÇÃO CRÍTICA (mismatch cross-lingual): a base vetorial é 100% inglês
+    (ver ingestion_service.py). Anteriormente, a query original em PT-BR era
+    SEMPRE incluída na lista de busca (ver histórico), garantindo que toda
+    requisição tivesse pelo menos uma busca vetorial em desvantagem
+    cross-lingual — a causa raiz de scores baixos e chunks existentes não
+    sendo recuperados. Agora a primeira posição da lista retornada é sempre
+    a TRADUÇÃO LITERAL em inglês (nunca o texto original em português),
+    e ela é o que deve ser usado para gerar o embedding "principal" no
+    chamador (ver _run_advanced_retrieval).
 
     Faz uma chamada assíncrona leve ao LLM de decomposição e parseia
-    o JSON de saída. Em caso de qualquer falha, retorna apenas a query
-    original (fallback seguro).
+    o JSON de saída. Em caso de falha do modelo principal E do fallback,
+    a query original em português É usada como último recurso (com aviso
+    alto no log) para nunca deixar a requisição sem resposta — mas isso
+    deve ser tratado como incidente operacional, não como caminho normal.
 
     Args:
         user_question: Pergunta original do usuário.
 
     Returns:
-        Lista contendo a query original + sub-queries geradas (sem duplicatas).
-        Garante que a query original SEMPRE está na lista resultante.
+        Lista de queries em inglês para busca vetorial: [tradução_literal,
+        *sub_queries_técnicas], sem duplicatas. Só contém texto em português
+        no caso extremo de falha total de tradução (ver NOTA acima).
     """
     # Lê configurações em runtime para permitir override sem recompilação
     decomp_model = getattr(settings, "rag_decomposition_model", _DECOMPOSITION_MODEL)
@@ -213,33 +242,41 @@ async def decompose_query(user_question: str) -> list[str]:
             data = resp.json()
             raw_content = data["choices"][0]["message"]["content"]
         except Exception as fallback_exc:
-            log.warning(
-                "Decomposição falhou no modelo de fallback também: %s. "
-                "Usando query original.",
+            log.error(
+                "TRADUÇÃO INDISPONÍVEL: decomposição falhou no modelo principal "
+                "('%s') e no fallback ('%s'): %s. Usando a query original em "
+                "PT-BR para embedding — isso é um caminho DEGRADADO que sofre "
+                "de mismatch cross-lingual contra o corpus (100%% inglês) e "
+                "deve ser tratado como incidente, não como comportamento normal.",
+                decomp_model,
+                _DECOMPOSITION_MODEL_FALLBACK,
                 fallback_exc,
             )
             return [user_question]
 
     except Exception as exc:
-        log.warning(
-            "Decomposição falhou com erro inesperado: %s. Usando query original.",
+        log.error(
+            "TRADUÇÃO INDISPONÍVEL: decomposição falhou com erro inesperado: %s. "
+            "Usando a query original em PT-BR para embedding — caminho "
+            "DEGRADADO, ver nota acima.",
             exc,
         )
         return [user_question]
 
     # --- Parse robusto da resposta JSON ---
-    sub_queries = _parse_decomposition_response(raw_content, user_question)
+    translated_query, sub_queries = _parse_decomposition_response(raw_content, user_question)
 
-    # A query original SEMPRE deve estar na lista para garantir cobertura máxima
-    all_queries: list[str] = [user_question]
+    # A tradução literal em inglês é a âncora da busca — NUNCA a query
+    # original em português (ver docstring desta função para o porquê).
+    all_queries: list[str] = [translated_query]
     for sq in sub_queries:
         sq_stripped = sq.strip()
-        # Evita duplicar a query original se o modelo a devolveu idêntica
-        if sq_stripped and sq_stripped.lower() != user_question.lower():
+        # Evita duplicar a tradução se o modelo a devolveu idêntica
+        if sq_stripped and sq_stripped.lower() != translated_query.lower():
             all_queries.append(sq_stripped)
 
     log.info(
-        "Query decomposta em %d queries | original + %d sub-queries",
+        "Query traduzida e decomposta em %d queries | tradução + %d sub-queries",
         len(all_queries),
         len(all_queries) - 1,
     )
@@ -249,34 +286,68 @@ async def decompose_query(user_question: str) -> list[str]:
     return all_queries
 
 
-def _parse_decomposition_response(raw: str, fallback_query: str) -> list[str]:
+def _parse_decomposition_response(
+    raw: str, fallback_query: str
+) -> tuple[str, list[str]]:
     """
-    Parser ultra-robusto para a saída do modelo de decomposição.
+    Parser ultra-robusto para a saída do modelo de decomposição/tradução.
 
-    Estratégias (em ordem de preferência):
+    Estratégias (em ordem de preferência), aplicadas ao dict parseado:
     1. JSON direto (caminho feliz — json_object mode do LiteLLM)
     2. Extração de bloco JSON via regex (se o modelo envolveu em markdown)
-    3. Extração de lista simples via regex linha por linha
-    4. Fallback para lista vazia (query original já foi adicionada pelo chamador)
+    3. Extração de JSON embutido sem markdown
+    4. Extração de lista simples via regex de aspas (sem 'translated_query'
+       confiável — usa a primeira string extraída como tradução aproximada)
+    5. Fallback total: 'fallback_query' (PT-BR) como tradução — só ocorre se
+       TODAS as estratégias de parse falharem, e é logado como erro alto,
+       nunca como comportamento silencioso esperado.
 
     Args:
         raw: String bruta retornada pelo LLM.
-        fallback_query: Query original para logging.
+        fallback_query: Query original do usuário, usada em ÚLTIMO CASO se
+            nenhuma tradução puder ser extraída da resposta do modelo.
 
     Returns:
-        Lista de sub-queries extraídas, ou lista vazia se o parse falhar.
+        Tupla (translated_query, sub_queries). translated_query nunca é
+        vazia — cai para fallback_query apenas se o parse falhar por completo.
     """
     raw = raw.strip()
     if not raw:
-        log.warning("Decomposição: resposta vazia do LLM.")
-        return []
+        log.warning(
+            "Decomposição: resposta vazia do LLM. Usando query original como "
+            "tradução — sem tradução real disponível para esta requisição."
+        )
+        return fallback_query, []
+
+    def _extract(parsed: dict[str, Any]) -> tuple[str, list[str]] | None:
+        translated = parsed.get("translated_query")
+        queries = parsed.get("sub_queries", [])
+        if not isinstance(queries, list) or not all(isinstance(q, str) for q in queries):
+            queries = []
+        clean_queries = [q for q in queries if isinstance(q, str) and q.strip()]
+
+        if isinstance(translated, str) and translated.strip():
+            return translated.strip(), clean_queries
+
+        # Campo 'translated_query' ausente/inválido: modelo pode ter usado
+        # formato antigo (só sub_queries). Reaproveita a primeira sub-query
+        # como âncora de tradução aproximada em vez de cair para PT-BR.
+        if clean_queries:
+            log.warning(
+                "Decomposição: 'translated_query' ausente na resposta do "
+                "modelo. Reaproveitando primeira sub-query como tradução "
+                "aproximada."
+            )
+            return clean_queries[0], clean_queries[1:]
+
+        return None
 
     # --- Estratégia 1: JSON direto ---
     try:
         parsed: dict[str, Any] = json.loads(raw)
-        queries = parsed.get("sub_queries", [])
-        if isinstance(queries, list) and all(isinstance(q, str) for q in queries):
-            return [q for q in queries if q.strip()]
+        result = _extract(parsed)
+        if result:
+            return result
     except json.JSONDecodeError:
         pass
 
@@ -285,9 +356,9 @@ def _parse_decomposition_response(raw: str, fallback_query: str) -> list[str]:
     if json_match:
         try:
             parsed = json.loads(json_match.group(1))
-            queries = parsed.get("sub_queries", [])
-            if isinstance(queries, list):
-                return [q for q in queries if isinstance(q, str) and q.strip()]
+            result = _extract(parsed)
+            if result:
+                return result
         except json.JSONDecodeError:
             pass
 
@@ -296,26 +367,29 @@ def _parse_decomposition_response(raw: str, fallback_query: str) -> list[str]:
     if json_match2:
         try:
             parsed = json.loads(json_match2.group(0))
-            queries = parsed.get("sub_queries", [])
-            if isinstance(queries, list):
-                return [q for q in queries if isinstance(q, str) and q.strip()]
+            result = _extract(parsed)
+            if result:
+                return result
         except json.JSONDecodeError:
             pass
 
-    # --- Estratégia 4: Lista de strings entre aspas ---
-    quoted_queries = re.findall(r'"([^"]{10,200})"', raw)
+    # --- Estratégia 4: Lista de strings entre aspas (sem chave confiável) ---
+    quoted_queries = [q for q in re.findall(r'"([^"]{10,200})"', raw) if q.strip()]
     if quoted_queries:
         log.warning(
-            "Decomposição: JSON inválido, extraindo via regex de aspas. raw=%r",
+            "Decomposição: JSON inválido, extraindo via regex de aspas. "
+            "Primeira string extraída assumida como tradução aproximada. raw=%r",
             raw[:120],
         )
-        return [q for q in quoted_queries if q.strip()]
+        return quoted_queries[0], quoted_queries[1:]
 
-    log.warning(
-        "Decomposição: impossível parsear resposta do LLM. Usando query original. raw=%r",
+    log.error(
+        "Decomposição: impossível parsear resposta do LLM em nenhum formato. "
+        "Usando query original em PT-BR como último recurso — mismatch "
+        "cross-lingual esperado para esta requisição. raw=%r",
         raw[:200],
     )
-    return []
+    return fallback_query, []
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +423,9 @@ async def retrieve_chunks_for_query(
             with_payload=True,
             # Sem score_threshold aqui — deixamos o reranker filtrar a qualidade
         )
+        log.debug("Recebidos %d resultados do Qdrant.", len(results))
+        if results:
+            log.debug("Payload de exemplo (1º resultado): %s", results[0].payload)
     except Exception as exc:
         log.error("Falha na busca vetorial (Qdrant): %s", exc)
         return []
@@ -569,6 +646,9 @@ async def retrieve_chunks(
             with_payload=True,
             score_threshold=settings.rag_score_threshold,
         )
+        log.debug("Recebidos %d resultados do Qdrant.", len(results))
+        if results:
+            log.debug("Payload de exemplo (1º resultado): %s", results[0].payload)
     except Exception as exc:
         log.error("Erro ao buscar no Qdrant (fallback naive): %s", exc)
         raise RuntimeError(f"Falha na busca vetorial: {exc}") from exc
@@ -865,40 +945,38 @@ async def _run_advanced_retrieval(
         settings, "rag_retrieval_limit_per_query", _RETRIEVAL_LIMIT_PER_QUERY
     )
 
-    # === PARALELISMO FASE 1 ===
-    # Dispara decomposição e embedding da query original simultaneamente.
-    # Ganho típico: ~8-12 segundos de latência eliminados.
-    log.info("Advanced RAG: iniciando decomposição e embedding em paralelo...")
+    # === FASE 1 — Decomposição/Tradução ===
+    # CORREÇÃO CRÍTICA: anteriormente esta fase disparava embed_text(user_question)
+    # em paralelo com a decomposição "para ganhar latência", e reaproveitava esse
+    # vetor (calculado sobre o texto em PT-BR) como a busca "principal". Isso
+    # bypassava completamente a tradução gerada por decompose_query() e garantia
+    # que a busca de maior peso no pool de reranking fosse sempre cross-lingual
+    # (query em português contra corpus 100% em inglês — ver ingestion_service.py).
+    # Essa era a causa raiz dos scores baixos / chunks existentes não recuperados.
+    #
+    # Agora esperamos decompose_query() primeiro: ela já retorna [tradução, *sub_queries],
+    # todas em inglês, e SÓ ENTÃO embedamos. Perdemos o paralelismo de ~1 chamada
+    # de embedding, mas eliminamos a busca cross-lingual garantida em toda requisição.
+    log.info("Advanced RAG: traduzindo e decompondo a query...")
 
-    decompose_task = asyncio.create_task(decompose_query(user_question))
-    embed_original_task = asyncio.create_task(embed_text(user_question))
-
-    all_queries, original_vector = await asyncio.gather(
-        decompose_task,
-        embed_original_task,
-    )
-
-    # === PARALELISMO FASE 2 ===
-    # Gera embeddings das sub-queries e faz as buscas, tudo em paralelo.
-    # Para a query original, reutilizamos o vetor já calculado.
-
-    # Separa a query original das sub-queries para evitar re-embeddamento
-    sub_queries = [q for q in all_queries if q != user_question]
+    all_queries = await decompose_query(user_question)
+    translated_query = all_queries[0]
+    sub_queries = all_queries[1:]
 
     log.info(
-        "Buscando no Qdrant: 1 query original + %d sub-queries em paralelo...",
+        "Buscando no Qdrant: 1 query traduzida + %d sub-queries em paralelo...",
         len(sub_queries),
     )
 
-    # Monta todas as tasks de retrieval
+    # Todas as queries (tradução + sub-queries) são embedadas e buscadas em
+    # paralelo entre si — nenhuma delas está em português neste ponto, exceto
+    # no caso extremo de falha total de tradução (ver decompose_query).
     retrieval_tasks: list[asyncio.Task] = [
-        # Query original já tem seu vetor calculado
         asyncio.create_task(
-            retrieve_chunks_for_query(qdrant, original_vector, retrieval_limit)
+            _embed_and_retrieve(translated_query, qdrant, retrieval_limit)
         )
     ]
 
-    # Sub-queries: embed + retrieve encadeados
     for sub_query in sub_queries:
         retrieval_tasks.append(
             asyncio.create_task(
@@ -1056,6 +1134,17 @@ async def run_rag_pipeline(
         )
         pipeline_used = "naive_fallback"
 
+        # NOTA: este fallback embeda request.message CRU (potencialmente em
+        # PT-BR) sem tradução, porque só é acionado quando o Advanced RAG já
+        # falhou catastroficamente (Qdrant/LiteLLM instável) — tentar mais uma
+        # chamada de tradução aqui arriscaria falhar de novo. Scores baixos
+        # neste caminho são esperados e não devem ser confundidos com o bug
+        # de mismatch cross-lingual do pipeline principal (já corrigido em
+        # _run_advanced_retrieval/decompose_query).
+        log.warning(
+            "Naive fallback usará a query original SEM tradução (pipeline "
+            "avançado indisponível) — scores mais baixos são esperados aqui."
+        )
         try:
             original_vector = await embed_text(request.message)
             chunks = await retrieve_chunks(qdrant, original_vector, effective_top_k)
