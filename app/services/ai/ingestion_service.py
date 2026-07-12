@@ -173,6 +173,26 @@ _UDN_MACRO_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 _UE_VERSION_RE = re.compile(r"(\d+\.\d+(?:\.\d+)?)")
 
+# Detecta assinaturas de definição de método/função estilo UE5 no .cpp:
+# "RetType UClassName::MethodName(args) [const] [override] { ... }"
+# Heurística deliberadamente simples (não é um parser C++ completo) — ver
+# docstring de _split_cpp_into_functions para as limitações conhecidas.
+_CPP_FUNCTION_SIG_RE = re.compile(
+    r"^[ \t]*(?:[\w:\<\>,\*&~]+[ \t]+)+?"       # tipo de retorno (best-effort)
+    r"(\w+)::(\w+)\s*\([^;{]*\)"                 # Classe::Metodo(args)
+    r"(?:\s*const)?(?:\s*override)?\s*\{",       # abre o corpo direto na linha
+    re.MULTILINE,
+)
+
+# Tamanho mínimo de função isolada para valer a pena documentar sozinha;
+# funções menores que isso (getters/setters triviais) são agrupadas.
+CPP_MIN_FUNCTION_CHARS: int = 80
+
+# Limite de chars por grupo de funções enviado à LLM documentadora do Canal A
+# em modo sample — evita reintroduzir o mesmo problema de truncamento que
+# headers grandes já tinham, agora para .cpp (tipicamente mais verboso).
+CPP_MAX_GROUP_CHARS: int = 6000
+
 
 # =============================================================================
 # SYSTEM PROMPT — Documentador Técnico Sênior (Canal A)
@@ -214,16 +234,16 @@ the provided header.\
 # UTILITÁRIOS DE I/O (despachados para thread)
 # =============================================================================
 
-def _walk_files(root: Path, extension: str) -> Iterator[Path]:
+def _walk_files(root: Path, extensions: tuple[str, ...]) -> Iterator[Path]:
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in _IGNORED_DIR_NAMES]
         for fname in filenames:
-            if fname.endswith(extension):
+            if fname.endswith(extensions):
                 yield Path(dirpath) / fname
 
 
-async def _discover_files(root: Path, extension: str) -> list[Path]:
-    return await asyncio.to_thread(lambda: list(_walk_files(root, extension)))
+async def _discover_files(root: Path, extensions: tuple[str, ...]) -> list[Path]:
+    return await asyncio.to_thread(lambda: list(_walk_files(root, extensions)))
 
 
 async def _read_file_bytes(path: Path) -> bytes:
@@ -238,7 +258,34 @@ def _compute_file_hash(raw_bytes: bytes) -> str:
 # CANAL A — Códigos-fonte C++ (.h)
 # =============================================================================
 
-def _is_gameplay_relevant_header(content: str, filename: str) -> tuple[bool, str]:
+def _is_gameplay_relevant_header(
+    content: str, filename: str, sample_mode: bool = False
+) -> tuple[bool, str]:
+    """
+    Decide se um header vale a pena documentar.
+
+    Modo padrão (sample_mode=False, usado para a Engine): allowlist estrita
+    por palavra-chave no nome da classe/base. Necessário para a Engine
+    porque o volume de headers é ordens de magnitude maior — sem filtro,
+    o custo de LLM documentadora explode e o corpus vira ruído (ver
+    docstring do módulo).
+
+    Modo sample (sample_mode=True, usado para projetos/samples de mecânica
+    como Lyra, City Sample, Vehicle Sample): a allowlist é DESLIGADA. Esses
+    projetos usam convenções de nome próprias (ex: ALyraWeapon, ULyraHealthSet)
+    que não batem em nenhuma keyword genérica e seriam descartados
+    silenciosamente pela allowlist — exatamente o conteúdo de mecânica real
+    que se quer capturar. Em vez de manter uma lista de keywords sempre
+    defasada, delega-se a decisão de relevância à LLM documentadora, que já
+    tem instrução explícita de ignorar código puramente estrutural
+    (construtores vazios, boilerplate GENERATED_BODY(), forward declarations).
+    Volume de um projeto de sample é limitado (não é a Engine inteira),
+    então o custo de deixar a LLM decidir é administrável.
+    """
+    if sample_mode:
+        stem = Path(filename).stem
+        return True, stem
+
     for match in _CLASS_DECL_RE.finditer(content):
         class_name = match.group(1)
         inheritance_blob = match.group(2)
@@ -263,8 +310,227 @@ def _clean_cpp_header(content: str) -> str:
     return cleaned.strip()
 
 
-async def _process_header_file(path: Path, raw: str, ue_version: str) -> list[dict]:
-    relevant, class_name = _is_gameplay_relevant_header(raw, path.name)
+# =============================================================================
+# CANAL C — Implementação C++ de mecânicas (.cpp), modo sample apenas
+# =============================================================================
+# NOTA DE ARQUITETURA — por que .cpp é um canal separado do Canal A (.h):
+#     A API pública (assinatura, propriedades) responde "o que existe". A
+#     LÓGICA DE COMO uma mecânica é implementada (ex: como o double jump é
+#     decidido, como um grafo PCG gera pontos) vive na IMPLEMENTAÇÃO, no
+#     .cpp. Para projetos de Engine isso é irrelevante (você quer a API
+#     pública, não detalhes internos). Para projetos-sample de mecânica
+#     (Lyra, City Sample, Vehicle Sample, etc.) é o inverso: a implementação
+#     É o conteúdo de valor.
+#
+# NOTA DE LIMITAÇÃO CONHECIDA — o splitter abaixo é uma heurística por
+#     regex + balanceamento de chaves, NÃO um parser C++ completo. Ele lida
+#     bem com o caso comum (métodos definidos no escopo de namespace/arquivo
+#     no formato "RetType UClasse::Metodo(...) { ... }"), mas pode errar em:
+#     macros complexas que injetam chaves, template especializations muito
+#     aninhadas, ou código gerado por outras macros que mascaram a
+#     assinatura. Nesses casos o método problemático cai no "restante do
+#     arquivo" (bucket final) em vez de virar um grupo isolado — não trava
+#     a ingestão, mas pode diluir a qualidade da documentação daquele
+#     método específico. Aceitável como trade-off custo/benefício frente a
+#     escrever um parser C++ completo.
+
+def _split_cpp_into_functions(content: str) -> list[tuple[str, str]]:
+    """
+    Divide um .cpp em blocos (assinatura_legível, corpo_completo) por função,
+    usando a posição das assinaturas detectadas + balanceamento de chaves
+    para encontrar o fim de cada corpo.
+
+    Funções muito pequenas (getters/setters triviais, < CPP_MIN_FUNCTION_CHARS)
+    são mantidas mas não geram grupo próprio — são agrupadas com a função
+    vizinha para não gerar chamadas de LLM desperdiçadas em trechos triviais.
+
+    Returns:
+        Lista de tuplas (nome_legivel, texto_do_bloco). Pode incluir um
+        bloco final "resto do arquivo" com qualquer código fora de função
+        reconhecida (includes já removidos a montante, código de namespace
+        solto, etc.) — nunca descarta conteúdo silenciosamente.
+    """
+    matches = list(_CPP_FUNCTION_SIG_RE.finditer(content))
+    if not matches:
+        return [("arquivo completo (nenhuma função reconhecida)", content)]
+
+    blocks: list[tuple[str, str]] = []
+    cursor = 0
+
+    for i, match in enumerate(matches):
+        class_name, method_name = match.group(1), match.group(2)
+        body_start = match.end() - 1  # posição do '{' de abertura
+
+        # Balanceamento de chaves para achar o fim real do corpo da função —
+        # necessário porque regex sozinho não sabe "contar" aninhamento.
+        depth = 0
+        end = body_start
+        for pos in range(body_start, len(content)):
+            if content[pos] == "{":
+                depth += 1
+            elif content[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = pos + 1
+                    break
+        else:
+            # Chave nunca fechou (arquivo truncado/malformado) — pega até o
+            # fim do arquivo em vez de travar ou perder o conteúdo.
+            end = len(content)
+
+        func_text = content[match.start():end]
+        blocks.append((f"{class_name}::{method_name}", func_text))
+        cursor = end
+
+    # Conteúdo antes da primeira função e depois da última (namespace-level
+    # code, definições fora de classe) — preservado, nunca descartado.
+    leading = content[: matches[0].start()].strip()
+    trailing = content[cursor:].strip()
+    if leading:
+        blocks.insert(0, ("código de topo do arquivo", leading))
+    if trailing:
+        blocks.append(("código remanescente do arquivo", trailing))
+
+    return blocks
+
+
+def _group_cpp_blocks(
+    blocks: list[tuple[str, str]], max_group_chars: int
+) -> list[tuple[list[str], str]]:
+    """
+    Agrupa blocos de função pequenos entre si (até max_group_chars) para
+    evitar uma chamada de LLM por getter trivial, mas nunca junta um bloco
+    já maior que o limite com outro (esse vai sozinho, truncado se preciso
+    pelo chamador).
+
+    Returns:
+        Lista de (nomes_das_funcoes_no_grupo, texto_concatenado).
+    """
+    groups: list[tuple[list[str], str]] = []
+    current_names: list[str] = []
+    current_text = ""
+
+    for name, text in blocks:
+        candidate = f"{current_text}\n\n{text}".strip() if current_text else text
+        if len(candidate) > max_group_chars and current_text:
+            groups.append((current_names, current_text))
+            current_names, current_text = [name], text
+        else:
+            current_names.append(name)
+            current_text = candidate
+
+    if current_text:
+        groups.append((current_names, current_text))
+
+    return groups
+
+
+_CPP_DOCUMENTER_SYSTEM_PROMPT = """\
+You are a Senior Gameplay Programmer at Epic Games, specialized in \
+explaining HOW Unreal Engine 5 gameplay mechanics are actually implemented, \
+based on real .cpp implementation code from a shipped project or official \
+sample (e.g. Lyra, City Sample, Vehicle Sample, Game Animation Sample).
+
+Your task: given one or more C++ function implementations from a real \
+project, produce a Markdown guide that explains the MECHANIC or SYSTEM \
+being implemented — not a line-by-line restatement of the code.
+
+STRICT RULES:
+1. Output ONLY Markdown. No preamble, no "Here is the documentation" filler.
+2. Start with a single H1 title describing the MECHANIC (e.g. \
+"# Double Jump Implementation", "# PCG Procedural Foliage Scattering") — \
+not just the raw function name.
+3. Explain the ACTUAL LOGIC: what triggers this code, what decisions it \
+makes, what state it reads/writes, and how it connects to other systems \
+(e.g. Input, Animation Blueprint, Gameplay Ability System, PCG Graph).
+4. Use H2 sections (`## `) to separate distinct concerns when the input \
+covers more than one function, e.g. `## How it's triggered`, \
+`## Core logic`, `## Integration points`.
+5. Never invent behavior not present in the provided code. If the logic is \
+unclear or incomplete from what's given, say so explicitly rather than \
+guessing.
+6. Be concise but complete — prioritize helping a developer replicate or \
+adapt this mechanic in their own project.\
+"""
+
+
+async def _process_cpp_file(
+    path: Path, raw: str, ue_version: str, project_source: str
+) -> list[dict]:
+    """
+    Processa um .cpp em modo sample: divide por função, agrupa blocos
+    pequenos, e documenta cada grupo via LLM com foco em MECÂNICA (não API).
+
+    Só deve ser chamado em sample_mode=True — para a Engine, .cpp não é
+    ingerido (ver _run_ingestion: extensões dependem de sample_mode).
+    """
+    cleaned = _clean_cpp_header(raw)  # remove #includes, normaliza blank lines
+    if not cleaned:
+        log.debug(".cpp vazio após limpeza, ignorado: %s", path)
+        return []
+
+    blocks = _split_cpp_into_functions(cleaned)
+    groups = _group_cpp_blocks(blocks, CPP_MAX_GROUP_CHARS)
+
+    all_chunks: list[dict] = []
+    for group_idx, (names, group_text) in enumerate(groups):
+        max_chars = settings.ingestion_max_header_chars
+        if len(group_text) > max_chars:
+            log.warning(
+                "Grupo de funções '%s' em '%s' tem %d chars (limite=%d) — "
+                "truncando antes de enviar à LLM documentadora.",
+                names[:3], path, len(group_text), max_chars,
+            )
+            group_text = group_text[:max_chars]
+
+        title = names[0] if names else path.stem
+        user_message = (
+            f"Source file: {path.name}\n"
+            f"Functions in this group: {', '.join(names)}\n\n"
+            f"```cpp\n{group_text}\n```"
+        )
+        messages = [
+            {"role": "system", "content": _CPP_DOCUMENTER_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ]
+
+        try:
+            markdown, _pt, _ct = await call_litellm(
+                messages=messages,
+                model=settings.ingestion_documenter_model,
+            )
+        except Exception as exc:
+            log.error(
+                "Falha ao documentar grupo %d/%d de '%s': %s — grupo ignorado.",
+                group_idx + 1, len(groups), path, exc,
+            )
+            continue
+
+        # source_file inclui o índice do grupo para não colidir com outros
+        # grupos do mesmo arquivo na deleção/upsert idempotente por
+        # source_file (ver _delete_file_chunks).
+        group_source_file = f"{path}#group{group_idx}"
+
+        all_chunks.extend(
+            _build_chunks_with_metadata(
+                markdown_text=markdown,
+                source_file=group_source_file,
+                doc_type="C++ Implementation (mechanic)",
+                title=title,
+                ue_version=ue_version,
+                raw_content=group_text,
+                project_source=project_source,
+                source_file_root=str(path),
+            )
+        )
+
+    return all_chunks
+
+
+async def _process_header_file(
+    path: Path, raw: str, ue_version: str, project_source: str, sample_mode: bool = False
+) -> list[dict]:
+    relevant, class_name = _is_gameplay_relevant_header(raw, path.name, sample_mode=sample_mode)
     if not relevant:
         log.debug("Header ignorado (sem relevância de gameplay): %s", path)
         return []
@@ -309,6 +575,7 @@ async def _process_header_file(path: Path, raw: str, ue_version: str) -> list[di
         title=title,
         ue_version=ue_version,
         raw_content=cleaned,
+        project_source=project_source,
     )
 
 
@@ -333,7 +600,9 @@ def _sanitize_udn(content: str) -> tuple[str, str]:
     return cleaned, title
 
 
-async def _process_udn_file(path: Path, raw: str, ue_version: str) -> list[dict]:
+async def _process_udn_file(
+    path: Path, raw: str, ue_version: str, project_source: str
+) -> list[dict]:
     clean_text, title = _sanitize_udn(raw)
     if not clean_text:
         log.debug("Documento .udn vazio após sanitização, ignorado: %s", path)
@@ -346,6 +615,7 @@ async def _process_udn_file(path: Path, raw: str, ue_version: str) -> list[dict]
         title=title or path.stem,
         ue_version=ue_version,
         raw_content=clean_text,
+        project_source=project_source,
     )
 
 
@@ -499,6 +769,8 @@ def _build_chunks_with_metadata(
     title: str,
     ue_version: str,
     raw_content: str,
+    project_source: str,
+    source_file_root: str | None = None,
 ) -> list[dict]:
     sections = _hierarchical_markdown_chunker(markdown_text, title)
     sections = _enforce_max_chunk_size(sections, settings.ingestion_max_chunk_chars)
@@ -509,12 +781,24 @@ def _build_chunks_with_metadata(
             {
                 "text": section_text,
                 "source_file": source_file,
+                # Path puro do arquivo em disco, SEM sufixo sintético de grupo
+                # (ex: "#group0"). Usado por _delete_file_chunks para limpar
+                # todos os chunks de um arquivo antes de reprocessá-lo,
+                # mesmo quando source_file varia entre grupos (Canal C).
+                # Default = source_file para Canais A/B, onde os dois são
+                # sempre idênticos (1 arquivo = 1 source_file, sem grupos).
+                "source_file_root": source_file_root or source_file,
                 "doc_type": doc_type,
                 "title": title,
                 "chunk_id": chunk_id,
                 "ue_version": ue_version,
-                "description": "",  
+                "description": "",
                 "raw_content": raw_content,
+                # Rótulo de proveniência — NUNCA entra no texto embedado.
+                # Permite segmentar via query_filter no Qdrant no futuro
+                # (ex: "só Engine", "só samples", "excluir Lyra") sem
+                # precisar reingerir nada. Ver auditoria de arquitetura RAG.
+                "project_source": project_source,
             }
         )
     return chunks
@@ -651,13 +935,27 @@ async def _delete_file_chunks(
     collection_name: str,
     source_file: str,
 ) -> None:
+    """
+    Remove todos os chunks de um arquivo-fonte antes de reprocessá-lo.
+
+    CORREÇÃO (Canal C / .cpp): chunks gerados a partir de .cpp usam um
+    `source_file` SINTÉTICO com sufixo "#groupN" (ver _process_cpp_file),
+    porque um único .cpp pode virar múltiplos grupos de funções. Filtrar
+    por match exato de `source_file` aqui NUNCA encontraria esses pontos
+    (o path puro nunca bate com "path#group0", "path#group1", ...) — a
+    deleção "funcionaria" sem erro mas silenciosamente não apagaria nada,
+    e uma reingestão que mudasse o agrupamento de funções acumularia
+    chunks órfãos para sempre. Por isso o filtro usa `source_file_root`
+    (sempre o path puro, gravado em TODO chunk independente do canal — ver
+    _build_chunks_with_metadata) em vez de `source_file`.
+    """
     result = await qdrant.delete(
         collection_name=collection_name,
         points_selector=qdrant_models.FilterSelector(
             filter=qdrant_models.Filter(
                 must=[
                     qdrant_models.FieldCondition(
-                        key="source_file",
+                        key="source_file_root",
                         match=qdrant_models.MatchValue(value=source_file),
                     )
                 ]
@@ -776,10 +1074,20 @@ async def _flush_batch(
         collection_name,
     )
 
+    # CORREÇÃO (Canal C / .cpp): agrupamos por source_file_root, não por
+    # source_file. Chunks de .cpp têm source_file sintético por grupo
+    # ("path#group0", "path#group1", ...), mas o rastreamento de commit em
+    # _run_ingestion (`tracking`) é indexado pelo path real do arquivo.
+    # Agrupar por source_file (chave antiga) faria os grupos NUNCA baterem
+    # com `tracking`, e o manifesto de checkpoint nunca seria commitado para
+    # .cpp — reprocessando (e re-chamando a LLM documentadora) o arquivo
+    # inteiro a cada ingestão, para sempre. source_file_root é idêntico a
+    # source_file para chunks de Canais A (.h) e B (.udn), então isso não
+    # muda nada para eles.
     per_file_counts: dict[str, int] = {}
     for point in points:
-        source_file = point.payload["source_file"]
-        per_file_counts[source_file] = per_file_counts.get(source_file, 0) + 1
+        source_file_root = point.payload["source_file_root"]
+        per_file_counts[source_file_root] = per_file_counts.get(source_file_root, 0) + 1
 
     return per_file_counts
 
@@ -794,11 +1102,27 @@ async def process_folder_ingestion(
     qdrant: AsyncQdrantClient,
     redis: Redis,
     ue_version_override: str | None = None,
+    project_source: str = "UE5_Engine",
+    sample_mode: bool = False,
 ) -> None:
     """
     Entrypoint chamado pelo BackgroundTasks. Serializa a execução por
     coleção via lock distribuído no Redis antes de delegar o trabalho para
     `_run_ingestion`.
+
+    Args:
+        project_source: rótulo de proveniência gravado em CADA chunk
+            (payload), nunca no texto embedado. Usado para segmentar a base
+            depois via query_filter sem precisar reingerir (ex: "UE5_Engine",
+            "Lyra", "CitySample", "VehicleSample"). Padrão "UE5_Engine" para
+            não quebrar chamadas existentes que não passam este argumento.
+        sample_mode: quando True, (1) desliga a allowlist de keywords de
+            relevância — necessário porque projetos-sample usam convenções
+            de nome próprias que não batem em _GAMEPLAY_KEYWORDS — e (2)
+            também descobre e processa arquivos .cpp (Canal C), além dos
+            .h, para capturar a IMPLEMENTAÇÃO da mecânica, não só a API.
+            Deve ser False para a Engine (mantém o comportamento original,
+            mais barato e mais estrito).
 
     NOTA DE CONCORRÊNCIA: sem esse lock, duas ingestões concorrentes para a
     mesma coleção (ex: um retry acidental do operador, ou dois canais
@@ -839,6 +1163,8 @@ async def process_folder_ingestion(
             redis=redis,
             collection_name=collection_name,
             ue_version_override=ue_version_override,
+            project_source=project_source,
+            sample_mode=sample_mode,
         )
     finally:
         try:
@@ -860,6 +1186,8 @@ async def _run_ingestion(
     redis: Redis,
     collection_name: str,
     ue_version_override: str | None = None,
+    project_source: str = "UE5_Engine",
+    sample_mode: bool = False,
 ) -> None:
     """Corpo real do pipeline de ingestão, protegido pelo lock do chamador."""
     root = Path(folder_path)
@@ -869,11 +1197,14 @@ async def _run_ingestion(
     max_failures = settings.ingestion_max_consecutive_failures
 
     log.info(
-        "Ingestão iniciada | pasta=%s tipo=%s coleção=%s manifesto=%s",
+        "Ingestão iniciada | pasta=%s tipo=%s coleção=%s manifesto=%s "
+        "project_source=%s sample_mode=%s",
         root,
         content_type,
         collection_name,
         manifest_key,
+        project_source,
+        sample_mode,
     )
 
     try:
@@ -890,15 +1221,23 @@ async def _run_ingestion(
     manifest_cache = await _load_manifest_cache(redis, manifest_key)
     failures_cache = await _load_failures_cache(redis, failures_key)
     ue_version = ue_version_override or _extract_ue_version(str(root))
-    extension = ".h" if content_type == "source_code" else ".udn"
-    
-    files = await _discover_files(root, extension)
+
+    # CORREÇÃO (Canal C): em sample_mode, também descobrimos .cpp — é onde
+    # vive a IMPLEMENTAÇÃO real da mecânica, não só a assinatura. Para a
+    # Engine (sample_mode=False), mantemos só .h — mais barato e mais
+    # estrito, como já era.
+    if content_type == "source_code":
+        extensions = (".h", ".cpp") if sample_mode else (".h",)
+    else:
+        extensions = (".udn",)
+
+    files = await _discover_files(root, extensions)
     total_files = len(files)
 
     log.info(
         "%d arquivo(s) '%s' encontrado(s) em '%s' para avaliação.",
         total_files,
-        extension,
+        extensions,
         root,
     )
 
@@ -972,9 +1311,21 @@ async def _run_ingestion(
             raw_text = raw_bytes.decode("utf-8", errors="ignore")
 
             if content_type == "source_code":
-                chunks = await _process_header_file(file_path, raw_text, ue_version)
+                if file_path.suffix == ".cpp":
+                    # Canal C — só existe em sample_mode (extensions só
+                    # inclui .cpp quando sample_mode=True, ver acima)
+                    chunks = await _process_cpp_file(
+                        file_path, raw_text, ue_version, project_source
+                    )
+                else:
+                    chunks = await _process_header_file(
+                        file_path, raw_text, ue_version, project_source,
+                        sample_mode=sample_mode,
+                    )
             else:
-                chunks = await _process_udn_file(file_path, raw_text, ue_version)
+                chunks = await _process_udn_file(
+                    file_path, raw_text, ue_version, project_source
+                )
 
             if not chunks:
                 stats["skipped"] += 1

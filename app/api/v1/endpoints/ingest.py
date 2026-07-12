@@ -46,10 +46,15 @@ router = APIRouter()
         "canal: Canal A (.h C++) filtra headers de gameplay relevantes e usa "
         "uma LLM rápida via LiteLLM para gerar documentação Markdown "
         "educacional; Canal B (.udn) sanitiza a documentação oficial via "
-        "regex, sem chamada de LLM. O processamento roda em background — "
-        "esta chamada retorna imediatamente (HTTP 202). Um manifesto de "
-        "checkpoint no Redis garante que arquivos já indexados (hash "
-        "inalterado) sejam ignorados em reingestões subsequentes."
+        "regex, sem chamada de LLM. Com `sample_mode=true` (para projetos-"
+        "sample de mecânica como Lyra/City Sample/Vehicle Sample, não a "
+        "Engine base), um Canal C adicional também varre e documenta "
+        "arquivos .cpp, focando na IMPLEMENTAÇÃO da mecânica, e o filtro de "
+        "relevância por palavra-chave do Canal A é desligado. O "
+        "processamento roda em background — esta chamada retorna "
+        "imediatamente (HTTP 202). Um manifesto de checkpoint no Redis "
+        "garante que arquivos já indexados (hash inalterado) sejam "
+        "ignorados em reingestões subsequentes."
     ),
     tags=["ingestion"],
 )
@@ -62,10 +67,15 @@ async def process_folder(
     """
     - **folder_path**: caminho ABSOLUTO dentro do container `ue5-agent`
       (confira os volumes configurados no docker-compose.yml).
-    - **content_type**: `source_code` (varre headers .h) ou `documentation`
-      (varre arquivos .udn).
+    - **content_type**: `source_code` (varre headers .h, e .cpp se
+      `sample_mode=true`) ou `documentation` (varre arquivos .udn).
     - **ue_version**: opcional — sobrescreve a detecção automática via regex
       no caminho informado.
+    - **project_source**: rótulo de proveniência gravado em cada chunk
+      (ex: 'UE5_Engine', 'Lyra', 'CitySample') — permite segmentar a busca
+      por origem no futuro sem reingerir.
+    - **sample_mode**: ative para projetos-sample de mecânica (Lyra, City
+      Sample, Vehicle Sample, projetos próprios) em vez da Engine base.
     """
     folder = Path(payload.folder_path)
 
@@ -92,19 +102,26 @@ async def process_folder(
         qdrant=qdrant,
         redis=redis,
         ue_version_override=payload.ue_version,
+        project_source=payload.project_source,
+        sample_mode=payload.sample_mode,
     )
 
     log.info(
-        "Ingestão agendada em background | pasta=%s tipo=%s",
+        "Ingestão agendada em background | pasta=%s tipo=%s project_source=%s sample_mode=%s",
         folder,
         payload.content_type,
+        payload.project_source,
+        payload.sample_mode,
     )
 
     return IngestAcceptedResponse(
         message=(
-            f"Ingestão da pasta '{folder}' agendada com sucesso. "
+            f"Ingestão da pasta '{folder}' agendada com sucesso "
+            f"(project_source='{payload.project_source}', sample_mode={payload.sample_mode}). "
             f"Acompanhe o progresso pelos logs da aplicação (nível INFO)."
         ),
         folder_path=str(folder),
         content_type=payload.content_type,
+        project_source=payload.project_source,
+        sample_mode=payload.sample_mode,
     )

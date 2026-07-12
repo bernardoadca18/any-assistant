@@ -64,6 +64,37 @@ class IngestRequest(BaseModel):
             "com fallback para o valor configurado em INGESTION_DEFAULT_UE_VERSION."
         ),
     )
+    project_source: str = Field(
+        default="UE5_Engine",
+        min_length=1,
+        max_length=64,
+        description=(
+            "Rótulo de proveniência gravado em cada chunk indexado (payload "
+            "do Qdrant, nunca no texto embedado). Identifica de qual projeto "
+            "o conteúdo veio — ex: 'UE5_Engine' (padrão, para a pasta "
+            "Source/ da própria Engine), 'Lyra', 'CitySample', "
+            "'VehicleSample'. Permite segmentar a busca por origem no "
+            "futuro (via filtro no Qdrant) sem precisar reingerir nada."
+        ),
+    )
+    sample_mode: bool = Field(
+        default=False,
+        description=(
+            "Ative para ingerir projetos-sample de mecânica (Lyra, City "
+            "Sample, Vehicle Sample, Game Animation Sample, projetos "
+            "próprios com jogo implementado) em vez da Engine base. "
+            "Efeitos quando True, aplicáveis apenas a content_type="
+            "'source_code': (1) desliga o filtro de relevância por "
+            "palavra-chave, já que esses projetos usam convenções de nome "
+            "próprias (ex: ALyraWeaponInstance) que não bateriam na "
+            "allowlist calibrada para a Engine; (2) além dos headers .h, "
+            "também varre e documenta arquivos .cpp — a implementação real "
+            "das mecânicas vive lá, não só na declaração. Mantenha False "
+            "para ingestão da Engine (Source/ da UE5): mais barato e mais "
+            "estrito, evita ruído em um volume de arquivos ordens de "
+            "magnitude maior."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -84,4 +115,10 @@ class IngestAcceptedResponse(BaseModel):
     )
     folder_path: str
     content_type: ContentType
+    project_source: str = Field(
+        description="Rótulo de proveniência que será gravado nos chunks desta ingestão.",
+    )
+    sample_mode: bool = Field(
+        description="Confirma com qual configuração de filtro/canais esta ingestão foi disparada.",
+    )
     accepted_at: datetime = Field(default_factory=_utcnow)
