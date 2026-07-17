@@ -48,6 +48,16 @@ class ChatRequest(BaseModel):
     )
     top_k: int = Field(default=5, ge=1, le=20, description="Chunks recuperados do Qdrant")
     stream: bool = Field(default=False, description="Retornar resposta como SSE stream")
+    project_source_filter: str | None = Field(
+        default=None,
+        description=(
+            "Filtra a busca vetorial pelo campo 'project_source' gravado no "
+            "payload do Qdrant durante a ingestão (ex: 'engine' para código "
+            "nativo da Unreal Engine, ou o nome de um projeto de amostra como "
+            "'Lyra'). None (padrão) não aplica nenhum filtro — busca em todo "
+            "o corpus, misturando todas as procedências."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +77,16 @@ class RetrievedChunk(BaseModel):
     chunk_id: int
     ue_version: str
     doc_type: str
+    project_source: str = Field(
+        default="",
+        description=(
+            "Procedência do chunk, gravada no payload do Qdrant durante a "
+            "ingestão — distingue código-fonte nativo da Engine de projetos "
+            "de amostra (ex: 'Lyra'). Default '' garante compatibilidade "
+            "retroativa com pontos antigos do Qdrant que não possuem esse "
+            "campo no payload."
+        ),
+    )
     raw_content: str = Field(
         default="",
         description=(
