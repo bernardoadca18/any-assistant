@@ -131,6 +131,79 @@ _IGNORED_DIR_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# CORREÇÃO (ponto cego de indexação — subsistemas modernos de gameplay):
+# uma auditoria direta no Qdrant (busca por pontos do módulo
+# "NetworkPredictionExtras" retornando vazio) expôs que a poda de 'Private'
+# acima, combinada com a allowlist estrita de _GAMEPLAY_KEYWORDS logo
+# abaixo, formava um ponto cego duplo para os novos ecossistemas de
+# movimentação/rede/física da UE5 (Mover, Network Prediction, Chaos
+# Mover/Vehicles, Motion Warping, Parametric/Procedural Motion): eles
+# dependem fortemente de structs auxiliares, controllers e lógica de
+# simulação de baixo nível que (a) frequentemente moram em Private/ — que
+# era podado incondicionalmente do os.walk, então nem CHEGAVAM a ser
+# avaliados — e (b) muitas vezes não herdam de UActorComponent/AActor nem
+# têm as palavras-chave legadas no nome, então mesmo quando alcançados
+# caíam fora da allowlist.
+#
+# _STRATEGIC_ENGINE_MODULE_MARKERS resolve os dois lados: é uma lista de
+# fragmentos de caminho (checados por substring, case-insensitive, contra
+# o path POSIX completo) que identifica os módulos de runtime de gameplay
+# moderno da Engine. Ela é usada em três pontos:
+#   1. _walk_files: suspende a poda de 'Private' especificamente para
+#      diretórios dentro de um desses módulos (nunca globalmente — outras
+#      pastas Private/ThirdParty/Binaries continuam podadas normalmente,
+#      preservando a proteção contra explosão de escopo).
+#   2. _is_gameplay_relevant_header: bypassa a allowlist de
+#      _GAMEPLAY_KEYWORDS para headers desses módulos, mesmo em modo
+#      Engine (sample_mode=False).
+#   3. _run_ingestion: permite que .cpp desses módulos específicos também
+#      sejam descobertos e roteados ao Canal C em modo Engine (que antes
+#      só existia em sample_mode).
+#
+# NOTA: os fragmentos abaixo refletem o layout padrão de plugins/módulos
+# da Epic nas versões recentes da UE5; como a árvore de diretórios pode
+# variar um pouco entre versões da Engine, vale conferir/ajustar esta
+# lista contra a instalação local antes de rodar uma ingestão completa da
+# Engine (é só uma tupla de strings — adicionar ou remover fragmentos não
+# afeta nenhum outro mecanismo do pipeline).
+_STRATEGIC_ENGINE_MODULE_MARKERS: tuple[str, ...] = (
+    # Mover — framework de movimentação baseado em simulação
+    # determinística, sucessor do CharacterMovementComponent clássico.
+    "Plugins/Runtime/Mover",
+    "Plugins/Experimental/Mover",
+    # Network Prediction — framework genérico de simulação predita/
+    # reconciliada em rede. "NetworkPredictionExtras" é coberto pelo
+    # próprio prefixo "NetworkPrediction" abaixo (é o módulo citado na
+    # auditoria original que motivou esta correção).
+    "Plugins/Runtime/NetworkPrediction",
+    "Plugins/Experimental/NetworkPrediction",
+    # Chaos Vehicles / Chaos Mover — física veicular e de movimentação de
+    # nova geração construída sobre o motor Chaos.
+    "Plugins/Runtime/ChaosVehicles",
+    "Plugins/Runtime/ChaosVehicleComponents",
+    "Plugins/Runtime/ChaosMover",
+    "Plugins/Experimental/ChaosMover",
+    # Núcleo experimental do Chaos (baixo nível de simulação física) que
+    # sustenta os módulos acima.
+    "Source/Runtime/Experimental/Chaos",
+    "Source/Runtime/PhysicsCore",
+    # Motion Warping e movimentação paramétrica/procedural de animação.
+    "Plugins/Animation/MotionWarping",
+    "Plugins/Runtime/ParametricMotion",
+)
+
+
+def _is_strategic_gameplay_path(path: Path) -> bool:
+    """
+    True se `path` (arquivo OU diretório) pertence a um dos módulos de
+    runtime de gameplay moderno listados em
+    _STRATEGIC_ENGINE_MODULE_MARKERS. Ver o comentário acima da constante
+    para os três pontos do pipeline que consultam esta função.
+    """
+    posix_lower = path.as_posix().lower()
+    return any(marker.lower() in posix_lower for marker in _STRATEGIC_ENGINE_MODULE_MARKERS)
+
+
 _GAMEPLAY_KEYWORDS: tuple[str, ...] = (
     "Character",
     "Pawn",
@@ -148,6 +221,20 @@ _GAMEPLAY_KEYWORDS: tuple[str, ...] = (
     "HUD",
     "Subsystem",
     "Interface",
+    # CORREÇÃO (Requisito 3 — expansão de keywords de segurança): termos
+    # modernos do framework de gameplay da UE5 (Mover, Network Prediction,
+    # Motion Warping, Parametric/Procedural Motion), para capturar esses
+    # arquivos caso apareçam FORA dos caminhos estratégicos listados em
+    # _STRATEGIC_ENGINE_MODULE_MARKERS (ex: um projeto que vendoriza esse
+    # código em outro diretório, ou uma classe helper com o termo no nome
+    # mas fora da pasta canônica do plugin).
+    "Mover",
+    "Prediction",
+    "Simulation",
+    "Warping",
+    "Parametric",
+    "Vehicle",
+    "Procedural",
 )
 
 _CLASS_DECL_RE = re.compile(
@@ -258,7 +345,22 @@ the provided header.\
 
 def _walk_files(root: Path, extensions: tuple[str, ...]) -> Iterator[Path]:
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _IGNORED_DIR_NAMES]
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in _IGNORED_DIR_NAMES
+            # CORREÇÃO (ponto cego de indexação — ver comentário em
+            # _STRATEGIC_ENGINE_MODULE_MARKERS): 'Private' normalmente é
+            # podado por estar em _IGNORED_DIR_NAMES, mas para os módulos
+            # estratégicos de gameplay moderno (Mover, Network Prediction,
+            # Chaos Mover/Vehicles, Motion Warping) é exatamente ali que
+            # vive a lógica de simulação/predição de rede que o pipeline
+            # precisa capturar. A exceção é escopada ao diretório
+            # resultante (dirpath/d) — nunca global — então Private/
+            # ThirdParty/Binaries/etc. continuam podados normalmente em
+            # todo o resto da árvore.
+            or (d == "Private" and _is_strategic_gameplay_path(Path(dirpath) / d))
+        ]
         for fname in filenames:
             if fname.endswith(extensions):
                 yield Path(dirpath) / fname
@@ -281,7 +383,7 @@ def _compute_file_hash(raw_bytes: bytes) -> str:
 # =============================================================================
 
 def _is_gameplay_relevant_header(
-    content: str, filename: str, sample_mode: bool = False
+    content: str, filename: str, sample_mode: bool = False, strategic_override: bool = False
 ) -> tuple[bool, str]:
     """
     Decide se um header vale a pena documentar.
@@ -303,8 +405,21 @@ def _is_gameplay_relevant_header(
     (construtores vazios, boilerplate GENERATED_BODY(), forward declarations).
     Volume de um projeto de sample é limitado (não é a Engine inteira),
     então o custo de deixar a LLM decidir é administrável.
+
+    strategic_override=True (CORREÇÃO — ponto cego de indexação, ver
+    _STRATEGIC_ENGINE_MODULE_MARKERS): mesmo em modo Engine
+    (sample_mode=False), headers que pertencem a um módulo estratégico de
+    gameplay moderno (Mover, Network Prediction, Chaos Mover/Vehicles,
+    Motion Warping) também desligam a allowlist. Esses subsistemas usam
+    structs auxiliares, controllers de retargeting e definições de
+    simulação de baixo nível que frequentemente não herdam de
+    UActorComponent/AActor e não carregam as keywords legadas no nome —
+    exatamente o mesmo motivo pelo qual a allowlist é desligada em
+    sample_mode, só que agora escopado a um conjunto restrito de caminhos
+    da Engine em vez do projeto inteiro, para não reabrir a explosão de
+    escopo que a allowlist existe para conter.
     """
-    if sample_mode:
+    if sample_mode or strategic_override:
         stem = Path(filename).stem
         return True, stem
 
@@ -560,8 +675,16 @@ async def _process_cpp_file(
     UMA VEZ por arquivo .cpp (não uma vez por grupo) para não multiplicar
     o custo de tokens quando o .cpp gera múltiplos grupos.
 
-    Só deve ser chamado em sample_mode=True — para a Engine, .cpp não é
-    ingerido (ver _run_ingestion: extensões dependem de sample_mode).
+    Chamado em dois cenários (ver _run_ingestion): (1) sample_mode=True,
+    onde TODOS os .cpp descobertos passam por aqui; e (2) modo Engine
+    (sample_mode=False) para o subconjunto restrito de .cpp que pertence a
+    um módulo estratégico de gameplay moderno listado em
+    _STRATEGIC_ENGINE_MODULE_MARKERS (Mover, Network Prediction, Chaos
+    Mover/Vehicles) — a lógica de predição de rede e simulação física
+    desses subsistemas vive na implementação, não só na API pública do
+    header, e por isso precisa do mesmo tratamento de Canal C que os
+    projetos-sample já recebiam. Para o resto da Engine, .cpp continua
+    fora do escopo de ingestão.
     """
     cleaned = _clean_cpp_header(raw)  # remove #includes, normaliza blank lines
     if not cleaned:
@@ -649,7 +772,13 @@ async def _process_cpp_file(
 async def _process_header_file(
     path: Path, raw: str, ue_version: str, project_source: str, sample_mode: bool = False
 ) -> list[dict]:
-    relevant, class_name = _is_gameplay_relevant_header(raw, path.name, sample_mode=sample_mode)
+    # CORREÇÃO (ponto cego de indexação — ver _STRATEGIC_ENGINE_MODULE_MARKERS):
+    # em modo Engine, headers de módulos estratégicos de gameplay moderno
+    # bypassam a allowlist de _GAMEPLAY_KEYWORDS mesmo sem sample_mode=True.
+    strategic_override = _is_strategic_gameplay_path(path)
+    relevant, class_name = _is_gameplay_relevant_header(
+        raw, path.name, sample_mode=sample_mode, strategic_override=strategic_override
+    )
     if not relevant:
         log.debug("Header ignorado (sem relevância de gameplay): %s", path)
         return []
@@ -1512,7 +1641,13 @@ async def process_folder_ingestion(
             também descobre e processa arquivos .cpp (Canal C), além dos
             .h, para capturar a IMPLEMENTAÇÃO da mecânica, não só a API.
             Deve ser False para a Engine (mantém o comportamento original,
-            mais barato e mais estrito).
+            mais barato e mais estrito para a esmagadora maioria dos
+            módulos). EXCEÇÃO: mesmo com sample_mode=False, os módulos
+            estratégicos de gameplay moderno listados em
+            _STRATEGIC_ENGINE_MODULE_MARKERS (Mover, Network Prediction,
+            Chaos Mover/Vehicles, Motion Warping) recebem o mesmo
+            tratamento do sample_mode — allowlist desligada e .cpp
+            descoberto — de forma escopada, sem afetar o resto da Engine.
 
     NOTA DE CONCORRÊNCIA: sem esse lock, duas ingestões concorrentes para a
     mesma coleção (ex: um retry acidental do operador, ou dois canais
@@ -1646,26 +1781,56 @@ async def _run_ingestion(
     # como JSON estruturado via BP_GraphExporter.py, Canal D) — gameplay em
     # projetos reais é híbrido C++/Blueprint, e ambos os canais capturam a
     # parte que .h sozinho não cobre. Para a Engine (sample_mode=False),
-    # mantemos só .h — mais barato e mais estrito, como já era.
+    # mantemos só .h como regra geral — mais barato e mais estrito, como
+    # já era —, EXCETO para o conjunto restrito de módulos estratégicos de
+    # gameplay moderno (Mover, Network Prediction, Chaos Mover/Vehicles,
+    # Motion Warping) listado em _STRATEGIC_ENGINE_MODULE_MARKERS: ali o
+    # .cpp também é descoberto e roteado ao Canal C, porque a lógica de
+    # predição de rede e simulação física desses subsistemas específicos
+    # vive na implementação, não só na API pública do header (ver ponto
+    # cego descrito no comentário da constante). Isso NÃO reabre a
+    # ingestão de .cpp para a Engine inteira — o restante permanece só .h.
     #
     # NOTA: ".bp.json" é uma extensão dupla. `fname.endswith(".bp.json")`
     # (usado dentro de _walk_files) funciona corretamente por comparação de
     # string — mas `Path.suffix` NÃO reconhece extensões duplas (retorna
     # só ".json"). Por isso o dispatch abaixo usa `file_path.name.endswith(...)`
     # em vez de `file_path.suffix ==` para este canal especificamente.
+    strategic_cpp_count = 0
     if content_type == "source_code":
-        extensions = (".h", ".cpp", ".bp.json") if sample_mode else (".h",)
+        if sample_mode:
+            extensions = (".h", ".cpp", ".bp.json")
+            files = await _discover_files(root, extensions)
+        else:
+            extensions = (".h", ".cpp")
+            discovered = await _discover_files(root, extensions)
+            # Segunda camada de segurança contra explosão de escopo: mesmo
+            # que _walk_files já restrinja onde 'Private' é destravado, um
+            # .cpp poderia teoricamente existir fora de Private/ (raro,
+            # mas possível em alguns layouts de módulo) — este filtro
+            # garante que NENHUM .cpp fora de um módulo estratégico chegue
+            # ao pipeline em modo Engine, independentemente de onde foi
+            # encontrado.
+            files = [
+                p for p in discovered
+                if p.suffix != ".cpp" or _is_strategic_gameplay_path(p)
+            ]
+            strategic_cpp_count = sum(1 for p in files if p.suffix == ".cpp")
     else:
         extensions = (".udn",)
+        files = await _discover_files(root, extensions)
 
-    files = await _discover_files(root, extensions)
     total_files = len(files)
 
     log.info(
-        "%d arquivo(s) '%s' encontrado(s) em '%s' para avaliação.",
+        "%d arquivo(s) '%s' encontrado(s) em '%s' para avaliação"
+        "%s.",
         total_files,
         extensions,
         root,
+        f" ({strategic_cpp_count} .cpp de módulos estratégicos em modo Engine)"
+        if strategic_cpp_count
+        else "",
     )
 
     pending: list[dict] = []
@@ -1753,8 +1918,13 @@ async def _run_ingestion(
                         file_path, raw_text, ue_version, project_source
                     )
                 elif file_path.suffix == ".cpp":
-                    # Canal C — só existe em sample_mode (extensions só
-                    # inclui .cpp quando sample_mode=True, ver acima)
+                    # Canal C — existe em sample_mode (todo .cpp descoberto)
+                    # E, desde a correção do ponto cego de indexação, em
+                    # modo Engine para o subconjunto restrito de módulos
+                    # estratégicos de gameplay moderno (Mover, Network
+                    # Prediction, Chaos Mover/Vehicles) — ver o filtro de
+                    # descoberta de arquivos acima e
+                    # _STRATEGIC_ENGINE_MODULE_MARKERS.
                     chunks = await _process_cpp_file(
                         file_path, raw_text, ue_version, project_source
                     )
