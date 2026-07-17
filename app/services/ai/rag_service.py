@@ -74,7 +74,7 @@ _DECOMPOSITION_MODEL: str = "gemini-3.1-flash-lite"
 # modelo genuinamente diferente (outro provider/tier no LiteLLM) para
 # fornecer redundância de verdade. Ajuste este valor para o modelo de
 # fallback real disponível no seu LiteLLM (ex.: outro provider hospedado).
-_DECOMPOSITION_MODEL_FALLBACK: str = "gpt-4o-mini"
+_DECOMPOSITION_MODEL_FALLBACK: str = "qwen-local"
 
 # Timeout dedicado para a chamada de decomposição (deve ser rápida)
 _DECOMPOSITION_TIMEOUT: float = 12.0
