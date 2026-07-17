@@ -9,7 +9,9 @@ multi-tópico (ex: "como fazer pulo em C++ E integrar com Animation Blueprint"):
     FASE 1 — QUERY DECOMPOSITION (LLM-Driven)
     ─────────────────────────────────────────
     1.1  decompose_query()        → até 3 sub-queries otimizadas para busca vetorial
-         (chamada assíncrona leve ao Gemini 2.0 Flash Lite via LiteLLM)
+         (chamada assíncrona leve ao Gemini 3.1 Flash Lite via LiteLLM — ver
+         _DECOMPOSITION_MODEL; CORREÇÃO: docstring citava "Gemini 2.0 Flash
+         Lite", desatualizada em relação à constante real)
 
     FASE 2 — EXPANDED RETRIEVAL + RERANKING
     ────────────────────────────────────────
@@ -40,6 +42,7 @@ from typing import Any
 
 import httpx
 from qdrant_client import AsyncQdrantClient
+from qdrant_client import models as qdrant_models
 from redis.asyncio import Redis
 from tenacity import (
     retry,
@@ -398,6 +401,44 @@ def _parse_decomposition_response(
 
 
 # ---------------------------------------------------------------------------
+# CORREÇÃO (ALTO — filtro de project_source ignorado): a ingestão grava
+# `project_source` no payload de cada ponto do Qdrant para distinguir
+# código-fonte nativo da Engine de projetos de amostra (ex: Lyra), mas até
+# aqui esse campo nunca era usado na busca — toda query misturava as duas
+# procedências livremente no mesmo pool de reranking. Este helper constrói
+# o Filter do Qdrant que restringe a busca a uma única procedência quando
+# o chamador (via ChatRequest.project_source_filter) pedir isso.
+# ---------------------------------------------------------------------------
+
+def _build_project_source_filter(
+    project_source: str | None,
+) -> qdrant_models.Filter | None:
+    """
+    Constrói o Filter do Qdrant para restringir a busca por `project_source`.
+
+    Args:
+        project_source: Valor exato do campo `project_source` a filtrar
+            (ex: 'engine', 'Lyra'). None ou string vazia não aplica nenhum
+            filtro — a busca segue irrestrita em todo o corpus.
+
+    Returns:
+        qdrant_models.Filter pronto para uso em `query_filter=`, ou None
+        se nenhum filtro deve ser aplicado.
+    """
+    if not project_source or not project_source.strip():
+        return None
+
+    return qdrant_models.Filter(
+        must=[
+            qdrant_models.FieldCondition(
+                key="project_source",
+                match=qdrant_models.MatchValue(value=project_source.strip()),
+            )
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
 # FASE 2.1 — Busca Expandida no Qdrant
 # ---------------------------------------------------------------------------
 
@@ -405,6 +446,7 @@ async def retrieve_chunks_for_query(
     qdrant: AsyncQdrantClient,
     query_vector: list[float],
     limit: int,
+    project_source_filter: str | None = None,
 ) -> list[RetrievedChunk]:
     """
     Executa uma única busca vetorial no Qdrant com limite expandido.
@@ -412,20 +454,33 @@ async def retrieve_chunks_for_query(
     Não aplica score_threshold aqui — o reranker vai cuidar da qualidade.
     Threshold é aplicado apenas se o reranker não estiver disponível.
 
+    CORREÇÃO (project_source ignorado): quando `project_source_filter` é
+    informado, a busca é restrita via `query_filter` a pontos cujo payload
+    tenha exatamente esse valor no campo `project_source` — permite separar
+    código-fonte nativo da Engine de projetos de amostra (ex: Lyra) direto
+    na busca vetorial, em vez de filtrar depois em memória (mais caro e
+    reduz o recall efetivo, já que o `limit` do Qdrant conta candidatos
+    antes do filtro).
+
     Args:
         qdrant: Cliente Qdrant assíncrono.
         query_vector: Vetor de embedding da query.
         limit: Número máximo de resultados a recuperar.
+        project_source_filter: Se informado, restringe a busca a pontos com
+            esse valor exato no campo `project_source` do payload. None
+            (padrão) busca em todo o corpus, sem restrição de procedência.
 
     Returns:
         Lista de RetrievedChunk, possivelmente vazia se Qdrant falhar.
     """
+    query_filter = _build_project_source_filter(project_source_filter)
     try:
         results = await qdrant.search(
             collection_name=settings.qdrant_collection,
             query_vector=query_vector,
             limit=limit,
             with_payload=True,
+            query_filter=query_filter,
             # Sem score_threshold aqui — deixamos o reranker filtrar a qualidade
         )
         log.debug("Recebidos %d resultados do Qdrant.", len(results))
@@ -449,6 +504,12 @@ async def retrieve_chunks_for_query(
                     chunk_id=payload.get("chunk_id", 0),
                     ue_version=payload.get("ue_version", ""),
                     doc_type=payload.get("doc_type", ""),
+                    # CORREÇÃO (Correção 1): project_source agora é extraído
+                    # do payload — antes era descartado silenciosamente, e o
+                    # RetrievedChunk resultante não tinha como sinalizar a
+                    # procedência (Engine nativa vs projeto de amostra) para
+                    # o restante do pipeline (_format_context, filtros, etc).
+                    project_source=payload.get("project_source", ""),
                     # HYBRID RAG: payload enriquecido — "" para pontos antigos
                     # ingeridos antes desta mudança (compatibilidade retroativa).
                     raw_content=payload.get("raw_content", ""),
@@ -693,15 +754,23 @@ async def retrieve_chunks(
     qdrant: AsyncQdrantClient,
     query_vector: list[float],
     top_k: int,
+    project_source_filter: str | None = None,
 ) -> list[RetrievedChunk]:
     """
     Busca naive original: busca direta no Qdrant com top_k fixo e score_threshold.
     Mantida como fallback para o caso do pipeline avançado falhar completamente.
 
+    CORREÇÃO (project_source ignorado): assim como em retrieve_chunks_for_query,
+    aplica `query_filter` quando `project_source_filter` é informado — o
+    fallback naive não deve reintroduzir procedências que o chamador pediu
+    para excluir.
+
     Args:
         qdrant: Cliente Qdrant assíncrono.
         query_vector: Vetor de embedding da query original.
         top_k: Número de resultados desejados.
+        project_source_filter: Se informado, restringe a busca a pontos com
+            esse valor exato no campo `project_source` do payload.
 
     Returns:
         Lista de RetrievedChunk.
@@ -709,6 +778,7 @@ async def retrieve_chunks(
     Raises:
         RuntimeError: se a busca no Qdrant falhar.
     """
+    query_filter = _build_project_source_filter(project_source_filter)
     try:
         results = await qdrant.search(
             collection_name=settings.qdrant_collection,
@@ -716,6 +786,7 @@ async def retrieve_chunks(
             limit=top_k,
             with_payload=True,
             score_threshold=settings.rag_score_threshold,
+            query_filter=query_filter,
         )
         log.debug("Recebidos %d resultados do Qdrant.", len(results))
         if results:
@@ -738,6 +809,9 @@ async def retrieve_chunks(
                     chunk_id=payload.get("chunk_id", 0),
                     ue_version=payload.get("ue_version", ""),
                     doc_type=payload.get("doc_type", ""),
+                    # CORREÇÃO (Correção 1): project_source agora é extraído
+                    # do payload também no caminho naive.
+                    project_source=payload.get("project_source", ""),
                     # HYBRID RAG: payload enriquecido — "" para pontos antigos
                     # ingeridos antes desta mudança (compatibilidade retroativa).
                     raw_content=payload.get("raw_content", ""),
@@ -904,6 +978,12 @@ def _format_context(chunks: list) -> str:
         score = _get_chunk_field(chunk, "score", 0.0)
         doc_type = _get_chunk_field(chunk, "doc_type", "")
         raw_content = (_get_chunk_field(chunk, "raw_content", "") or "").strip()
+        # CORREÇÃO (Correção 1): procedência do chunk (Engine nativa vs
+        # projeto de amostra) agora é exibida explicitamente no bloco de
+        # metadados — antes era recuperada do payload mas nunca chegava ao
+        # prompt do LLM, que não tinha como saber se um trecho vinha da API
+        # bruta da Engine ou de um projeto de amostra como Lyra.
+        project_source = (_get_chunk_field(chunk, "project_source", "") or "").strip()
 
         source = source_file.split("/")[-1] if "/" in source_file else source_file
 
@@ -911,6 +991,7 @@ def _format_context(chunks: list) -> str:
             f"--- DOCUMENTO {i} ---\n"
             f"Título: {title}\n"
             f"Arquivo: {source}\n"
+            f"Fonte do Projeto: {project_source or 'não especificada'}\n"
             f"Score de relevância: {score:.4f}\n\n"
             f"[A) ANÁLISE SEMÂNTICA]\n"
             f"{text}"
@@ -1015,10 +1096,29 @@ def _is_retryable_litellm_error(exc: BaseException) -> bool:
     return False
 
 
+# CORREÇÃO (ALTO — @retry engessado em tempo de importação): antes,
+# `stop=stop_after_attempt(settings.litellm_max_retries)` era avaliado UMA
+# ÚNICA VEZ quando o módulo era importado — `stop_after_attempt(n)` captura
+# `n` por valor naquele instante e devolve um objeto imutável. Qualquer
+# alteração de `settings.litellm_max_retries` em runtime (hot-reload do
+# Pydantic Settings, override via variável de ambiente recarregada, etc.)
+# era completamente ignorada até o processo ser reiniciado. `tenacity`
+# aceita qualquer callable `(RetryCallState) -> bool` em `stop=`, não só as
+# fábricas prontas (stop_after_attempt, stop_after_delay, ...) — então em
+# vez de reimplementar a lógica de "parar após N tentativas" à mão,
+# delegamos para uma instância de stop_after_attempt construída NA HORA,
+# dentro do callable, lendo settings.litellm_max_retries a cada chamada.
+def _stop_after_dynamic_attempts(retry_state) -> bool:
+    """Lê settings.litellm_max_retries em runtime a cada avaliação de
+    retry, em vez de congelar o valor em tempo de importação do módulo."""
+    current_max_retries = settings.litellm_max_retries
+    return stop_after_attempt(current_max_retries)(retry_state)
+
+
 @retry(
     retry=retry_if_exception(_is_retryable_litellm_error),
     wait=wait_exponential_jitter(initial=2, max=30),
-    stop=stop_after_attempt(settings.litellm_max_retries),
+    stop=_stop_after_dynamic_attempts,
     reraise=True,
 )
 async def _post_chat_completion(
@@ -1095,6 +1195,7 @@ async def _run_advanced_retrieval(
     user_question: str,
     qdrant: AsyncQdrantClient,
     top_k: int,
+    project_source_filter: str | None = None,
 ) -> list[RetrievedChunk]:
     """
     Executa as fases de Decomposição + Busca Expandida + Deduplicação + Reranking.
@@ -1112,9 +1213,13 @@ async def _run_advanced_retrieval(
         user_question: Pergunta original do usuário.
         qdrant: Cliente Qdrant assíncrono.
         top_k: Número final de chunks desejados após reranking.
+        project_source_filter: Se informado, restringe TODAS as buscas
+            (tradução + sub-queries) a essa procedência — propagado desde
+            ChatRequest.project_source_filter (Correção 1).
 
     Returns:
-        Lista de RetrievedChunk reranqueados, limitada ao top_k.
+        Lista de RetrievedChunk reranqueados, limitada ao top_k e filtrada
+        pelo piso de qualidade pós-reranking (ver settings.rag_rerank_min_score).
         Pode estar vazia se o Qdrant não retornar resultados.
     """
     # Lê o limite de busca expandida das settings (override sem recompilação)
@@ -1150,14 +1255,24 @@ async def _run_advanced_retrieval(
     # no caso extremo de falha total de tradução (ver decompose_query).
     retrieval_tasks: list[asyncio.Task] = [
         asyncio.create_task(
-            _embed_and_retrieve(translated_query, qdrant, retrieval_limit)
+            _embed_and_retrieve(
+                translated_query,
+                qdrant,
+                retrieval_limit,
+                project_source_filter=project_source_filter,
+            )
         )
     ]
 
     for sub_query in sub_queries:
         retrieval_tasks.append(
             asyncio.create_task(
-                _embed_and_retrieve(sub_query, qdrant, retrieval_limit)
+                _embed_and_retrieve(
+                    sub_query,
+                    qdrant,
+                    retrieval_limit,
+                    project_source_filter=project_source_filter,
+                )
             )
         )
 
@@ -1216,13 +1331,49 @@ async def _run_advanced_retrieval(
     # disponível neste escopo, calculado na Fase 1 acima) resolve o mismatch.
     reranked = await rerank_with_flashrank(unique_chunks, translated_query)
 
-    # === FASE 2.4 — Seleção Final top-k ===
-    final_chunks = reranked[:top_k]
+    # === FASE 2.4 — Piso de Qualidade Pós-Reranking (Correção 2) ===
+    # CORREÇÃO (ALTO — ausência de piso de qualidade pós-reranking): antes,
+    # a seleção final simplesmente recortava `reranked[:top_k]`, sem levar
+    # em conta se os scores do Cross-Encoder eram bons ou ruins. Se o
+    # retrieval expandido trouxesse só ruído (nenhum chunk genuinamente
+    # relevante para a pergunta), o pipeline injetava esse ruído no prompt
+    # do LLM do mesmo jeito, só porque havia "espaço" no top_k. Agora
+    # aplicamos um piso de qualidade (settings.rag_rerank_min_score) ANTES
+    # de recortar por top_k — reranked já vem ordenado do maior para o
+    # menor score (ver rerank_with_flashrank), então filtrar preserva a
+    # ordem dos sobreviventes.
+    min_score = getattr(settings, "rag_rerank_min_score", 0.0)
+    if min_score is None:
+        min_score = 0.0
+
+    above_threshold = [c for c in reranked if c.score >= min_score]
+
+    if not above_threshold and reranked:
+        # Nenhum chunk atingiu o piso — mantemos ao menos o melhor candidato
+        # em vez de deixar o prompt sem nenhum contexto. A REGRA 2 do
+        # _SYSTEM_PROMPT já instrui o modelo a avisar explicitamente quando
+        # a documentação não cobre o tópico, então um único chunk fraco não
+        # arrisca uma resposta inventada — só dá ao LLM a chance de
+        # constatar a lacuna com algo concreto na mão.
+        log.warning(
+            "Nenhum chunk atingiu o piso de qualidade pós-reranking "
+            "(rag_rerank_min_score=%.4f, melhor score=%.4f). Mantendo "
+            "apenas o chunk de maior score para não deixar o prompt sem "
+            "contexto algum.",
+            min_score,
+            reranked[0].score,
+        )
+        above_threshold = reranked[:1]
+
+    final_chunks = above_threshold[:top_k]
 
     log.info(
-        "Advanced RAG: %d chunks selecionados após reranking (top_k=%d)",
+        "Advanced RAG: %d chunks selecionados após reranking + piso de "
+        "qualidade (top_k=%d, min_score=%.4f, descartados_por_qualidade=%d)",
         len(final_chunks),
         top_k,
+        min_score,
+        len(reranked) - len(above_threshold),
     )
 
     return final_chunks
@@ -1232,6 +1383,7 @@ async def _embed_and_retrieve(
     query: str,
     qdrant: AsyncQdrantClient,
     limit: int,
+    project_source_filter: str | None = None,
 ) -> list[RetrievedChunk]:
     """
     Função helper: gera embedding de uma query e busca no Qdrant.
@@ -1245,13 +1397,17 @@ async def _embed_and_retrieve(
         query: Texto da sub-query.
         qdrant: Cliente Qdrant assíncrono.
         limit: Número máximo de chunks a recuperar.
+        project_source_filter: Repassado para retrieve_chunks_for_query —
+            restringe a busca por procedência quando informado (Correção 1).
 
     Returns:
         Lista de RetrievedChunk, ou lista vazia em caso de falha.
     """
     try:
         vector = await embed_text(query)
-        return await retrieve_chunks_for_query(qdrant, vector, limit)
+        return await retrieve_chunks_for_query(
+            qdrant, vector, limit, project_source_filter=project_source_filter
+        )
     except Exception as exc:
         log.warning("Falha ao processar sub-query '%s': %s", query[:60], exc)
         return []
@@ -1308,6 +1464,12 @@ async def run_rag_pipeline(
     # top_k=1 ou 2, o Advanced RAG rodava com esse valor raquítico mesmo.
     effective_top_k = max(request.top_k, 8)
 
+    # Correção 1: propaga o filtro de procedência (Engine nativa vs projeto
+    # de amostra) do request até as duas trilhas de retrieval abaixo
+    # (Advanced e o fallback Naive) — antes esse campo do payload era
+    # gravado na ingestão mas nunca chegava a ser usado numa busca.
+    project_source_filter = request.project_source_filter
+
     # =========================================================================
     # TENTATIVA: Advanced RAG Pipeline
     # =========================================================================
@@ -1319,6 +1481,7 @@ async def run_rag_pipeline(
             user_question=request.message,
             qdrant=qdrant,
             top_k=effective_top_k,
+            project_source_filter=project_source_filter,
         )
 
     except Exception as exc:
@@ -1349,7 +1512,12 @@ async def run_rag_pipeline(
         )
         try:
             original_vector = await embed_text(request.message)
-            chunks = await retrieve_chunks(qdrant, original_vector, effective_top_k)
+            chunks = await retrieve_chunks(
+                qdrant,
+                original_vector,
+                effective_top_k,
+                project_source_filter=project_source_filter,
+            )
         except RuntimeError as naive_exc:
             log.error("Naive RAG fallback também falhou: %s", naive_exc)
             raise  # propaga apenas se o fallback também falhar
