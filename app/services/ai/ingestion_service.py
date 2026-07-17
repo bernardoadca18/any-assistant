@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -192,6 +193,27 @@ CPP_MIN_FUNCTION_CHARS: int = 80
 # em modo sample — evita reintroduzir o mesmo problema de truncamento que
 # headers grandes já tinham, agora para .cpp (tipicamente mais verboso).
 CPP_MAX_GROUP_CHARS: int = 6000
+
+# =============================================================================
+# Constantes — Canal D (.bp.json, Blueprints exportados via Unreal Python API)
+# =============================================================================
+# CORREÇÃO ARQUITETURAL: o Canal D deixou de depender de exportação em
+# texto T3D + limpeza por regex. Um script Editor Utility rodando DENTRO da
+# Unreal (ver BP_GraphExporter.py) agora percorre o EdGraph via API Python
+# e exporta um JSON já estruturado (ParentClass, Variables,
+# ExecutionFlow linearizado com branches nomeados). Isso elimina a
+# necessidade de qualquer regex de limpeza aqui — o JSON já chega limpo,
+# sem ruído visual de editor (NodePosX, GUIDs, PinIds nunca são
+# exportados pelo script Unreal). O trabalho deste canal passa a ser só:
+# validar o JSON, formatá-lo de volta como texto legível para o prompt, e
+# documentar via LLM.
+
+# Teto de caracteres do JSON formatado (após json.dumps) enviado à LLM
+# documentadora — Blueprints com muitos Custom Events e fluxos profundos
+# ainda podem gerar um JSON grande mesmo sem ruído de editor. Truncar aqui
+# é sobre o texto SERIALIZADO, não sobre regex de limpeza (que não existe
+# mais neste canal).
+BP_JSON_MAX_CHARS: int = 8000
 
 
 # =============================================================================
@@ -454,12 +476,81 @@ adapt this mechanic in their own project.\
 """
 
 
+# Orçamento de caracteres dedicado para o header injetado como contexto no
+# Canal C — deliberadamente menor que ingestion_max_header_chars (que vale
+# para o Canal A processando o header como documento PRINCIPAL). Aqui o
+# header é só CONTEXTO de apoio; o conteúdo principal é o .cpp. Um teto
+# menor evita que um header grande domine o prompt e empurre o orçamento
+# total (header + grupo de funções) para além do limite de contexto do
+# modelo documentador.
+CPP_HEADER_CONTEXT_MAX_CHARS: int = 4000
+
+
+def _find_sibling_header(cpp_path: Path) -> Path | None:
+    """
+    Localiza o .h correspondente a um .cpp: mesmo nome, mesma pasta.
+
+    Convenção universal em código UE5 (Engine e projetos/samples) — não
+    cobre o caso raro de headers em pasta `Public/` separada de `Private/`
+    com o .cpp (alguns módulos de plugin usam esse layout); nesse caso o
+    Canal C simplesmente segue sem contexto de header, degradando
+    graciosamente em vez de falhar.
+    """
+    candidate = cpp_path.with_suffix(".h")
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def _load_header_context(cpp_path: Path) -> str:
+    """
+    Lê e prepara o .h irmão de um .cpp para uso como contexto injetado no
+    prompt do Canal C. Retorna string vazia se o header não existir ou não
+    puder ser lido — nunca lança, porque a ausência de header não deve
+    impedir a documentação da implementação em si (apenas a empobrece).
+    """
+    header_path = _find_sibling_header(cpp_path)
+    if header_path is None:
+        log.debug("Nenhum .h irmão encontrado para '%s' — Canal C seguirá sem contexto de header.", cpp_path)
+        return ""
+
+    try:
+        raw_header = header_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        log.warning("Falha ao ler header irmão '%s' de '%s': %s — seguindo sem contexto.", header_path, cpp_path, exc)
+        return ""
+
+    cleaned_header = _clean_cpp_header(raw_header)  # remove #includes, normaliza blanks
+    if not cleaned_header:
+        return ""
+
+    if len(cleaned_header) > CPP_HEADER_CONTEXT_MAX_CHARS:
+        log.debug(
+            "Header de contexto '%s' truncado de %d para %d chars para o Canal C.",
+            header_path, len(cleaned_header), CPP_HEADER_CONTEXT_MAX_CHARS,
+        )
+        cleaned_header = cleaned_header[:CPP_HEADER_CONTEXT_MAX_CHARS]
+
+    return cleaned_header
+
+
 async def _process_cpp_file(
     path: Path, raw: str, ue_version: str, project_source: str
 ) -> list[dict]:
     """
     Processa um .cpp em modo sample: divide por função, agrupa blocos
     pequenos, e documenta cada grupo via LLM com foco em MECÂNICA (não API).
+
+    CORREÇÃO — Injeção de contexto do header: o .cpp sozinho só mostra a
+    IMPLEMENTAÇÃO; as macros UCLASS/UPROPERTY/UFUNCTION e as assinaturas
+    completas (incluindo tipos de retorno e parâmetros com nomes
+    descritivos, que no .cpp às vezes vêm abreviados) vivem no .h. Sem
+    esse contexto, a LLM documentadora pode interpretar mal o propósito de
+    uma variável ou sinalizador (ex: não sabe se uma UPROPERTY é
+    replicada, BlueprintReadOnly, EditAnywhere, etc.) e produzir
+    documentação tecnicamente correta mas rasa. O header é lido e limpo
+    UMA VEZ por arquivo .cpp (não uma vez por grupo) para não multiplicar
+    o custo de tokens quando o .cpp gera múltiplos grupos.
 
     Só deve ser chamado em sample_mode=True — para a Engine, .cpp não é
     ingerido (ver _run_ingestion: extensões dependem de sample_mode).
@@ -468,6 +559,8 @@ async def _process_cpp_file(
     if not cleaned:
         log.debug(".cpp vazio após limpeza, ignorado: %s", path)
         return []
+
+    header_context = _load_header_context(path)
 
     blocks = _split_cpp_into_functions(cleaned)
     groups = _group_cpp_blocks(blocks, CPP_MAX_GROUP_CHARS)
@@ -484,9 +577,22 @@ async def _process_cpp_file(
             group_text = group_text[:max_chars]
 
         title = names[0] if names else path.stem
+
+        # Contexto do header (se disponível) entra ANTES do bloco .cpp no
+        # prompt do usuário, claramente rotulado como "declaração" para a
+        # LLM não confundir com o corpo de implementação que é o foco real.
+        header_section = (
+            f"Header declarations for context (from {path.with_suffix('.h').name}):\n"
+            f"```cpp\n{header_context}\n```\n\n"
+            if header_context
+            else ""
+        )
+
         user_message = (
             f"Source file: {path.name}\n"
             f"Functions in this group: {', '.join(names)}\n\n"
+            f"{header_section}"
+            f"Implementation ({path.name}):\n"
             f"```cpp\n{group_text}\n```"
         )
         messages = [
@@ -615,6 +721,202 @@ async def _process_udn_file(
         title=title or path.stem,
         ue_version=ue_version,
         raw_content=clean_text,
+        project_source=project_source,
+    )
+
+
+# =============================================================================
+# CANAL D — Blueprints exportados como JSON estruturado (.bp.json)
+# =============================================================================
+# NOTA DE ARQUITETURA — por que Blueprints importam tanto quanto C++ aqui:
+#     Gameplay em projetos UE5 reais é HÍBRIDO — muita mecânica (regras de
+#     dano, montagem de árvore de habilidade, lógica de UI, triggers de
+#     nível) é implementada em Blueprint, não em C++. Ignorar Blueprints no
+#     RAG deixaria uma lacuna tão grande quanto ignorar .cpp (ver Canal C).
+#
+# MUDANÇA ARQUITETURAL (v2): este canal deixou de consumir Blueprints
+# exportados em texto T3D + limpeza por regex. Um Editor Utility Script
+# rodando DENTRO da Unreal (ver BP_GraphExporter.py, entregue junto) agora
+# percorre o EdGraph via API Python e exporta um <Asset>.bp.json já
+# ESTRUTURADO — com ParentClass, Variables e ExecutionFlow linearizado
+# (nós de controle de fluxo como Branch/Sequence viram passos "branch" com
+# sub-listas rotuladas). Isso elimina a limitação conhecida da versão
+# anterior (regex não entende topologia de grafo): a topologia agora é
+# resolvida DENTRO da Unreal, onde a API tem acesso real aos pinos de
+# execução — o backend só recebe o resultado já linearizado.
+#
+# LIMITAÇÃO CONHECIDA REMANESCENTE (herdada do exportador, não deste
+#     backend): o exportador não deduplica nós em ramos que reconvergem
+#     (um nó alcançado por dois branches diferentes aparece uma vez em
+#     cada ramo), e loops de execução são detectados e cortados, não
+#     resolvidos como laço semântico. Ver docstring de
+#     _trace_execution_flow em BP_GraphExporter.py para o detalhe completo.
+
+_BP_DOCUMENTER_SYSTEM_PROMPT = """\
+You are a Senior Gameplay Programmer at Epic Games, specialized in \
+explaining Unreal Engine 5 Blueprint mechanics from a STRUCTURED JSON \
+representation of the Blueprint's graph, extracted via the Unreal Python \
+API (not raw exported text).
+
+The JSON contains:
+- "ParentClass": the C++ or Blueprint class this Blueprint extends.
+- "Variables": a list of {"name", "default_value"} for each meaningful \
+Blueprint variable.
+- "ExecutionFlow": a list of entry points, each with an "entry_point" \
+(the triggering event — e.g. BeginPlay, a Custom Event, an input binding) \
+and "steps" — a linearized sequence of the logic that entry point \
+triggers. A step is either:
+  - {"type": "step", "node": {...}} — a single action (e.g. a function \
+call, identified by "function_name" or "event_name" when available).
+  - {"type": "branch", "node": {...}, "branches": {label: [steps...]}} — \
+a control-flow node (Branch, Sequence, ForEachLoop, Switch, etc.) whose \
+execution splits into multiple named outcomes, each with its own \
+sub-sequence of steps.
+  - {"type": "loop_reference"} — the flow returned to an already-visited \
+node in this branch (a loop was detected and the trace stopped there to \
+avoid infinite recursion).
+
+Your task: produce a Markdown guide explaining WHAT this Blueprint does as \
+a gameplay mechanic — not a transcription of the JSON structure itself.
+
+STRICT RULES:
+1. Output ONLY Markdown. No preamble, no "Here is the documentation" filler.
+2. Start with a single H1 title naming the mechanic or system (e.g. \
+"# Double Jump Blueprint Logic", "# Interactable Door Trigger") — not just \
+the raw Blueprint asset name.
+3. State the PARENT CLASS this Blueprint extends.
+4. Under `## Key Variables`, list the meaningful variables and their \
+default values, explaining what each controls in gameplay terms.
+5. Under `## Main Events`, cover each entry point in "ExecutionFlow": \
+name the trigger, then describe IN YOUR OWN WORDS the sequence of logic \
+it runs. When you encounter a "branch" step, explain the condition/split \
+and summarize what happens in each named outcome. Do not just restate \
+node names — explain what the sequence accomplishes as gameplay behavior.
+6. Under `## Integration Points`, note any calls to other systems (e.g. \
+Gameplay Ability System, Animation Blueprint, C++ base class functions, \
+other Blueprints) identifiable from function_name/event_name values.
+7. Never invent behavior not evidenced in the provided JSON. If
+"ExecutionFlow" is empty or a referenced function is external and its \
+behavior isn't shown, say so explicitly rather than guessing. If you see \
+a "loop_reference" step, mention that the flow loops back rather than \
+inventing what the loop does.
+8. Be concise but complete — prioritize helping a developer understand or \
+replicate this mechanic in their own project.\
+"""
+
+
+def _extract_blueprint_asset_name(path: Path) -> str:
+    """
+    Extrai o nome do asset a partir do path de um arquivo '<Nome>.bp.json'.
+
+    path.stem sozinho NÃO resolve isso corretamente: para uma extensão
+    dupla como '.bp.json', path.stem remove só o último componente
+    ('.json'), retornando 'NomeDoAsset.bp' — com o sufixo '.bp' residual
+    ainda grudado no nome. Removemos explicitamente o sufixo '.bp' restante
+    quando presente.
+    """
+    stem = path.stem  # "BP_DoubleJump.bp" para "BP_DoubleJump.bp.json"
+    if stem.endswith(".bp"):
+        stem = stem[: -len(".bp")]
+    return stem
+
+
+async def _process_blueprint_file(
+    path: Path, raw: str, ue_version: str, project_source: str
+) -> list[dict]:
+    """
+    Processa um Blueprint exportado como JSON estruturado (.bp.json):
+    parseia e valida o JSON, formata de volta como texto legível para o
+    prompt, documenta via LLM com foco em mecânica de gameplay, e constrói
+    os chunks finais.
+
+    Só deve ser chamado em sample_mode=True — Blueprints exportados só
+    fazem sentido no contexto de projetos-sample de mecânica, nunca para a
+    Engine base (ver _run_ingestion: .bp.json só entra nas extensões
+    descobertas quando sample_mode=True).
+    """
+    asset_name = _extract_blueprint_asset_name(path)
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.error(
+            "Falha ao parsear '%s' como JSON — arquivo malformado ou "
+            "exportação incompleta do BP_GraphExporter.py: %s. Arquivo ignorado.",
+            path, exc,
+        )
+        return []
+
+    if not isinstance(payload, dict):
+        log.error(
+            "'%s' não contém um objeto JSON no nível raiz (esperado dict, "
+            "recebido %s) — arquivo ignorado.",
+            path, type(payload).__name__,
+        )
+        return []
+
+    # Validação defensiva e tolerante: campos ausentes viram valores vazios
+    # em vez de derrubar a exportação inteira do Blueprint. O próprio
+    # BP_GraphExporter.py já documenta casos em que ExecutionFlow pode vir
+    # vazio (ex: Blueprint sem EventGraph acessível) — isso não é erro
+    # fatal, só uma documentação mais pobre para esse asset específico.
+    parent_class = payload.get("ParentClass", "Unknown")
+    variables = payload.get("Variables", [])
+    execution_flow = payload.get("ExecutionFlow", [])
+
+    if not execution_flow:
+        log.warning(
+            "Blueprint '%s' tem ExecutionFlow vazio — documentação será "
+            "limitada a ParentClass/Variables.",
+            asset_name,
+        )
+
+    normalized_payload = {
+        "AssetName": asset_name,
+        "ParentClass": parent_class,
+        "Variables": variables,
+        "ExecutionFlow": execution_flow,
+    }
+
+    formatted_json = json.dumps(normalized_payload, indent=2, ensure_ascii=False)
+
+    if len(formatted_json) > BP_JSON_MAX_CHARS:
+        log.warning(
+            "JSON de '%s' tem %d chars formatado (limite=%d) — truncando "
+            "antes de enviar à LLM documentadora. Fluxos de execução mais "
+            "profundos podem ser cortados.",
+            path, len(formatted_json), BP_JSON_MAX_CHARS,
+        )
+        formatted_json = formatted_json[:BP_JSON_MAX_CHARS]
+
+    user_message = (
+        f"Blueprint asset: {asset_name}\n\n"
+        f"```json\n{formatted_json}\n```"
+    )
+    messages = [
+        {"role": "system", "content": _BP_DOCUMENTER_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    try:
+        markdown, _pt, _ct = await call_litellm(
+            messages=messages,
+            model=settings.ingestion_documenter_model,
+        )
+    except Exception as exc:
+        log.error(
+            "Falha ao documentar Blueprint '%s': %s — arquivo ignorado.",
+            path, exc,
+        )
+        return []
+
+    return _build_chunks_with_metadata(
+        markdown_text=markdown,
+        source_file=str(path),
+        doc_type="Blueprint Logic (.bp.json)",
+        title=asset_name,
+        ue_version=ue_version,
+        raw_content=formatted_json,
         project_source=project_source,
     )
 
@@ -1222,12 +1524,20 @@ async def _run_ingestion(
     failures_cache = await _load_failures_cache(redis, failures_key)
     ue_version = ue_version_override or _extract_ue_version(str(root))
 
-    # CORREÇÃO (Canal C): em sample_mode, também descobrimos .cpp — é onde
-    # vive a IMPLEMENTAÇÃO real da mecânica, não só a assinatura. Para a
-    # Engine (sample_mode=False), mantemos só .h — mais barato e mais
-    # estrito, como já era.
+    # CORREÇÃO (Canal C + Canal D): em sample_mode, também descobrimos .cpp
+    # (implementação C++ real, Canal C) e .bp.json (Blueprints exportados
+    # como JSON estruturado via BP_GraphExporter.py, Canal D) — gameplay em
+    # projetos reais é híbrido C++/Blueprint, e ambos os canais capturam a
+    # parte que .h sozinho não cobre. Para a Engine (sample_mode=False),
+    # mantemos só .h — mais barato e mais estrito, como já era.
+    #
+    # NOTA: ".bp.json" é uma extensão dupla. `fname.endswith(".bp.json")`
+    # (usado dentro de _walk_files) funciona corretamente por comparação de
+    # string — mas `Path.suffix` NÃO reconhece extensões duplas (retorna
+    # só ".json"). Por isso o dispatch abaixo usa `file_path.name.endswith(...)`
+    # em vez de `file_path.suffix ==` para este canal especificamente.
     if content_type == "source_code":
-        extensions = (".h", ".cpp") if sample_mode else (".h",)
+        extensions = (".h", ".cpp", ".bp.json") if sample_mode else (".h",)
     else:
         extensions = (".udn",)
 
@@ -1311,7 +1621,17 @@ async def _run_ingestion(
             raw_text = raw_bytes.decode("utf-8", errors="ignore")
 
             if content_type == "source_code":
-                if file_path.suffix == ".cpp":
+                if file_path.name.endswith(".bp.json"):
+                    # Canal D — verificado ANTES de .cpp/.h porque
+                    # Path.suffix não reconhece extensão dupla (".bp.json"
+                    # tem suffix == ".json", que cairia no ramo Canal A por
+                    # engano se checássemos .suffix primeiro). Só existe em
+                    # sample_mode (extensions só inclui .bp.json quando
+                    # sample_mode=True, ver acima).
+                    chunks = await _process_blueprint_file(
+                        file_path, raw_text, ue_version, project_source
+                    )
+                elif file_path.suffix == ".cpp":
                     # Canal C — só existe em sample_mode (extensions só
                     # inclui .cpp quando sample_mode=True, ver acima)
                     chunks = await _process_cpp_file(
