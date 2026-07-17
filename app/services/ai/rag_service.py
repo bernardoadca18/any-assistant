@@ -563,15 +563,27 @@ async def _get_ranker() -> Any:
 
 async def rerank_with_flashrank(
     chunks: list[RetrievedChunk],
-    user_question: str,
+    query_text_en: str,
 ) -> list[RetrievedChunk]:
     """
     Reordena os chunks usando um Cross-Encoder leve via FlashRank.
 
     FlashRank usa modelos ONNX otimizados que rodam em CPU em milissegundos,
     sem necessidade de GPU, sem chamada de API externa. Compara o texto de
-    cada chunk diretamente contra a PERGUNTA ORIGINAL (não sub-queries)
-    para maximizar relevância final.
+    cada chunk diretamente contra `query_text_en` para maximizar relevância
+    final — a comparação usa a query como um todo (não as sub-queries
+    decompostas individualmente), para julgar cada chunk contra a intenção
+    completa da pergunta.
+
+    CORREÇÃO CRÍTICA (mismatch cross-lingual): `query_text_en` DEVE ser texto
+    em INGLÊS (a `translated_query` retornada por decompose_query() — nunca
+    a pergunta original em PT-BR). O modelo Cross-Encoder do FlashRank
+    (ms-marco-MiniLM, ver _FLASHRANK_MODEL) é treinado e opera em inglês;
+    comparar texto em português contra os chunks (também em inglês) faz o
+    score de relevância desabar para praticamente zero em todos os
+    candidatos, mesmo nos genuinamente relevantes — ver correção aplicada em
+    _run_advanced_retrieval, que antes chamava esta função com a pergunta
+    original em PT-BR por engano.
 
     O Ranker é cacheado como singleton (ver _get_ranker) e a inferência roda
     em thread separada (asyncio.to_thread) para nunca bloquear o event loop.
@@ -581,7 +593,8 @@ async def rerank_with_flashrank(
 
     Args:
         chunks: Lista deduplicada de chunks para reranking.
-        user_question: Pergunta original do usuário (âncora do reranking).
+        query_text_en: Texto em INGLÊS usado como âncora do reranking
+            (tipicamente a translated_query de decompose_query()).
 
     Returns:
         Lista reordenada pelo score do Cross-Encoder (mais relevante primeiro).
@@ -611,7 +624,7 @@ async def rerank_with_flashrank(
             for chunk in chunks
         ]
 
-        rerank_request = RerankRequest(query=user_question, passages=passages)
+        rerank_request = RerankRequest(query=query_text_en, passages=passages)
         # CORREÇÃO (bloqueio de event loop): inferência do Cross-Encoder é
         # CPU-bound e síncrona — despachada para thread para não travar o
         # loop enquanto outras requisições HTTP estão em andamento.
@@ -1183,7 +1196,25 @@ async def _run_advanced_retrieval(
     # síncrono e bloqueante — rerank_with_flashrank despacha a inferência via
     # asyncio.to_thread internamente para não travar o event loop sob
     # concorrência (ver correção em _get_ranker/rerank_with_flashrank).
-    reranked = await rerank_with_flashrank(unique_chunks, user_question)
+    #
+    # CORREÇÃO CRÍTICA (mismatch cross-lingual no reranking): antes, esta
+    # chamada usava `user_question` — a pergunta ORIGINAL em PT-BR — como
+    # âncora de comparação do Cross-Encoder. O modelo do FlashRank
+    # (ms-marco-MiniLM, ver _FLASHRANK_MODEL) é treinado e opera em INGLÊS;
+    # comparar texto em português contra os chunks em inglês faz o
+    # Cross-Encoder atribuir scores de relevância artificialmente baixos e
+    # quase uniformes a TODOS os candidatos (mesmo aos genuinamente
+    # relevantes) — exatamente o mesmo mismatch cross-lingual que
+    # decompose_query()/_run_advanced_retrieval já corrigem para a fase de
+    # embedding, mas que nunca tinha sido aplicado à fase de reranking. Isso
+    # não bloqueia a resposta (o pipeline segue funcionando e retornando
+    # chunks plausíveis, já que o Qdrant já tinha feito o trabalho pesado de
+    # retrieval com a query traduzida), mas o rerank final é essencialmente
+    # ruído — o campo `score` nos chunks retornados fica artificialmente
+    # próximo de zero e não reflete relevância real, e a reordenação que o
+    # Cross-Encoder aplica também perde valor. Usar `translated_query` (já
+    # disponível neste escopo, calculado na Fase 1 acima) resolve o mismatch.
+    reranked = await rerank_with_flashrank(unique_chunks, translated_query)
 
     # === FASE 2.4 — Seleção Final top-k ===
     final_chunks = reranked[:top_k]
