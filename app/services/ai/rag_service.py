@@ -35,6 +35,7 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from typing import Any
 
 import httpx
@@ -65,8 +66,15 @@ _RETRIEVAL_LIMIT_PER_QUERY: int = 15
 # Modelo de decomposição padrão (pode ser sobrescrito via settings)
 _DECOMPOSITION_MODEL: str = "gemini-3.1-flash-lite"
 
-# Fallback: se o modelo de decomposição principal retornar erro 4xx/5xx
-_DECOMPOSITION_MODEL_FALLBACK: str = "gemini-3.1-flash-lite"
+# Fallback: se o modelo de decomposição principal falhar (HTTP 4xx/5xx,
+# timeout ou erro de conexão — ver decompose_query).
+# CORREÇÃO (ALTO): este valor estava idêntico a _DECOMPOSITION_MODEL, o que
+# tornava o fallback um no-op — uma indisponibilidade real do modelo
+# principal falhava da mesma forma nas duas tentativas. Precisa ser um
+# modelo genuinamente diferente (outro provider/tier no LiteLLM) para
+# fornecer redundância de verdade. Ajuste este valor para o modelo de
+# fallback real disponível no seu LiteLLM (ex.: outro provider hospedado).
+_DECOMPOSITION_MODEL_FALLBACK: str = "gpt-4o-mini"
 
 # Timeout dedicado para a chamada de decomposição (deve ser rápida)
 _DECOMPOSITION_TIMEOUT: float = 12.0
@@ -207,7 +215,16 @@ async def decompose_query(user_question: str) -> list[str]:
         "response_format": {"type": "json_object"},  # força JSON no LiteLLM
     }
 
-    try:
+    # CORREÇÃO (ALTO — fallback pulado em falhas não-HTTP): antes, só
+    # httpx.HTTPStatusError acionava a tentativa com o modelo de fallback;
+    # qualquer outra falha (timeout, ConnectError, JSON malformado na
+    # resposta) ia direto para o caminho degradado em PT-BR, pulando o
+    # fallback por completo — o oposto do que faz sentido, já que timeout
+    # e erro de conexão são justamente os casos mais comuns de falha
+    # transitória. Agora QUALQUER falha do modelo principal tenta o
+    # fallback antes de degradar.
+    async def _call_decomposition_model(model_name: str) -> str:
+        request_payload = {**payload, "model": model_name}
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=5.0,
@@ -218,50 +235,38 @@ async def decompose_query(user_question: str) -> list[str]:
         ) as client:
             resp = await client.post(
                 url,
-                json=payload,
+                json=request_payload,
                 headers=settings.litellm_headers,
             )
             resp.raise_for_status()
-
         data = resp.json()
-        raw_content: str = data["choices"][0]["message"]["content"]
+        return data["choices"][0]["message"]["content"]
 
-    except httpx.HTTPStatusError as exc:
-        # Tenta modelo de fallback se o principal retornar 4xx/5xx
+    try:
+        raw_content: str = await _call_decomposition_model(decomp_model)
+    except Exception as primary_exc:
         log.warning(
-            "Decomposição: modelo '%s' retornou HTTP %d. Tentando fallback '%s'.",
+            "Decomposição: modelo principal '%s' falhou (%s). Tentando "
+            "fallback '%s'.",
             decomp_model,
-            exc.response.status_code,
+            primary_exc,
             _DECOMPOSITION_MODEL_FALLBACK,
         )
-        payload["model"] = _DECOMPOSITION_MODEL_FALLBACK
         try:
-            async with httpx.AsyncClient(timeout=decomp_timeout) as client:
-                resp = await client.post(url, json=payload, headers=settings.litellm_headers)
-                resp.raise_for_status()
-            data = resp.json()
-            raw_content = data["choices"][0]["message"]["content"]
+            raw_content = await _call_decomposition_model(_DECOMPOSITION_MODEL_FALLBACK)
         except Exception as fallback_exc:
             log.error(
                 "TRADUÇÃO INDISPONÍVEL: decomposição falhou no modelo principal "
-                "('%s') e no fallback ('%s'): %s. Usando a query original em "
+                "('%s': %s) e no fallback ('%s': %s). Usando a query original em "
                 "PT-BR para embedding — isso é um caminho DEGRADADO que sofre "
                 "de mismatch cross-lingual contra o corpus (100%% inglês) e "
                 "deve ser tratado como incidente, não como comportamento normal.",
                 decomp_model,
+                primary_exc,
                 _DECOMPOSITION_MODEL_FALLBACK,
                 fallback_exc,
             )
             return [user_question]
-
-    except Exception as exc:
-        log.error(
-            "TRADUÇÃO INDISPONÍVEL: decomposição falhou com erro inesperado: %s. "
-            "Usando a query original em PT-BR para embedding — caminho "
-            "DEGRADADO, ver nota acima.",
-            exc,
-        )
-        return [user_question]
 
     # --- Parse robusto da resposta JSON ---
     translated_query, sub_queries = _parse_decomposition_response(raw_content, user_question)
@@ -498,7 +503,65 @@ def _deduplicate_chunks(chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
 # FASE 2.3 — Reranking com FlashRank (Cross-Encoder CPU)
 # ---------------------------------------------------------------------------
 
-def rerank_with_flashrank(
+# ---------------------------------------------------------------------------
+# Singleton do Ranker (FlashRank)
+# ---------------------------------------------------------------------------
+# CORREÇÃO (ALTO — bloqueio de event loop): rerank_with_flashrank criava um
+# `Ranker(...)` novo A CADA REQUISIÇÃO, dentro de uma função síncrona chamada
+# diretamente do event loop assíncrono (sem asyncio.to_thread). O comentário
+# original ("FlashRank faz cache interno — chamadas subsequentes são
+# instantâneas") se refere ao cache do ARQUIVO de modelo em disco, não à
+# instância Python/sessão ONNX — recriar o objeto tem overhead real, e mesmo
+# que fosse grátis, a inferência do Cross-Encoder é CPU-bound e síncrona: para
+# N usuários concorrentes, cada rerank bloqueava o loop inteiro pelo tempo de
+# execução, serializando todas as outras requisições HTTP do FastAPI nesse
+# intervalo. Agora o Ranker é construído uma única vez (fora do event loop,
+# via to_thread) e reaproveitado; a inferência também roda em thread separada.
+_ranker_instance: Any = None
+_ranker_init_lock = asyncio.Lock()
+
+
+async def _get_ranker() -> Any:
+    """Retorna o Ranker cacheado, construindo-o (em thread) na 1ª chamada."""
+    global _ranker_instance
+    if _ranker_instance is not None:
+        return _ranker_instance
+
+    async with _ranker_init_lock:
+        # Re-checa dentro do lock: outra corrotina pode ter inicializado
+        # enquanto esperávamos o lock.
+        if _ranker_instance is None:
+            try:
+                from flashrank import Ranker  # importação lazy — graceful degradation
+            except ImportError:
+                log.warning(
+                    "FlashRank não está instalado. Instale com: pip install flashrank. "
+                    "Usando ordem original do Qdrant como fallback."
+                )
+                return None
+
+            reranker_model = getattr(settings, "rag_reranker_model", _FLASHRANK_MODEL)
+            cache_dir = getattr(settings, "rag_reranker_cache_dir", "/tmp/flashrank_cache")
+            try:
+                _ranker_instance = await asyncio.to_thread(
+                    Ranker, model_name=reranker_model, cache_dir=cache_dir
+                )
+                log.info(
+                    "FlashRank Ranker inicializado e cacheado | model=%s",
+                    reranker_model,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Falha ao inicializar o FlashRank Ranker: %s. "
+                    "Reranking ficará desabilitado (fallback: ordem original).",
+                    exc,
+                )
+                return None
+
+    return _ranker_instance
+
+
+async def rerank_with_flashrank(
     chunks: list[RetrievedChunk],
     user_question: str,
 ) -> list[RetrievedChunk]:
@@ -509,6 +572,9 @@ def rerank_with_flashrank(
     sem necessidade de GPU, sem chamada de API externa. Compara o texto de
     cada chunk diretamente contra a PERGUNTA ORIGINAL (não sub-queries)
     para maximizar relevância final.
+
+    O Ranker é cacheado como singleton (ver _get_ranker) e a inferência roda
+    em thread separada (asyncio.to_thread) para nunca bloquear o event loop.
 
     Em caso de falha (biblioteca não instalada, modelo não disponível, etc.),
     retorna os chunks na ordem original do Qdrant como fallback.
@@ -523,23 +589,12 @@ def rerank_with_flashrank(
     if not chunks:
         return chunks
 
-    try:
-        from flashrank import Ranker, RerankRequest  # importação lazy — graceful degradation
-    except ImportError:
-        log.warning(
-            "FlashRank não está instalado. Instale com: pip install flashrank. "
-            "Usando ordem original do Qdrant como fallback."
-        )
+    ranker = await _get_ranker()
+    if ranker is None:
         return chunks
 
     try:
-        # Lê modelo e cache dir das settings (permitem override sem recompilação)
-        reranker_model = getattr(settings, "rag_reranker_model", _FLASHRANK_MODEL)
-        cache_dir = getattr(settings, "rag_reranker_cache_dir", "/tmp/flashrank_cache")
-
-        # Inicialização do ranker (carrega modelo ONNX na primeira chamada)
-        # FlashRank faz cache interno — chamadas subsequentes são instantâneas
-        ranker = Ranker(model_name=reranker_model, cache_dir=cache_dir)
+        from flashrank import RerankRequest
 
         # Formata os passages no formato esperado pelo FlashRank
         passages = [
@@ -557,7 +612,10 @@ def rerank_with_flashrank(
         ]
 
         rerank_request = RerankRequest(query=user_question, passages=passages)
-        reranked_results = ranker.rerank(rerank_request)
+        # CORREÇÃO (bloqueio de event loop): inferência do Cross-Encoder é
+        # CPU-bound e síncrona — despachada para thread para não travar o
+        # loop enquanto outras requisições HTTP estão em andamento.
+        reranked_results = await asyncio.to_thread(ranker.rerank, rerank_request)
 
         # Reconstrói a lista de RetrievedChunk na nova ordem do Cross-Encoder
         # Cria índice de busca rápida por (source_file, chunk_id)
@@ -682,6 +740,104 @@ async def retrieve_chunks(
         settings.rag_score_threshold,
     )
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# CORREÇÃO CRÍTICA — Backfill do raw_content (Referência Direta ausente)
+# ---------------------------------------------------------------------------
+# ingestion_service.py grava o `raw_content` completo apenas no chunk_id==0
+# de cada `source_file` (ver _build_chunks_with_metadata), para não duplicar
+# o conteúdo integral do arquivo em N pontos do Qdrant. O comentário lá é
+# explícito: "o rag_service.py deve, ao montar a Referência Direta, cair de
+# volta no raw_content do chunk_id==0 daquele source_file quando o chunk
+# recuperado tiver None" — mas esse fallback nunca tinha sido implementado
+# aqui. Como o retrieval é por CHUNK (não por arquivo), a maioria dos chunks
+# retornados numa consulta normal tem chunk_id != 0, e _format_context
+# descartava silenciosamente o bloco "B) REFERÊNCIA DIRETA" para eles — sem
+# log, sem erro. Na prática, a garantia de sintaxe exata (assinaturas, tipos,
+# UPROPERTY/UFUNCTION) que é a proposta central do Hybrid RAG só aparecia
+# quando por acaso o chunk 0 do arquivo entrava no pool retornado.
+#
+# NOTA (Canal C / .cpp): o fallback usa `chunk.source_file`, NÃO
+# `source_file_root`. Cada grupo de funções de um .cpp tem seu próprio
+# source_file sintético ("path#groupN") e seu próprio raw_content isolado
+# (o texto daquele grupo específico, não o arquivo .cpp inteiro) — ver
+# _process_cpp_file. O chunk 0 "certo" para o fallback é sempre o do MESMO
+# source_file do chunk que está com raw_content ausente.
+async def _backfill_raw_content(
+    qdrant: AsyncQdrantClient, chunks: list[RetrievedChunk]
+) -> list[RetrievedChunk]:
+    """
+    Preenche `raw_content` ausente (chunks com chunk_id != 0) buscando o
+    chunk_id==0 do mesmo `source_file` diretamente por point_id
+    determinístico (mesmo esquema uuid5 usado no upsert — ver
+    ingestion_service.py::_flush_batch), sem custo de embedding e sem
+    filtro por payload.
+
+    Falhas aqui NUNCA devem derrubar a resposta — na pior hipótese, os
+    chunks afetados simplesmente ficam sem a seção B) no contexto, como
+    acontecia antes desta correção.
+    """
+    missing_sources = {
+        chunk.source_file
+        for chunk in chunks
+        if chunk.chunk_id != 0
+        and not (chunk.raw_content or "").strip()
+        and chunk.source_file
+    }
+    if not missing_sources:
+        return chunks
+
+    point_ids = [
+        str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}::0"))
+        for source in missing_sources
+    ]
+
+    try:
+        points = await qdrant.retrieve(
+            collection_name=settings.qdrant_collection,
+            ids=point_ids,
+            with_payload=["source_file", "raw_content"],
+        )
+    except Exception as exc:
+        log.warning(
+            "Backfill de raw_content falhou (%d arquivo(s) afetado(s)): %s. "
+            "Referência Direta ficará ausente para os chunks correspondentes "
+            "nesta resposta — não bloqueante.",
+            len(missing_sources),
+            exc,
+        )
+        return chunks
+
+    raw_by_source: dict[str, str] = {
+        p.payload["source_file"]: p.payload.get("raw_content", "")
+        for p in points
+        if p.payload and p.payload.get("source_file")
+    }
+
+    if not raw_by_source:
+        return chunks
+
+    backfilled = 0
+    result: list[RetrievedChunk] = []
+    for chunk in chunks:
+        if (
+            chunk.chunk_id != 0
+            and not (chunk.raw_content or "").strip()
+            and chunk.source_file in raw_by_source
+        ):
+            result.append(chunk.model_copy(update={"raw_content": raw_by_source[chunk.source_file]}))
+            backfilled += 1
+        else:
+            result.append(chunk)
+
+    log.info(
+        "Backfill de raw_content: %d/%d chunk(s) sem Referência Direta "
+        "preenchidos a partir do chunk 0 do respectivo arquivo.",
+        backfilled,
+        len(missing_sources),
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -825,13 +981,21 @@ def _get_litellm_client() -> httpx.AsyncClient:
 
 def _is_retryable_litellm_error(exc: BaseException) -> bool:
     """
-    Define quais falhas justificam retry com backoff exponencial: timeouts e
-    erros HTTP tipicamente transitórios (rate limit e 5xx). Erros 4xx que não
-    sejam 429 (payload malformado, modelo inexistente, etc.) NÃO são
-    retentados — insistir não resolve um erro de requisição malformada, só
-    atrasa a falha e desperdiça tentativas.
+    Define quais falhas justificam retry com backoff exponencial: timeouts,
+    erros de conexão, e erros HTTP tipicamente transitórios (rate limit e
+    5xx). Erros 4xx que não sejam 429 (payload malformado, modelo
+    inexistente, etc.) NÃO são retentados — insistir não resolve um erro de
+    requisição malformada, só atrasa a falha e desperdiça tentativas.
+
+    CORREÇÃO (ALTO — retry não cobria erros de conexão): antes só
+    httpx.TimeoutException era tratado como transitório. httpx.ConnectError
+    (conexão recusada, DNS falhando, container do LiteLLM ainda subindo) é
+    subclasse de httpx.TransportError, NÃO de TimeoutException — ficava de
+    fora e desistia na primeira tentativa mesmo com retries configurados.
+    httpx.RemoteProtocolError (conexão encerrada abruptamente pelo servidor,
+    comum em restarts de proxy) tem o mesmo problema e foi incluído também.
     """
-    if isinstance(exc, httpx.TimeoutException):
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError)):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in (429, 500, 502, 503, 504)
@@ -1014,10 +1178,12 @@ async def _run_advanced_retrieval(
         len(unique_chunks),
     )
 
-    # === FASE 2.3 — Reranking (síncrono, CPU-bound) ===
-    # FlashRank é síncrono e muito rápido (~10-50ms para dezenas de chunks)
-    # Executar em thread pool não é necessário nesta escala
-    reranked = rerank_with_flashrank(unique_chunks, user_question)
+    # === FASE 2.3 — Reranking (CPU-bound, despachado para thread) ===
+    # FlashRank é rápido (~10-50ms para dezenas de chunks), mas ainda assim
+    # síncrono e bloqueante — rerank_with_flashrank despacha a inferência via
+    # asyncio.to_thread internamente para não travar o event loop sob
+    # concorrência (ver correção em _get_ranker/rerank_with_flashrank).
+    reranked = await rerank_with_flashrank(unique_chunks, user_question)
 
     # === FASE 2.4 — Seleção Final top-k ===
     final_chunks = reranked[:top_k]
@@ -1103,8 +1269,13 @@ async def run_rag_pipeline(
     )
 
     # Determina o top_k efetivo: usa o do request, mas respeita o mínimo recomendado
-    # para o Advanced RAG ter valor (8 garante contexto rico sem overflow de tokens)
-    effective_top_k = max(request.top_k, min(request.top_k, 8))
+    # para o Advanced RAG ter valor (8 garante contexto rico sem overflow de tokens).
+    # CORREÇÃO (ALTO — bug matemático): a fórmula anterior era
+    # `max(request.top_k, min(request.top_k, 8))`, que é sempre igual a
+    # request.top_k para qualquer valor (min(x, 8) <= x, logo max(x, algo <= x)
+    # == x) — o floor de 8 nunca era aplicado na prática. Se o cliente pedisse
+    # top_k=1 ou 2, o Advanced RAG rodava com esse valor raquítico mesmo.
+    effective_top_k = max(request.top_k, 8)
 
     # =========================================================================
     # TENTATIVA: Advanced RAG Pipeline
@@ -1164,6 +1335,12 @@ async def run_rag_pipeline(
             "Respondendo sem contexto de documentação.",
             request.session_id,
         )
+    else:
+        # CORREÇÃO CRÍTICA: preenche raw_content ausente (chunk_id != 0)
+        # antes de montar o contexto — ver _backfill_raw_content. Não
+        # bloqueante: se falhar, os chunks seguem sem a seção B) como já
+        # acontecia antes desta correção.
+        chunks = await _backfill_raw_content(qdrant, chunks)
 
     # =========================================================================
     # AUGMENTAÇÃO + GERAÇÃO
