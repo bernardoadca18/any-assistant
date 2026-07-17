@@ -162,6 +162,22 @@ class Settings(BaseSettings):
         default="/tmp/flashrank_cache",
         description="Diretório para cache dos modelos FlashRank (ONNX).",
     )
+    rag_rerank_min_score: float = Field(
+        default=0.0,
+        description=(
+            "Piso de qualidade aplicado à lista já reordenada pelo FlashRank "
+            "(rag_service.py::_run_advanced_retrieval). Chunks com score de "
+            "Cross-Encoder abaixo deste valor são descartados antes de ir "
+            "para o prompt do LLM, mesmo que estejam dentro do top_k — evita "
+            "injetar ruído quando o retrieval expandido não traz nada "
+            "realmente relevante. O default 0.0 é seguro (equivale a nenhum "
+            "filtro, já que o score do Cross-Encoder do FlashRank não é "
+            "negativo na prática) — ajuste para um valor positivo (ex: 0.1) "
+            "para de fato descartar candidatos fracos. Sempre mantém ao "
+            "menos 1 chunk (o de maior score) mesmo se todos caírem abaixo "
+            "do threshold, para não quebrar o prompt do RAG."
+        ),
+    )
 
     # --- Ingestão — Pipeline ETL Code-to-Doc ----------------------------------
     # Endpoint: POST /v1/ingest/process-folder (ver app/services/ai/ingestion_service.py).
