@@ -93,8 +93,15 @@ def get_embedding_client() -> httpx.AsyncClient:
 # de falhas por todo o restante do lote. O backoff exponencial + jitter dá
 # tempo do serviço se recuperar antes de desistir do chunk.
 
+# CORREÇÃO (ALTO — retry não cobria erros de conexão): antes só
+# httpx.TimeoutException era tratado como transitório. httpx.ConnectError
+# (conexão recusada, DNS falhando, container do LiteLLM ainda subindo) é
+# subclasse de httpx.TransportError, NÃO de TimeoutException — ficava de
+# fora e desistia na primeira tentativa mesmo com retries configurados.
+# httpx.RemoteProtocolError (conexão encerrada abruptamente pelo servidor,
+# comum em restarts de proxy) tem o mesmo problema e foi incluído também.
 def _is_retryable_embedding_error(exc: BaseException) -> bool:
-    if isinstance(exc, httpx.TimeoutException):
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError)):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in (429, 500, 502, 503, 504)
