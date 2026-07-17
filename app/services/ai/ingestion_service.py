@@ -502,12 +502,18 @@ def _find_sibling_header(cpp_path: Path) -> Path | None:
     return None
 
 
-def _load_header_context(cpp_path: Path) -> str:
+async def _load_header_context(cpp_path: Path) -> str:
     """
     Lê e prepara o .h irmão de um .cpp para uso como contexto injetado no
     prompt do Canal C. Retorna string vazia se o header não existir ou não
     puder ser lido — nunca lança, porque a ausência de header não deve
     impedir a documentação da implementação em si (apenas a empobrece).
+
+    CORREÇÃO (bloqueio de event loop): a leitura do arquivo é despachada
+    para thread via asyncio.to_thread, assim como as demais operações de
+    I/O de disco do módulo (ver NOTA DE PERFORMANCE no topo do arquivo).
+    Antes, path.read_text() rodava direto na corrotina, bloqueando o loop
+    compartilhado com /v1/chat uma vez por .cpp processado em sample_mode.
     """
     header_path = _find_sibling_header(cpp_path)
     if header_path is None:
@@ -515,7 +521,9 @@ def _load_header_context(cpp_path: Path) -> str:
         return ""
 
     try:
-        raw_header = header_path.read_text(encoding="utf-8", errors="ignore")
+        raw_header = await asyncio.to_thread(
+            header_path.read_text, encoding="utf-8", errors="ignore"
+        )
     except OSError as exc:
         log.warning("Falha ao ler header irmão '%s' de '%s': %s — seguindo sem contexto.", header_path, cpp_path, exc)
         return ""
@@ -560,9 +568,14 @@ async def _process_cpp_file(
         log.debug(".cpp vazio após limpeza, ignorado: %s", path)
         return []
 
-    header_context = _load_header_context(path)
+    header_context = await _load_header_context(path)
 
-    blocks = _split_cpp_into_functions(cleaned)
+    # CORREÇÃO (bloqueio de event loop): o balanceamento de chaves em
+    # _split_cpp_into_functions é CPU-bound (scan caractere-a-caractere)
+    # e pode ser custoso em .cpp grandes e densos de funções — despachado
+    # para thread pelo mesmo motivo que a leitura de disco é. _group_cpp_blocks
+    # é barato (concatenação) e permanece síncrono.
+    blocks = await asyncio.to_thread(_split_cpp_into_functions, cleaned)
     groups = _group_cpp_blocks(blocks, CPP_MAX_GROUP_CHARS)
 
     all_chunks: list[dict] = []
@@ -669,10 +682,17 @@ async def _process_header_file(
         {"role": "user", "content": user_message},
     ]
 
-    markdown, _prompt_tokens, _completion_tokens = await call_litellm(
-        messages=messages,
-        model=settings.ingestion_documenter_model,
-    )
+    try:
+        markdown, _prompt_tokens, _completion_tokens = await call_litellm(
+            messages=messages,
+            model=settings.ingestion_documenter_model,
+        )
+    except Exception as exc:
+        log.error(
+            "Falha ao documentar header '%s' (Canal A): %s — arquivo ignorado.",
+            path, exc,
+        )
+        return []
 
     return _build_chunks_with_metadata(
         markdown_text=markdown,
@@ -1095,7 +1115,17 @@ def _build_chunks_with_metadata(
                 "chunk_id": chunk_id,
                 "ue_version": ue_version,
                 "description": "",
-                "raw_content": raw_content,
+                # CORREÇÃO (custo/payload): raw_content é o mesmo conteúdo
+                # integral do arquivo-fonte para TODOS os chunks gerados a
+                # partir dele. Gravá-lo em cada chunk faz uma busca que
+                # recupera N chunks do mesmo arquivo carregar N cópias
+                # idênticas no prompt do rag_service.py (custo de tokens sem
+                # ganho de informação), além de inflar o payload no Qdrant.
+                # Guardamos o valor completo só no chunk_id==0; o
+                # rag_service.py deve, ao montar a "Referência Direta", cair
+                # de volta no raw_content do chunk_id==0 daquele
+                # source_file_root quando o chunk recuperado tiver None.
+                "raw_content": raw_content if chunk_id == 0 else None,
                 # Rótulo de proveniência — NUNCA entra no texto embedado.
                 # Permite segmentar via query_filter no Qdrant no futuro
                 # (ex: "só Engine", "só samples", "excluir Lyra") sem
@@ -1238,7 +1268,14 @@ async def _delete_file_chunks(
     source_file: str,
 ) -> None:
     """
-    Remove todos os chunks de um arquivo-fonte antes de reprocessá-lo.
+    Remove TODOS os chunks de um arquivo-fonte, incondicionalmente.
+
+    NÃO é mais chamada automaticamente pelo fluxo de `_run_ingestion` (ver
+    correção de idempotência: `_delete_orphaned_chunks`, que remove só o
+    resíduo de versões anteriores e apenas após o commit confirmado).
+    Mantida aqui como utilitário para limpeza manual/administrativa
+    completa de um arquivo específico (ex: ferramenta de CLI/admin que
+    queira forçar a remoção total antes de uma reingestão manual).
 
     CORREÇÃO (Canal C / .cpp): chunks gerados a partir de .cpp usam um
     `source_file` SINTÉTICO com sufixo "#groupN" (ver _process_cpp_file),
@@ -1272,8 +1309,55 @@ async def _delete_file_chunks(
     )
 
 
+async def _delete_orphaned_chunks(
+    qdrant: AsyncQdrantClient,
+    collection_name: str,
+    source_file: str,
+    keep_chunk_count: int,
+) -> None:
+    """
+    Remove SOMENTE chunks residuais de uma versão ANTERIOR do arquivo que
+    tinha mais chunks que a versão atual (chunk_id >= keep_chunk_count).
+
+    Chamado DEPOIS do commit confirmado no manifesto — nunca antes. Os
+    chunks 0..keep_chunk_count-1 já foram sobrescritos in-place pelo
+    upsert (point_id determinístico), então este delete nunca remove
+    conteúdo vigente; na pior hipótese (falha aqui), sobra um chunk órfão
+    da versão anterior até a próxima ingestão — nunca um buraco de
+    conteúdo, que é o cenário que este fluxo elimina.
+    """
+    try:
+        await qdrant.delete(
+            collection_name=collection_name,
+            points_selector=qdrant_models.FilterSelector(
+                filter=qdrant_models.Filter(
+                    must=[
+                        qdrant_models.FieldCondition(
+                            key="source_file_root",
+                            match=qdrant_models.MatchValue(value=source_file),
+                        ),
+                        qdrant_models.FieldCondition(
+                            key="chunk_id",
+                            range=qdrant_models.Range(gte=keep_chunk_count),
+                        ),
+                    ]
+                )
+            ),
+            wait=True,
+        )
+    except Exception as exc:
+        log.warning(
+            "Falha ao limpar chunks órfãos de '%s' (não bloqueia o commit, "
+            "resíduo será limpo em ingestão futura): %s",
+            source_file,
+            exc,
+        )
+
+
 async def _commit_confirmed_files(
     redis: Redis,
+    qdrant: AsyncQdrantClient,
+    collection_name: str,
     manifest_key: str,
     tracking: dict[str, _PendingFileCommit],
     per_file_counts: dict[str, int],
@@ -1299,6 +1383,10 @@ async def _commit_confirmed_files(
                 exc_info=True,
             )
             continue
+
+        # Limpeza de resíduo de versão anterior — só agora, com o commit já
+        # confirmado no manifesto (ver docstring de _delete_orphaned_chunks).
+        await _delete_orphaned_chunks(qdrant, collection_name, source_file, tracker.total_chunks)
 
         # Sucesso confirmado — o arquivo sai de quarentena, se estava nela.
         if failures_key is not None and failures_cache is not None:
@@ -1457,6 +1545,29 @@ async def process_folder_ingestion(
         )
         return
 
+    # CORREÇÃO (ALTO — lock sem heartbeat): sem renovação, uma ingestão mais
+    # longa que ingestion_lock_timeout_seconds perde o lock (expira por TTL)
+    # NO MEIO da execução — uma segunda chamada concorrente pode então
+    # adquiri-lo livremente e rodar em paralelo, gerando exatamente a
+    # condição de corrida (delete/upsert intercalados do mesmo arquivo) que
+    # este lock existe para prevenir. A task abaixo estende o TTL
+    # periodicamente enquanto `_run_ingestion` estiver rodando.
+    async def _renew_lock_periodically() -> None:
+        interval = max(settings.ingestion_lock_timeout_seconds / 2, 1)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await lock.reacquire()
+            except Exception as exc:
+                log.error(
+                    "Falha ao renovar (heartbeat) o lock '%s' — a ingestão "
+                    "pode perder exclusividade a partir daqui: %s",
+                    lock_key,
+                    exc,
+                )
+                return
+
+    renewal_task = asyncio.create_task(_renew_lock_periodically())
     try:
         await _run_ingestion(
             folder_path=folder_path,
@@ -1469,13 +1580,19 @@ async def process_folder_ingestion(
             sample_mode=sample_mode,
         )
     finally:
+        renewal_task.cancel()
+        try:
+            await renewal_task
+        except asyncio.CancelledError:
+            pass
         try:
             await lock.release()
         except Exception as exc:
-            # Não crítico: se o lock já expirou por TTL (ingestion_lock_timeout_seconds),
-            # release() pode falhar por já não pertencer mais a este processo.
+            # Não crítico: se o lock já expirou por TTL apesar do heartbeat
+            # (ex: renovação falhou e não houve mais tentativa), release()
+            # pode falhar por já não pertencer mais a este processo.
             log.warning(
-                "Falha ao liberar lock '%s' (provavelmente já expirou por TTL): %s",
+                "Falha ao liberar lock '%s' (possivelmente já expirado): %s",
                 lock_key,
                 exc,
             )
@@ -1604,17 +1721,21 @@ async def _run_ingestion(
             log.info("[%d/%d] Ignorado — checkpoint OK (hash inalterado).", i, total_files)
             continue
 
-        # Gatilho de Limpeza Unificado (sempre executa se for processar)
-        try:
-            log.info("Limpando órfãos do Qdrant para garantir idempotência: %s", file_path)
-            await _delete_file_chunks(qdrant, collection_name, source_file_str)
-            if existing_hash is not None:
-                stats["modified"] += 1
-        except Exception as exc:
-            stats["errors"] += 1
-            await _record_failure(redis, failures_key, failures_cache, relative_key)
-            log.error("Falha na limpeza de órfãos para '%s' — ignorando: %s", file_path, exc)
-            continue
+        # CORREÇÃO (idempotência/CRÍTICO): o delete antecipado de todos os
+        # chunks do arquivo foi removido daqui. Ele rodava ANTES da chamada
+        # à LLM documentadora, do embedding e do upsert — qualquer falha
+        # nessas etapas (a mais provável do pipeline) deixava o arquivo sem
+        # NENHUM chunk no Qdrant até a próxima ingestão bem-sucedida daquele
+        # arquivo específico, um buraco de conteúdo no RAG por tempo
+        # indefinido. Como o point_id é determinístico
+        # (uuid5(source_file::chunk_id), ver _flush_batch), o upsert da nova
+        # versão já sobrescreve in-place os chunks 0..N-1 da versão
+        # anterior sem precisar de delete prévio. O único resíduo possível
+        # (nova versão com MENOS chunks que a antiga) é limpo em
+        # _commit_confirmed_files, e só DEPOIS do commit confirmado — nunca
+        # há um instante em que o arquivo fica sem cobertura nenhuma.
+        if existing_hash is not None:
+            stats["modified"] += 1
 
         # Processamento e Geração de Chunks
         try:
@@ -1693,7 +1814,7 @@ async def _run_ingestion(
                 per_file_counts = await _flush_batch(qdrant, collection_name, batch)
                 stats["chunks_indexed"] += sum(per_file_counts.values())
                 await _commit_confirmed_files(
-                    redis, manifest_key, tracking, per_file_counts,
+                    redis, qdrant, collection_name, manifest_key, tracking, per_file_counts,
                     failures_key=failures_key, failures_cache=failures_cache,
                 )
 
@@ -1709,7 +1830,7 @@ async def _run_ingestion(
         per_file_counts = await _flush_batch(qdrant, collection_name, pending)
         stats["chunks_indexed"] += sum(per_file_counts.values())
         await _commit_confirmed_files(
-            redis, manifest_key, tracking, per_file_counts,
+            redis, qdrant, collection_name, manifest_key, tracking, per_file_counts,
             failures_key=failures_key, failures_cache=failures_cache,
         )
 
