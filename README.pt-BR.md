@@ -2,216 +2,238 @@
 
 ---
 
-# Pipeline de Ingestão Unreal Code-to-Doc
- 
-### Motor de ETL Assíncrono de Alta Performance para Destilar Código-Fonte da Unreal Engine 5 em Documentação Semântica para RAG
- 
-![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.115.5-009688?logo=fastapi&logoColor=white)
-![Qdrant](https://img.shields.io/badge/Qdrant-v1.9.2-DC244C?logo=qdrant&logoColor=white)
-![Redis](https://img.shields.io/badge/Redis-7--alpine-DC382D?logo=redis&logoColor=white)
-![LiteLLM](https://img.shields.io/badge/LiteLLM-Proxy-6C5CE7)
-![License](https://img.shields.io/badge/Licença-Não%20especificada-lightgrey)
- 
+# UE5 AI Assistant
+
+![Version](https://img.shields.io/badge/version-0.2.0-blue)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-async-009688)
+![Status](https://img.shields.io/badge/status-active--development-yellow)
+
+> Um assistente de IA técnico para **Unreal Engine 5**, construído sobre um pipeline avançado de Retrieval-Augmented Generation (RAG). Ele responde perguntas de gameplay e arquitetura de engine ancorando as respostas da LLM em uma base de conhecimento semanticamente curada, derivada diretamente do código-fonte C++ da UE5, da documentação oficial da Epic e de lógica de Blueprint exportada.
+
+Diferente de um sistema RAG ingênuo que simplesmente "embeda o código-fonte bruto", o princípio central de design deste projeto é que **C++ e grafos de Blueprint brutos não têm densidade semântica suficiente para um retrieval confiável**. Um motor de ingestão dedicado transforma código e scripting visual em documentação técnica gerada por LLM, legível por humanos, *antes* que qualquer coisa chegue ao banco vetorial — preservando o conteúdo original bruto como uma camada secundária de referência, soberana para sintaxe exata.
+
 ---
- 
-## Visão Geral
- 
-A árvore de código-fonte da Unreal Engine 5 é monstruosa, profundamente aninhada e escrita para um compilador — não para um modelo de linguagem. Alimentar diretamente arquivos `.h` brutos ou documentação oficial `.udn` em um banco de dados vetorial produz um corpus poluído com ruído de `#include`, boilerplate de modificadores de acesso, macros proprietárias de markup e fragmentos órfãos. O resultado é um sistema de Retrieval-Augmented Generation (RAG) que recupera chunks sintaticamente semelhantes, porém semanticamente inúteis, levando um LLM downstream a alucinar ou se contradizer.
- 
-Este repositório implementa um **pipeline de ETL Code-to-Doc**: um serviço FastAPI assíncrono que varre um diretório montado da Unreal Engine, aplica filtragem estrutural agressiva, transforma headers C++ brutos em documentação Markdown orientada a gameplay via LLM, sanitiza a documentação oficial `.udn` por meio de regex puro (sem chamada de LLM) e indexa os chunks resultantes no **Qdrant** com um manifesto de idempotência apoiado em **Redis**.
- 
-O sistema foi construído com o propósito específico de alimentar um assistente RAG downstream (`POST /v1/chat`) capaz de responder perguntas precisas de programação de gameplay em UE5 — fundamentado em símbolos reais da engine, não em conhecimento genérico da web.
- 
+
+## Sumário
+
+- [Arquitetura e Tech Stack](#arquitetura-e-tech-stack)
+- [Core Features](#core-features)
+  - [Pipeline de Advanced RAG](#1-pipeline-de-advanced-rag)
+  - [Motor de Ingestão Code-to-Doc](#2-motor-de-ingestão-code-to-doc-etl-multi-canal)
+  - [Idempotência e Resiliência](#3-idempotência-e-resiliência)
+- [Endpoints da API](#endpoints-da-api)
+- [Configuração de Ambiente](#configuração-de-ambiente)
+- [Instruções de Uso](#instruções-de-uso)
+
 ---
- 
-## Principais Funcionalidades
- 
-- **Motor de Ingestão de Duplo Canal** — `content_type: source_code` roteia arquivos `.h` pelo **Canal A** (documentador técnico via LLM); `content_type: documentation` roteia arquivos `.udn` pelo **Canal B** (sanitização puramente regex, custo zero de LLM).
-- **Manifesto de Idempotência apoiado em Redis** — a identidade de cada arquivo-fonte é rastreada como um hash SHA-256 em uma Hash do Redis (`manifest:{collection_name}`), indexada pelo caminho relativo. Arquivos inalterados são ignorados integralmente em reingestões; arquivos modificados disparam a limpeza de chunks órfãos no Qdrant antes da reindexação.
-- **Fronteira de Commit Atômico (`_PendingFileCommit`)** — os chunks são acumulados entre arquivos e enviados ao Qdrant em lotes por eficiência de rede, mas o manifesto **nunca** é atualizado a partir de contagens agregadas em memória. Cada arquivo é rastreado individualmente (`total_chunks` vs. `confirmed_chunks`); somente quando todos os chunks de um arquivo forem confirmadamente inseridos é que seu hash é commitado. Uma queda no meio de um lote não deixa nenhum checkpoint mentiroso — o arquivo é simplesmente reprocessado do zero na próxima execução.
-- **Filtragem Estrutural Agressiva na Origem** — diretórios como `Private`, `ThirdParty`, `Intermediate`, `Binaries`, `Saved` e `.git` são excluídos da varredura (`_IGNORED_DIR_NAMES`); o Canal A ainda se restringe a headers contendo símbolos relevantes de gameplay (`_GAMEPLAY_KEYWORDS`: `Character`, `Pawn`, `Actor`, `Component`, `GameMode`, `PlayerController`, `Subsystem`, entre outros).
-- **Poda de Chunks Órfãos/Vazios** — após o chunking estrutural por headers Markdown, qualquer chunk reduzido a uma única linha de cabeçalho órfão (ex.: um título `#` truncado sem corpo) é descartado antes mesmo de chegar à etapa de embedding, economizando diretamente tokens de API de embedding.
-- **Quarentena por Falhas Consecutivas** — um arquivo que falha `INGESTION_MAX_CONSECUTIVE_FAILURES` vezes seguidas (padrão: 3) é automaticamente colocado em quarentena e ignorado nas execuções subsequentes, evitando desperdício de chamadas de LLM/embedding em um arquivo permanentemente quebrado até intervenção manual.
-- **Lock Distribuído no Redis por Coleção** — `ingestion_lock_key` serializa execuções concorrentes de `process_folder_ingestion` sobre a mesma coleção do Qdrant, com um TTL autoexpirável (`INGESTION_LOCK_TIMEOUT_SECONDS`, padrão 3600s) como rede de segurança contra locks órfãos deixados por processos que morreram.
-- **Enriquecimento de Payload para RAG Híbrido** — o vetor de embedding é sempre gerado a partir do Markdown sintetizado pela LLM (`chunk["text"]`), mas o payload do Qdrant armazena adicionalmente `raw_content` — o conteúdo original e integral do arquivo-fonte (header C++ já limpo ou `.udn` já sanitizado) — que o `rag_service.py` injeta posteriormente como uma fonte soberana de "Referência Direta", para sintaxe exata (assinaturas, macros `UPROPERTY`/`UFUNCTION`), complementando o resumo conceitual.
-- **Ingestão Não-Bloqueante via BackgroundTasks** — `POST /v1/ingest/process-folder` executa apenas uma verificação síncrona barata (`Path.is_dir()`) e retorna **HTTP 202 Accepted** imediatamente; a varredura completa do sistema de arquivos, as chamadas de LLM, a geração de embeddings e os upserts no Qdrant rodam depois via `BackgroundTasks` do FastAPI, despachados através de `asyncio.to_thread()` para operações de I/O bloqueantes, garantindo que o mesmo event loop que atende `/v1/chat` nunca seja bloqueado.
-- **Chamadas de Embedding Resilientes** — `embed_text()` envolve cada chamada ao endpoint `/embeddings` do LiteLLM em uma política de retry via `tenacity`, com backoff exponencial e jitter (`litellm_max_retries`, padrão 4), tolerante a HTTP 429/500/502/503/504 e timeouts — crítico quando uma única execução de ingestão pode disparar dezenas de milhares de chamadas de embedding.
-- **Reranking Avançado no RAG** — o pipeline de chat sobrepõe um cross-encoder **FlashRank** (`ms-marco-MiniLM-L-12-v2`) rodando exclusivamente em CPU sobre a busca vetorial, melhorando a precisão da recuperação sem qualquer dependência de GPU.
----
- 
-## Arquitetura e Fluxo de Dados
- 
-```mermaid
-flowchart TD
-    A["POST /v1/ingest/process-folder"] -->|"HTTP 202 Accepted"| B["BackgroundTasks.add_task"]
-    B --> C["process_folder_ingestion()"]
-    C --> D{"content_type?"}
- 
-    D -->|"source_code (.h)"| E["Canal A: Filtro de Keywords de Gameplay"]
-    E --> F["Limpeza de #include / ruídos"]
-    F --> G["LiteLLM: Prompt Documentador Técnico Sênior"]
-    G --> H["Documento Markdown Estruturado"]
- 
-    D -->|"documentation (.udn)"| I["Canal B: Sanitizador Regex"]
-    I --> J["Remove metadados UDN + macros proprietárias"]
-    J --> H
- 
-    H --> K["Chunking Estrutural por Headers Markdown"]
-    K --> L["Poda de Chunks Órfãos / Vazios"]
-    L --> M["Verificação do Manifesto Redis: diff de hash SHA-256"]
-    M -->|"inalterado"| N["Ignora arquivo"]
-    M -->|"novo/modificado"| O["Buffer do chunk na lista 'pending'"]
- 
-    O --> P{"len(pending) >= batch_size?"}
-    P -->|"sim"| Q["_flush_batch(): embed_text() + upsert no Qdrant"]
-    Q --> R["_commit_confirmed_files(): HSET no manifesto por arquivo"]
-    P -->|"não"| C
- 
-    R --> S[("Coleção Qdrant: ue5_docs")]
- 
-    T["POST /v1/chat"] --> U["Decomposição de Query (LiteLLM)"]
-    U --> V["Embedding das sub-queries"]
-    V --> S
-    S --> W["Reranking Cross-Encoder FlashRank"]
-    W --> X["Injeta raw_content + contexto Markdown"]
-    X --> Y["LiteLLM Chat Completion"]
-    Y --> Z["Histórico de Sessão no Redis"]
-    Y --> AA["ChatResponse ao cliente"]
-```
- 
-**Fluxo narrativo:**
- 
-1. Um cliente chama `POST /v1/ingest/process-folder` com um `folder_path` (absoluto, **dentro** do container `ue5-agent`) e um `content_type`. O endpoint valida que o diretório existe e retorna imediatamente `IngestAcceptedResponse` (HTTP 202).
-2. `process_folder_ingestion()` adquire um lock distribuído no Redis (`ingestion_lock_key`) escopado à coleção do Qdrant, carrega os caches de manifesto e de falhas, e então descobre recursivamente todos os arquivos `.h` ou `.udn` (`_discover_files`), ignorando diretórios excluídos.
-3. O hash SHA-256 de cada arquivo é comparado ao manifesto no Redis. Arquivos inalterados são ignorados; arquivos novos ou modificados disparam a exclusão de quaisquer chunks órfãos existentes no Qdrant (`_delete_file_chunks`) antes da regeneração.
-4. O **Canal A** (`source_code`) aplica o filtro de keywords de gameplay, remove instruções `#include` e linhas em branco excessivas, trunca headers excepcionalmente grandes (`ingestion_max_header_chars`) e chama a LLM configurada em `INGESTION_DOCUMENTER_MODEL` com o `_DOCUMENTER_SYSTEM_PROMPT` — uma persona de "Documentador Técnico Sênior da Epic Games" que produz Markdown estruturado.
-5. O **Canal B** (`documentation`) remove campos de metadados `.udn` (`Availability`, `Title`, `Crumbs`, etc.) e macros proprietárias entre colchetes apenas via regex — sem invocação de LLM, sem custo de tokens.
-6. Ambos os canais convergem para o chunking estrutural por headers Markdown, seguido da etapa de poda de chunks órfãos/vazios.
-7. Os chunks se acumulam em um buffer compartilhado `pending`; ao atingir `ingestion_batch_size`, `_flush_batch()` gera embeddings concorrentemente (limitado por `ingestion_embedding_concurrency`) e executa um upsert atômico no Qdrant.
-8. Somente após **todos** os chunks de um arquivo serem confirmadamente inseridos, `_commit_confirmed_files()` grava seu hash no manifesto do Redis — garantindo que o checkpoint jamais minta sobre progresso parcial.
-9. No lado da recuperação, `POST /v1/chat` decompõe a pergunta do usuário em sub-queries em inglês técnico, gera seus embeddings, recupera candidatos do Qdrant, reordena com FlashRank, injeta tanto o Markdown sintetizado quanto o campo de payload `raw_content` no prompt, e chama a LLM via LiteLLM — persistindo o turno de conversa no Redis (`session_service.py`) para memória multi-turno.
----
- 
-## Stack Tecnológica
- 
-| Tecnologia | Papel no Pipeline |
+
+## Arquitetura e Tech Stack
+
+O sistema é composto por uma camada de API FastAPI stateless, cercada por infraestrutura especializada. **Nenhum componente conversa diretamente com um provedor de LLM** — toda chamada de modelo (chat, embeddings, decomposição de query, geração de documentação na ingestão) é roteada através de um único **LiteLLM Proxy**, que abstrai o provedor subjacente (modelos locais via Ollama ou modelos em nuvem como o Gemini).
+
+| Componente | Papel |
 |---|---|
-| **Python 3.12** | Runtime principal; design assíncrono em toda a base de código. |
-| **FastAPI** | Camada HTTP, validação de requisições via Pydantic, injeção de dependência para os clientes Qdrant/Redis. |
-| **BackgroundTasks** | Mecanismo nativo do FastAPI usado para executar o pipeline de ingestão completo fora do ciclo de requisição/resposta. |
-| **Qdrant (`v1.9.2`)** | Banco de dados vetorial que armazena embeddings de alta dimensão e payloads enriquecidos (`raw_content`, caminho de origem, versão da UE). |
-| **Redis 7 (alpine)** | Manifesto de idempotência (rastreamento de hash de arquivos), rastreamento de falhas consecutivas, lock distribuído de ingestão e histórico/TTL de sessões de chat. |
-| **LiteLLM Proxy** | Ponte compatível com OpenAI para LLMs locais/remotos (ex.: `ollama/qwen2.5-coder:7b`, `gemini/gemini-2.0-flash-lite`), usada tanto pelo documentador do Canal A quanto pelo modelo de chat. |
-| **httpx** | Cliente HTTP assíncrono para toda a comunicação com LiteLLM/Ollama. |
-| **tenacity** | Backoff exponencial com jitter em torno de falhas transitórias de embedding/completion (HTTP 429/5xx, timeouts). |
-| **FlashRank** | Reranker cross-encoder leve, rodando exclusivamente em CPU (`ms-marco-MiniLM-L-12-v2`), melhorando a precisão da recuperação sem dependência de GPU. |
-| **Docker Compose** | Orquestra `qdrant`, `qdrant-healthcheck` (sidecar alpine), `agent-redis` e o serviço FastAPI `ue5-agent` em redes bridge isoladas. |
- 
+| **FastAPI** | Camada de API assíncrona que expõe `/v1/chat`, `/v1/ingest/process-folder` e `/v1/health`. Executa a ingestão como `BackgroundTasks` no mesmo event loop, usando `asyncio.to_thread()` para descarregar I/O de disco bloqueante. |
+| **LiteLLM Proxy** | Ponto único de entrada para *todo* o tráfego de modelos — chat completions, embeddings, decomposição de query e geração de documentação em tempo de ingestão. Roteia internamente para Ollama ou Gemini conforme o alias do modelo. Autenticado via master key. |
+| **Qdrant** | Banco de dados vetorial que armazena os chunks de documentação com payloads enriquecidos (`project_source`, `doc_type`, `ue_version`, `raw_content`). Suporta busca filtrada por payload (ex: restringir o retrieval a um projeto específico). |
+| **Redis** | Armazenamento de múltiplos propósitos: histórico de sessão de conversa (com TTL), o **manifesto de checkpoint** da ingestão (hashes SHA-256 de conteúdo por arquivo), um **rastreador de falhas/quarentena**, e **locks distribuídos** que serializam execuções de ingestão por coleção. |
+| **FlashRank** | Reranker Cross-Encoder leve, rodando apenas em CPU (runtime ONNX, sem necessidade de GPU), usado para reordenar os chunks recuperados por relevância semântica real antes de chegarem ao prompt final. |
+| **Gemini (via LiteLLM)** | Usado em duas tarefas leves, rápidas e baratas: decomposição/tradução de query (`gemini-3.1-flash-lite`) e geração de documentação em tempo de ingestão (`gemini-2.0-flash-lite`). |
+| **Ollama** | Backend de modelo local (ex: `qwen2.5-coder`), acessado exclusivamente através do proxy LiteLLM — usado para o modelo principal de chat/completion e para embeddings. |
+
 ---
- 
-## Como Executar o Projeto
- 
-### Pré-requisitos
- 
-- Docker e Docker Compose.
-- Um **proxy LiteLLM** em execução, acessível pela rede externa `litellm_public` do Docker, configurado com seu modelo de embedding (ex.: `mxbai-embed-large` via Ollama) e modelos de chat/completion.
-- A árvore de código-fonte da Unreal Engine 5 (ou um subconjunto dela) acessível no host, para ser montada em modo somente-leitura dentro do container.
-### 1. Clonar o repositório
- 
-```bash
-git clone <url-do-repositorio>
-cd <diretorio-do-repositorio>
-```
- 
-### 2. Configurar as variáveis de ambiente
- 
-Copie o template e preencha os segredos obrigatórios:
- 
-```bash
-cp .env.example .env
-```
- 
+
+## Core Features
+
+### 1. Pipeline de Advanced RAG
+
+O pipeline (`app/services/ai/rag_service.py`) roda em três fases desenhadas para maximizar tanto o **recall** (encontrar toda a documentação relevante para perguntas multi-tópico) quanto a **precisão** (filtrar ruído antes que chegue ao prompt final):
+
+**Fase 1 — Decomposição e Tradução de Query**
+O corpus vetorial é indexado inteiramente em **inglês técnico** (tanto a documentação gerada por LLM quanto os docs oficiais `.udn` da Epic). Como uma query em português sofreria um mismatch cross-lingual no embedding, `decompose_query()` chama uma LLM rápida (`gemini-3.1-flash-lite`, com um modelo de fallback distinto em caso de falha) para:
+1. Produzir uma **tradução** literal em inglês da pergunta do usuário (`translated_query`) — esta é sempre usada como âncora de busca, nunca a query original no idioma de origem.
+2. Decompor a pergunta em até **3 sub-queries técnicas adicionais**, cada uma focada em um único conceito da UE5 (ex: separar "como programo o pulo em C++ e configuro a animação de aterrissagem?" em uma query de input binding em C++ e outra de Animation Blueprint).
+
+O parser da resposta é deliberadamente defensivo, com estratégias de fallback em camadas (JSON direto → JSON em bloco markdown → JSON embutido → extração de strings entre aspas → fallback para a pergunta original) para garantir que o pipeline nunca quebre diante de uma resposta malformada da LLM.
+
+**Fase 2 — Retrieval Expandido + Reranking via Cross-Encoder**
+1. Cada query (tradução + sub-queries) é embedada e buscada no Qdrant de forma independente, cada uma trazendo até `rag_retrieval_limit_per_query` candidatos (padrão: 15) — priorizando recall em detrimento de precisão nesta etapa.
+2. Os resultados de todas as queries são **deduplicados** em memória por `(source_file, chunk_id)`.
+3. O pool deduplicado é reordenado por `rerank_with_flashrank()`, um Cross-Encoder (`ms-marco-MiniLM-L-12-v2` por padrão) que pontua cada chunk diretamente contra a query traduzida em inglês — nunca contra as sub-queries individualmente — para julgar a relevância em relação à intenção completa da pergunta. O reranking roda em CPU via ONNX e é despachado para uma thread para não bloquear o event loop.
+4. Um piso de qualidade opcional (`rag_rerank_min_score`) pode descartar chunks com score baixo após o reranking, sempre preservando ao menos o resultado de maior score, para que o prompt nunca fique vazio.
+5. O retrieval pode, opcionalmente, ser restrito a um único `project_source` (ex: apenas Lyra, ou apenas código base da Engine) via filtro de payload no Qdrant.
+
+**Fase 3 — Geração**
+O contexto final é formatado em um prompt de duas camadas por chunk:
+- **Análise Semântica** — o resumo conceitual gerado pela LLM (o que o código *faz* e *por quê*).
+- **Referência Direta** — o código-fonte bruto e não modificado (`raw_content`: o header C++ já limpo, o `.udn` sanitizado, ou o JSON de Blueprint formatado), que o system prompt instrui explicitamente o modelo a tratar como a **fonte soberana de verdade** para assinaturas exatas, tipos e nomes de propriedades.
+
+O histórico de conversa é carregado do Redis, a mensagem aumentada é enviada ao modelo de chat via `call_litellm()`, e o turno é persistido de volta no Redis. Cada fase tem tratamento de erro isolado com fallback para um caminho de RAG mais simples (`retrieve_chunks()`, Naive RAG), de forma que uma falha na decomposição ou no reranking nunca se manifesta como um HTTP 500.
+
+### 2. Motor de Ingestão Code-to-Doc (ETL Multi-Canal)
+
+O motor de ingestão (`app/services/ai/ingestion_service.py`) é disparado via `POST /v1/ingest/process-folder` e roda inteiramente como uma **`BackgroundTask` do FastAPI**, dentro do mesmo container e event loop da API de chat. Como uma varredura recursiva sobre uma árvore de código em escala de engine pode envolver dezenas de milhares de arquivos, todo trabalho ligado a disco (`os.walk`, leitura de arquivos) é despachado para threads de trabalho via `asyncio.to_thread()`, para nunca bloquear requisições concorrentes a `/v1/chat`.
+
+Seu princípio arquitetural central: **código bruto nunca é embedado diretamente**. Cada canal transforma seu material de origem em Markdown semanticamente denso antes de ser dividido em chunks e embedado — é isso que permite que um modelo local pequeno responda com precisão em vez de se perder na sintaxe bruta.
+
+| Canal | Origem | Processamento |
+|---|---|---|
+| **A — headers `.h`** | Headers C++ da UE5 | Limpa includes/boilerplate, filtra por relevância de gameplay (allowlist estrita por palavra-chave para código de Engine; desligada inteiramente em `sample_mode` ou para módulos estratégicos de gameplay moderno como Mover/Network Prediction), então envia o header já limpo a uma LLM atuando como "Documentador Técnico Sênior" para produzir um guia em Markdown orientado a gameplay. |
+| **B — `.udn`** | Formato oficial de documentação da Epic | Sanitização puramente via regex (remove macros/metadados proprietários) — **sem chamada de LLM**. Custo menor, já que a origem já é prosa escrita por humanos. |
+| **C — `.cpp` (somente Sample Mode)** | Lógica de implementação em projetos de amostra (Lyra, City Sample, Vehicle Sample) | Divide o arquivo em blocos por função via detecção de assinatura + balanceamento de chaves, agrupa funções pequenas para evitar chamadas de LLM desperdiçadas, e documenta a lógica de implementação agrupada — capturando *como* uma mecânica funciona, não apenas sua API pública. |
+| **D — `.bp.json` (somente Sample Mode)** | Grafos de Blueprint, exportados via um script Python complementar do Editor Unreal (`BP_GraphExporter.py`) | Consome uma representação JSON já estruturada (`ParentClass`, `Variables`, `ExecutionFlow` linearizado com resolução de branch/loop) — sem parsing por regex de texto bruto — e documenta o comportamento de gameplay do Blueprint, suas variáveis-chave, principais fluxos de evento e pontos de integração com outros sistemas. |
+
+Os quatro canais convergem para o mesmo pipeline posterior: **chunking estrutural de Markdown** (dividido pela hierarquia de headers, com um teto rígido de caracteres como rede de segurança), **enriquecimento de metadados** (`project_source`, `doc_type`, `ue_version`, `raw_content`), **geração de embeddings em lote**, e **upsert idempotente** no Qdrant.
+
+### 3. Idempotência e Resiliência
+
+O Redis sustenta todos os mecanismos de segurança do pipeline de ingestão:
+
+- **Manifesto de Checkpoint** — um hash do Redis (`manifest:{collection_name}`) mapeia o caminho relativo de cada arquivo-fonte a um hash SHA-256 de seu conteúdo. Em reingestões, arquivos inalterados são completamente ignorados (sem releitura, sem chamada de LLM, sem reembedding), e arquivos modificados são detectados e reprocessados automaticamente. A entrada de um arquivo só é commitada no manifesto depois que *todos* os chunks que ele gerou forem **confirmados como persistidos** no Qdrant — nunca com base apenas em contagens de geração em memória — de forma que uma execução interrompida nunca deixa um checkpoint de "sucesso" falso.
+- **Rastreamento de Falhas e Quarentena** — arquivos que falham no processamento (erros de leitura, de LLM, de embedding) são rastreados em um hash dedicado de falhas no Redis. Após `ingestion_max_consecutive_failures` falhas consecutivas, um arquivo é colocado em quarentena e ignorado em execuções futuras até intervenção manual, evitando desperdiçar chamadas de LLM/embedding em um arquivo permanentemente quebrado.
+- **Lock Distribuído** — um lock distribuído baseado em Redis (`ingestion_lock_key`) garante que apenas uma execução de ingestão por coleção rode por vez, evitando que duas execuções concorrentes corrompam o manifesto de checkpoint. O lock é renovado periodicamente (heartbeat) durante toda a duração de ingestões longas, para que nunca expire no meio da execução por TTL, mantendo ainda assim uma expiração segura caso o processo morra inesperadamente.
+- **Limpeza de Órfãos** — quando um arquivo já indexado é alterado, seus chunks antigos só são removidos do Qdrant *depois* que os novos chunks são confirmados como commitados, evitando qualquer janela em que dados válidos fiquem ausentes do índice.
+
+---
+
+## Endpoints da API
+
+| Método | Endpoint | Descrição |
+|---|---|---|
+| `POST` | `/v1/chat` | Executa o pipeline completo de Advanced RAG: embeda a pergunta, recupera e reordena os chunks de documentação, monta o prompt aumentado, e gera a resposta via o proxy LiteLLM. O histórico de conversa é mantido por `session_id` no Redis. Retorna `503` em falhas operacionais conhecidas (ex: LiteLLM/Ollama indisponível) e `500` em erros inesperados. |
+| `POST` | `/v1/ingest/process-folder` | Dispara o motor de ETL Code-to-Doc como uma tarefa em background sobre um caminho de pasta **dentro do container**. Aceita `content_type` (`source_code` ou `documentation`), `project_source` (rótulo de proveniência, ex: `UE5_Engine`, `Lyra`), `sample_mode` (habilita os Canais C e D), e um `ue_version` opcional para sobrescrever a detecção automática. Retorna imediatamente com `202 Accepted` — a tarefa roda de forma assíncrona e o progresso é acompanhado pelos logs da aplicação e pelo manifesto no Redis. |
+| `GET` | `/v1/health` | Health check ativo contra todas as dependências (Qdrant, Redis, LiteLLM), executado de forma concorrente. Retorna `200` se todas as dependências estiverem saudáveis ou degradadas, `503` se alguma dependência estiver em estado de erro — incluindo latência e detalhe de status por dependência. |
+
+---
+
+## Configuração de Ambiente
+
+A configuração é centralizada em `app/core/config.py` via Pydantic Settings, carregada a partir de um arquivo `.env`. Principais variáveis:
+
 ```env
-# .env
- 
-AGENT_REDIS_PASSWORD=troque-por-uma-senha-forte
- 
-LITELLM_MASTER_KEY=sk-sua-chave-litellm
- 
-APP_ENV=development
-LOG_LEVEL=DEBUG
-EMBEDDING_MODEL=ollama-embed
- 
-# --- Ingestão — Pipeline ETL Code-to-Doc (POST /v1/ingest/process-folder) ---
-# Modelo LiteLLM rápido/barato usado para transformar headers .h em
-# documentação Markdown educacional (Canal A). Deve estar configurado
-# no config.yaml do LiteLLM.
+# --- Aplicação ---
+APP_ENV=production               # production | development | test
+LOG_LEVEL=INFO
+
+# --- Qdrant ---
+QDRANT_HOST=qdrant
+QDRANT_PORT=6333
+QDRANT_COLLECTION=ue5_docs
+
+# --- Redis (sessões, manifesto, locks, quarentena) ---
+REDIS_HOST=agent-redis
+REDIS_PORT=6379
+REDIS_PASSWORD=                  # obrigatória
+REDIS_DB=0
+REDIS_SESSION_TTL=3600           # TTL da sessão de conversa, em segundos
+
+# --- LiteLLM Proxy (ponto único de entrada para todas as chamadas de modelo) ---
+LITELLM_BASE_URL=http://litellm-proxy:4000
+LITELLM_MASTER_KEY=              # obrigatória
+LITELLM_MAX_RETRIES=4            # tentativas em caso de 429/500/502/503/504 ou timeout
+
+# --- Embeddings ---
+EMBEDDING_MODEL=ollama-embed     # deve estar configurado como modelo de embedding no config.yml do LiteLLM
+EMBEDDING_DIM=1024               # um de: 384, 768, 1024, 1536, 3072
+
+# --- RAG (geral) ---
+RAG_TOP_K=5
+RAG_SCORE_THRESHOLD=0.6          # usado apenas no Naive RAG — substituído pelo reranker no Advanced RAG
+
+# --- Advanced RAG — Decomposição de Query ---
+RAG_DECOMPOSITION_ENABLED=true
+RAG_DECOMPOSITION_MODEL=gemini/gemini-3.1-flash-lite
+RAG_DECOMPOSITION_TIMEOUT=12.0
+
+# --- Advanced RAG — Expansão de Retrieval ---
+RAG_RETRIEVAL_LIMIT_PER_QUERY=15
+
+# --- Advanced RAG — Reranker FlashRank ---
+RAG_RERANKER_ENABLED=true
+RAG_RERANKER_MODEL=ms-marco-MiniLM-L-12-v2   # ou ms-marco-MultiBERT-L-12, rank-T5-flan
+RAG_RERANKER_CACHE_DIR=/tmp/flashrank_cache
+RAG_RERANK_MIN_SCORE=0.0
+
+# --- Ingestão — ETL Code-to-Doc ---
 INGESTION_DOCUMENTER_MODEL=gemini/gemini-2.0-flash-lite
- 
-# Opcionais — descomente para sobrescrever os defaults em app/core/config.py
-# INGESTION_BATCH_SIZE=32
-# INGESTION_EMBEDDING_CONCURRENCY=8
-# INGESTION_MAX_CHUNK_CHARS=3000
-# INGESTION_DEFAULT_UE_VERSION=5.8
+INGESTION_BATCH_SIZE=32
+INGESTION_EMBEDDING_CONCURRENCY=8
+INGESTION_MAX_CHUNK_CHARS=3000
+INGESTION_DEFAULT_UE_VERSION=5.8
+INGESTION_LOCK_TIMEOUT_SECONDS=3600
+INGESTION_MAX_HEADER_CHARS=12000
+INGESTION_MAX_CONSECUTIVE_FAILURES=3
 ```
- 
-### 3. Montar a árvore de código-fonte da Unreal Engine
- 
-No `docker-compose.yml`, ajuste o volume montado no serviço `ue5-agent` para apontar para sua instalação local da UE5 (somente-leitura):
- 
-```yaml
-volumes:
-  - /caminho/para/UE_5.8/Engine:/data/ue5_engine_root:ro
+
+> **Nota:** `ollama_base_url` está deliberadamente ausente — o serviço FastAPI nunca chama o Ollama diretamente. Todo o tráfego de modelo, incluindo embeddings, é roteado através do proxy LiteLLM, que já tem o Ollama pré-configurado como um de seus backends.
+
+---
+
+## Instruções de Uso
+
+> O projeto foi desenhado para rodar como parte de uma stack multi-container (serviço FastAPI + Qdrant + Redis + proxy LiteLLM), coordenada via Docker Compose.
+
+### 1. Clone e configure
+
+```bash
+git clone <repository-url>
+cd ue5-ai-assistant
+cp .env.example .env
+# Preencha REDIS_PASSWORD, LITELLM_MASTER_KEY e quaisquer chaves de API de
+# provedor exigidas pelo seu config.yml do LiteLLM (ex: chave de API do Gemini).
 ```
- 
-### 4. Construir e subir a stack
- 
+
+### 2. Suba a stack
+
 ```bash
 docker compose up -d --build
 ```
- 
-Isso provisiona:
-- `ue5-qdrant` — o banco de dados vetorial (portas `6333`/`6334`).
-- `ue5-qdrant-healthcheck` — um sidecar Alpine que faz polling em `/healthz`, já que a imagem distroless do Qdrant não possui ferramentas nativas de healthcheck.
-- `ue5-agent-redis` — memória de sessão e armazenamento do manifesto de ingestão.
-- `ue5-agent-api` — o serviço FastAPI (porta `8000`), que só inicia após ambas as dependências reportarem estado saudável.
-### 5. Validar a stack
- 
+
+Isso deve subir, no mínimo: o serviço FastAPI `ue5-agent`, o `qdrant`, o `agent-redis`, e o `litellm-proxy` (com o Ollama acessível a partir da rede do proxy).
+
+### 3. Verifique a saúde do sistema
+
 ```bash
-python scripts/validate_stack.py --api-url http://localhost:8000 --verbose
+curl http://localhost:8000/v1/health
 ```
- 
-### 6. Disparar uma execução de ingestão
- 
+
+### 4. Ingira documentação e código-fonte
+
 ```bash
 curl -X POST http://localhost:8000/v1/ingest/process-folder \
   -H "Content-Type: application/json" \
   -d '{
-        "folder_path": "/data/ue5_engine_root/Source/Runtime",
-        "content_type": "source_code"
+        "folder_path": "/data/UnrealEngine/Engine/Source",
+        "content_type": "source_code",
+        "project_source": "UE5_Engine",
+        "sample_mode": false
       }'
 ```
- 
-Acompanhe o progresso pelos logs da aplicação (nível `INFO`).
- 
----
- 
-## Endpoints Principais da API
- 
-| Método | Rota | Descrição |
-|---|---|---|
-| `POST` | `/v1/ingest/process-folder` | Dispara o pipeline de ETL Code-to-Doc de duplo canal em background para uma pasta informada. Retorna **HTTP 202** com um `IngestAcceptedResponse` (`task_id`, `folder_path`, `content_type`, `accepted_at`). Corpo: `IngestRequest { folder_path: str, content_type: "source_code" \| "documentation", ue_version?: str }`. |
-| `POST` | `/v1/chat` | Executa o pipeline RAG completo: decomposição de query, embedding, recuperação no Qdrant, reranking via FlashRank, completion via LiteLLM e memória de sessão apoiada em Redis. Corpo: `ChatRequest { message: str, session_id: str, model: str, top_k: int }`. |
-| `GET` | `/v1/health` | Health check ativo contra Qdrant, Redis e o proxy LiteLLM em paralelo (`asyncio.gather`). Retorna **200** se todas as dependências reportarem `ok`/`degraded`, ou **503** se alguma reportar `error`. |
- 
----
- 
-## Roadmap / Próximos Passos
- 
-- **Respostas de Chat em Streaming** — o campo `stream: true`, já reservado em `ChatRequest`, aguarda uma futura implementação via Server-Sent Events sobre `/v1/chat`.
-- **API de Progresso de Ingestão** — expor progresso em tempo real (arquivos processados, chunks indexados, arquivo atual) via um endpoint de status dedicado ou WebSocket, substituindo a observabilidade atual baseada apenas em logs.
-- **Instrumentação Prometheus** — ativar a dependência já referenciada `prometheus-fastapi-instrumentator` para métricas de throughput de ingestão e latência do RAG.
-- **Reenfileiramento Automatizado de Falhas** — disponibilizar um endpoint administrativo para limpar arquivos em quarentena (hoje um `HDEL` manual no Redis) e disparar reprocessamento direcionado.
-- **Roteamento Multi-Coleção** — estender o manifesto e as chaves de lock (já escopadas por coleção) para suportar ingestão paralela de múltiplas versões da Unreal Engine em coleções isoladas do Qdrant.
-- **Ativação da Suíte de Testes** — promover as dependências comentadas `pytest`/`pytest-asyncio` para um pipeline de CI ativo, cobrindo a lógica de filtragem de duplo canal e o comportamento do manifesto de idempotência.
+
+Para um projeto-sample de gameplay (habilita os Canais C e D):
+
+```bash
+curl -X POST http://localhost:8000/v1/ingest/process-folder \
+  -H "Content-Type: application/json" \
+  -d '{
+        "folder_path": "/data/Lyra",
+        "content_type": "source_code",
+        "project_source": "Lyra",
+        "sample_mode": true
+      }'
+```
+
+A ingestão roda em background; acompanhe o progresso pelos logs da aplicação (nível `INFO`) e pelo manifesto de checkpoint no Redis.
+
+### 5. Faça uma pergunta
+
+```bash
+curl -X POST http://localhost:8000/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+        "message": "Como implemento um double jump em C++ e conecto isso a um Animation Blueprint?",
+        "session_id": "5c1f2e3a-...-uuid-v4",
+        "top_k": 5
+      }'
+```
