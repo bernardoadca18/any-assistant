@@ -153,3 +153,4 @@ services:
     volumes:
       - /mnt/c/Program Files/Epic Games/UE_5.8/Engine:/data/ue5_engine_root:ro
       - /mnt/c/Users/Bernardo.DESKTOP-G7D68S2/Downloads/Ingest_projects:/data/projects_source:ro
+      - /mnt/c/Users/Bernardo.DESKTOP-G7D68S2/Documents/Unreal Projects:/data/sample_projects:ro

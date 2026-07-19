@@ -115,11 +115,7 @@ MIN_BODY_CHARS: int = 100  # Quantidade mínima de caracteres de corpo para emit
 
 _IGNORED_DIR_NAMES: frozenset[str] = frozenset(
     {
-        "Private",
-        "Detail",
-        "Details",
         "ThirdParty",
-        "Internal",
         "Intermediate",
         "Binaries",
         "Build",
