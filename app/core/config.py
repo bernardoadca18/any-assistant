@@ -119,7 +119,7 @@ class Settings(BaseSettings):
         ),
     )
     rag_decomposition_model: str = Field(
-        default="gemini/gemini-3.1-flash-lite",
+        default="gemini/gemini-3.5-flash-lite",
         description="Modelo LiteLLM para decomposição de queries (deve ser rápido e barato).",
     )
     rag_decomposition_timeout: float = Field(
@@ -184,7 +184,7 @@ class Settings(BaseSettings):
     # Roda DENTRO do próprio container ue5-agent — substitui os antigos
     # scripts externos de ingestão que rodavam no host WSL.
     ingestion_documenter_model: str = Field(
-        default="gemini/gemini-2.0-flash-lite",
+        default="qwen-local",
         description=(
             "Modelo LiteLLM usado para transformar headers C++ (.h) em "
             "documentação Markdown educacional orientada a gameplay (Canal A). "
