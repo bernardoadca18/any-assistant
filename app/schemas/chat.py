@@ -70,9 +70,9 @@ class RetrievedChunk(BaseModel):
     Campos alinhados com o payload do ue5_rag_ingestor.py.
     """
     score: float = Field(..., description="Score de similaridade coseno [0, 1]")
-    text: str
+    summary_markdown: str
     title: str
-    description: str = ""
+    #description: str = ""
     source_file: str
     chunk_id: int
     ue_version: str
