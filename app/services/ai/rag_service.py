@@ -67,7 +67,7 @@ log = logging.getLogger(__name__)
 _RETRIEVAL_LIMIT_PER_QUERY: int = 15
 
 # Modelo de decomposição padrão (pode ser sobrescrito via settings)
-_DECOMPOSITION_MODEL: str = "gemini-3.1-flash-lite"
+_DECOMPOSITION_MODEL: str = "gemini-3.5-flash-lite"
 
 # Fallback: se o modelo de decomposição principal falhar (HTTP 4xx/5xx,
 # timeout ou erro de conexão — ver decompose_query).
