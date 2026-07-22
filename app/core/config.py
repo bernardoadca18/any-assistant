@@ -119,7 +119,7 @@ class Settings(BaseSettings):
         ),
     )
     rag_decomposition_model: str = Field(
-        default="gemini/gemini-3.5-flash-lite",
+        default="gemini-3.5-flash-lite",
         description="Modelo LiteLLM para decomposição de queries (deve ser rápido e barato).",
     )
     rag_decomposition_timeout: float = Field(
