@@ -753,7 +753,7 @@ async def _process_cpp_file(
             _build_chunks_with_metadata(
                 markdown_text=markdown,
                 source_file=group_source_file,
-                doc_type="C++ Implementation (mechanic)",
+                doc_type="cpp_implementation",
                 title=title,
                 ue_version=ue_version,
                 raw_content=group_text,
@@ -822,7 +822,7 @@ async def _process_header_file(
     return _build_chunks_with_metadata(
         markdown_text=markdown,
         source_file=str(path),
-        doc_type="C++ Source API",
+        doc_type="cpp_header_api",
         title=title,
         ue_version=ue_version,
         raw_content=cleaned,
@@ -862,7 +862,7 @@ async def _process_udn_file(
     return _build_chunks_with_metadata(
         markdown_text=clean_text,
         source_file=str(path),
-        doc_type="Official Documentation (.udn)",
+        doc_type="udn_documentation",
         title=title or path.stem,
         ue_version=ue_version,
         raw_content=clean_text,
@@ -1058,7 +1058,7 @@ async def _process_blueprint_file(
     return _build_chunks_with_metadata(
         markdown_text=markdown,
         source_file=str(path),
-        doc_type="Blueprint Logic (.bp.json)",
+        doc_type="blueprint_logic",
         title=asset_name,
         ue_version=ue_version,
         raw_content=formatted_json,
@@ -1226,7 +1226,7 @@ def _build_chunks_with_metadata(
     for chunk_id, section_text in enumerate(sections):
         chunks.append(
             {
-                "text": section_text,
+                "summary_markdown": section_text,
                 "source_file": source_file,
                 # Path puro do arquivo em disco, SEM sufixo sintético de grupo
                 # (ex: "#group0"). Usado por _delete_file_chunks para limpar
@@ -1239,7 +1239,6 @@ def _build_chunks_with_metadata(
                 "title": title,
                 "chunk_id": chunk_id,
                 "ue_version": ue_version,
-                "description": "",
                 # CORREÇÃO (custo/payload): raw_content é o mesmo conteúdo
                 # integral do arquivo-fonte para TODOS os chunks gerados a
                 # partir dele. Gravá-lo em cada chunk faz uma busca que
@@ -1544,7 +1543,7 @@ async def _flush_batch(
     async def _embed_one(chunk: dict) -> tuple[dict, list[float] | None]:
         async with semaphore:
             try:
-                vector = await embed_text(chunk["text"])
+                vector = await embed_text(chunk["summary_markdown"])
                 return chunk, vector
             except Exception as exc:
                 log.error(
@@ -1942,7 +1941,7 @@ async def _run_ingestion(
             filtered_chunks = []
             for chunk in chunks:
                 # Extrai o texto do chunk tratando de forma segura se ele for dict ou objeto
-                text = chunk.get("text", "") if isinstance(chunk, dict) else getattr(chunk, "text", "")
+                text = chunk.get("summary_markdown", "") if isinstance(chunk, dict) else getattr(chunk, "summary_markdown", "")
                 
                 # Divide em linhas reais e limpa os espaços em branco das extremidades
                 lines = [line.strip() for line in text.split("\n") if line.strip()]

@@ -497,7 +497,7 @@ async def retrieve_chunks_for_query(
             chunks.append(
                 RetrievedChunk(
                     score=hit.score,
-                    text=payload.get("text", ""),
+                    summary_markdown=payload.get("summary_markdown", ""),
                     title=payload.get("title", "Sem título"),
                     description=payload.get("description", ""),
                     source_file=payload.get("source_file", ""),
@@ -674,7 +674,7 @@ async def rerank_with_flashrank(
         passages = [
             {
                 "id": f"{chunk.source_file}|{chunk.chunk_id}",
-                "text": chunk.text,
+                "text": chunk.summary_markdown,
                 "meta": {
                     "source_file": chunk.source_file,
                     "chunk_id": chunk.chunk_id,
@@ -802,7 +802,7 @@ async def retrieve_chunks(
             chunks.append(
                 RetrievedChunk(
                     score=hit.score,
-                    text=payload.get("text", ""),
+                    summary_markdown=payload.get("summary_markdown", ""),
                     title=payload.get("title", "Sem título"),
                     description=payload.get("description", ""),
                     source_file=payload.get("source_file", ""),
@@ -972,7 +972,7 @@ def _format_context(chunks: list) -> str:
 
     parts: list[str] = []
     for i, chunk in enumerate(chunks, start=1):
-        text = _get_chunk_field(chunk, "text", "")
+        text = _get_chunk_field(chunk, "summary_markdown", "")
         title = _get_chunk_field(chunk, "title", "Sem título")
         source_file = _get_chunk_field(chunk, "source_file", "")
         score = _get_chunk_field(chunk, "score", 0.0)
@@ -1000,7 +1000,7 @@ def _format_context(chunks: list) -> str:
         if raw_content:
             # Canal A ("C++ Source API") usa fence ```cpp; qualquer outro
             # doc_type (Canal B / documentação oficial .udn) usa ```markdown.
-            fence_lang = "cpp" if doc_type == "C++ Source API" else "markdown"
+            fence_lang = "cpp" if doc_type == "cpp_header_api" else "markdown"
             block += (
                 f"\n\n[B) REFERÊNCIA DIRETA — verdade absoluta para sintaxe, "
                 f"assinaturas e tipos]\n"
