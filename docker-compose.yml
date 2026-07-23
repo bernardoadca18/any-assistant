@@ -9,12 +9,10 @@ networks:
 
 volumes:
   qdrant-storage:
-    external: true
     name: qdrant-storage
     labels:
       description: "Qdrant vector database storage for UE5 docs embeddings"
   agent-redis-data:
-    external: true
     name: agent-redis-data
     labels:
       description: "Redis for agent session memory and conversation history"
