@@ -1289,6 +1289,41 @@ async def ensure_collection_exists(qdrant: AsyncQdrantClient) -> None:
         settings.embedding_dim,
     )
 
+SPARSE_VECTOR_NAME = "keywords_sparse"
+
+async def ensure_sparse_vectors_enabled(qdrant: AsyncQdrantClient) -> None:
+    """
+    Migração idempotente e ADITIVA: adiciona o espaço de vetor esparso
+    'keywords_sparse' à coleção existente, sem tocar no vetor denso
+    já indexado (não-nomeado) nem nos payloads.
+
+    modifier=Modifier.IDF: os pontos guardam só term-frequency bruto
+    (ver build_sparse_vector); o Qdrant calcula e mantém a estatística de
+    IDF em nível de coleção internamente e aplica na hora da busca — não
+    precisamos calcular IDF manualmente nem re-processar a coleção toda
+    quando novos documentos entram.
+    """
+    collection_name = settings.qdrant_collection
+    info = await qdrant.get_collection(collection_name)
+    existing_sparse = (info.config.params.sparse_vectors or {})
+
+    if SPARSE_VECTOR_NAME in existing_sparse:
+        log.info("Sparse vector '%s' já habilitado — nada a fazer.", SPARSE_VECTOR_NAME)
+        return
+
+    await qdrant.update_collection(
+        collection_name=collection_name,
+        sparse_vectors_config={
+            SPARSE_VECTOR_NAME: qdrant_models.SparseVectorParams(
+                modifier=qdrant_models.Modifier.IDF,
+            ),
+        },
+    )
+    log.info(
+        "Sparse vector '%s' habilitado na coleção '%s' (modifier=IDF). "
+        "Vetor denso existente não foi alterado.",
+        SPARSE_VECTOR_NAME, collection_name,
+    )
 
 # =============================================================================
 # CHECKPOINT / MANIFESTO DE INGESTÃO (idempotência via Redis)
