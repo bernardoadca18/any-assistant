@@ -23,7 +23,13 @@ from app.core.logging import setup_logging
 from app.db.qdrant import close_qdrant, init_qdrant
 from app.db.redis import close_redis, init_redis
 from app.services.ai.embedding_service import close_embedding_client, init_embedding_client
-from app.services.ai.rag_service import close_litellm_client, init_litellm_client
+from app.services.ai.ingestion_service import ensure_sparse_vectors_enabled
+from app.services.ai.rag_service import (
+    close_decomposition_client,
+    close_litellm_client,
+    init_decomposition_client,
+    init_litellm_client,
+)
 
 setup_logging()
 log = logging.getLogger(__name__)
@@ -36,15 +42,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     STARTUP:
         1. Qdrant  — valida coleção 'ue5_docs'
+        1.1 Qdrant — migração idempotente/aditiva do espaço de vetor
+            esparso 'keywords_sparse' (busca híbrida — ver
+            ingestion_service.ensure_sparse_vectors_enabled). Não bloqueante:
+            se a coleção ainda não existir (nenhuma ingestão rodou ainda),
+            fica registrado um warning e a migração é reaplicada
+            automaticamente na próxima ingestão.
         2. Redis   — pool de conexões para sessões
         3. LiteLLM — cliente HTTP para embeddings (mesmo proxy)
         4. LiteLLM — cliente HTTP para chat/completions (mesmo proxy)
+        5. LiteLLM — cliente HTTP para decomposição/tradução de query
+           (mesmo proxy; client dedicado — ver rag_service.decompose_query)
 
     SHUTDOWN (ordem inversa):
-        1. LiteLLM client de chat/completions fechado
-        2. LiteLLM client de embeddings fechado
-        3. Redis fechado
-        4. Qdrant fechado
+        1. LiteLLM client de decomposição de query fechado
+        2. LiteLLM client de chat/completions fechado
+        3. LiteLLM client de embeddings fechado
+        4. Redis fechado
+        5. Qdrant fechado
     """
     log.info("=" * 60)
     log.info("Iniciando %s v%s [%s]", settings.app_name, settings.app_version, settings.app_env)
@@ -52,11 +67,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     startup_errors: list[str] = []
 
+    qdrant_client = None
     try:
-        await init_qdrant()
+        qdrant_client = await init_qdrant()
     except ConnectionError as exc:
         log.error("FALHA ao conectar Qdrant: %s", exc)
         startup_errors.append(f"Qdrant: {exc}")
+
+    if qdrant_client is not None:
+        # BUSCA HÍBRIDA: migração idempotente/aditiva do espaço esparso.
+        # Não bloqueante de propósito — se falhar (ex: coleção ainda não
+        # existe, nenhuma ingestão rodou ainda), a aplicação sobe normalmente
+        # e a migração é reaplicada automaticamente no início da próxima
+        # ingestão (ver ingestion_service._run_ingestion).
+        try:
+            await ensure_sparse_vectors_enabled(qdrant_client)
+        except Exception as exc:
+            log.warning(
+                "Migração de sparse vectors (busca híbrida) não aplicada no "
+                "startup: %s. Será retentada na próxima ingestão.",
+                exc,
+            )
 
     try:
         await init_redis()
@@ -76,6 +107,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         log.error("FALHA ao inicializar client de chat/completions do LiteLLM: %s", exc)
         startup_errors.append(f"LiteLLM (chat): {exc}")
 
+    try:
+        await init_decomposition_client()
+    except Exception as exc:
+        log.error("FALHA ao inicializar client de decomposição de query do LiteLLM: %s", exc)
+        startup_errors.append(f"LiteLLM (decomposição): {exc}")
+
     if startup_errors:
         log.warning(
             "Aplicação iniciada com %d erro(s) de dependência: %s",
@@ -92,6 +129,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     log.info("Encerrando aplicação...")
+    await close_decomposition_client()
     await close_litellm_client()
     await close_embedding_client()
     await close_redis()
