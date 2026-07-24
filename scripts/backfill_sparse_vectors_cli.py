@@ -1,52 +1,40 @@
 """
-backfill_sparse_vectors_cli.py
-===============================
-Script standalone para disparar o backfill de vetores esparsos
-('keywords_sparse') nos pontos LEGADOS da coleção Qdrant — ou seja, pontos
-ingeridos ANTES da migração para busca híbrida (Dense + Sparse via RRF).
+backfill_sparse_vectors_cli.py  (STANDALONE — sem dependências do pacote app.*)
+=================================================================================
+Só é ÚTIL DEPOIS de você ter um espaço 'keywords_sparse' habilitado na
+coleção — ou seja, depois de:
+  (a) migrar via migrate_to_hybrid_collection.py, OU
+  (b) atualizar o Qdrant para >= v1.18 e rodar a app normalmente (o
+      próprio startup já habilita o schema nesse caso).
 
-NÃO re-ingere nada: não chama a LLM documentadora, não recalcula embedding
-denso, não toca em nenhum campo do payload. Só lê os campos de texto já
-armazenados (title, raw_content, summary_markdown), gera o vetor esparso
-localmente (CPU, sem chamada de rede) e grava apenas esse vetor via
-`update_vectors`. Idempotente — seguro rodar múltiplas vezes.
+Popula o vetor esparso em pontos que ainda não o têm (idempotente — pula
+quem já tem). Ver docstring de migrate_to_hybrid_collection.py para a
+explicação completa de por que este script é standalone (não depende do
+pacote `app`, só de `qdrant-client`) e como rodá-lo (docker cp + exec, ou
+direto do host via --host localhost).
 
-INSTALAÇÃO:
-    Copie este arquivo para dentro do projeto, por exemplo em:
-        app/scripts/backfill_sparse_vectors.py
-    (crie também app/scripts/__init__.py vazio, se o diretório não existir)
+USO:
+    docker cp backfill_sparse_vectors_cli.py ue5-agent-api:/tmp/backfill.py
+    docker compose exec ue5-agent python /tmp/backfill.py
 
-USO (dentro do container ue5-agent-api, via docker compose):
+    # ou do host (porta 6333 exposta no docker-compose.yml):
+    python backfill_sparse_vectors_cli.py --host localhost
 
-    # Se colocado como app/scripts/backfill_sparse_vectors.py:
-    docker compose exec ue5-agent python -m app.scripts.backfill_sparse_vectors
-
-    # Ou rodando este arquivo diretamente (ex: montado/copiado na raiz
-    # do container, onde o pacote `app` já está no PYTHONPATH):
-    docker compose exec ue5-agent python backfill_sparse_vectors_cli.py
-
-    # Batch size customizado (padrão: 200):
-    docker compose exec ue5-agent python backfill_sparse_vectors_cli.py 500
-
-Não precisa parar o container nem interromper o tráfego normal de
-/v1/chat — o backfill só lê e atualiza vetores, não interfere na busca
-densa já em uso, e o retrieval híbrido já cai automaticamente para os
-pontos migrados assim que eles forem atualizados (sem restart necessário).
+    # opções:
+    python backfill_sparse_vectors_cli.py --host qdrant --port 6333 \\
+        --collection ue5_docs_hybrid --batch-size 200
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
-import sys
+import re
+import zlib
 
 from qdrant_client import AsyncQdrantClient
-
-from app.core.config import settings
-from app.services.ai.ingestion_service import (
-    backfill_sparse_vectors,
-    ensure_sparse_vectors_enabled,
-)
+from qdrant_client.http import models as qdrant_models
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,35 +42,125 @@ logging.basicConfig(
 )
 log = logging.getLogger("backfill_sparse_vectors_cli")
 
+# --- Tokenização/hashing — cópia intencional de sparse_vector_service.py ---
+SPARSE_VECTOR_NAME = "keywords_sparse"
+_SPARSE_VECTOR_DIM = 2**24
+_NON_ALNUM_RE = re.compile(r"[^A-Za-z0-9]+")
+_CAMEL_SPLIT_RE = re.compile(
+    r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+"
+)
 
-async def main(batch_size: int) -> None:
-    log.info(
-        "Conectando ao Qdrant em %s:%s (coleção=%s)...",
-        settings.qdrant_host,
-        settings.qdrant_port,
-        settings.qdrant_collection,
-    )
-    qdrant = AsyncQdrantClient(
-        host=settings.qdrant_host,
-        port=settings.qdrant_port,
-        timeout=30.0,
-    )
+
+def _tokenize(text: str) -> list[str]:
+    tokens: list[str] = []
+    for raw_word in _NON_ALNUM_RE.split(text):
+        if not raw_word:
+            continue
+        lowered = raw_word.lower()
+        if len(lowered) > 1:
+            tokens.append(lowered)
+        sub_parts = _CAMEL_SPLIT_RE.findall(raw_word)
+        if len(sub_parts) > 1:
+            for part in sub_parts:
+                part_lower = part.lower()
+                if len(part_lower) > 1:
+                    tokens.append(part_lower)
+    return tokens
+
+
+def build_sparse_vector(text: str) -> qdrant_models.SparseVector:
+    if not text:
+        return qdrant_models.SparseVector(indices=[], values=[])
+    tokens = _tokenize(text)
+    if not tokens:
+        return qdrant_models.SparseVector(indices=[], values=[])
+    term_frequency: dict[int, float] = {}
+    for token in tokens:
+        idx = zlib.crc32(token.encode("utf-8")) % _SPARSE_VECTOR_DIM
+        term_frequency[idx] = term_frequency.get(idx, 0.0) + 1.0
+    indices = list(term_frequency.keys())
+    values = [term_frequency[i] for i in indices]
+    return qdrant_models.SparseVector(indices=indices, values=values)
+
+
+async def backfill(host: str, port: int, collection: str, batch_size: int) -> None:
+    qdrant = AsyncQdrantClient(host=host, port=port, timeout=30.0)
     try:
-        # Garante que o schema está migrado antes do backfill — idempotente,
-        # não faz nada se 'keywords_sparse' já estiver habilitado.
-        await ensure_sparse_vectors_enabled(qdrant)
+        if not await qdrant.collection_exists(collection):
+            raise RuntimeError(f"Coleção '{collection}' não existe em http://{host}:{port}.")
 
-        total_updated = await backfill_sparse_vectors(qdrant, batch_size=batch_size)
+        info = await qdrant.get_collection(collection)
+        if SPARSE_VECTOR_NAME not in (info.config.params.sparse_vectors or {}):
+            raise RuntimeError(
+                f"Coleção '{collection}' ainda não tem o espaço "
+                f"'{SPARSE_VECTOR_NAME}' no schema. Rode "
+                f"migrate_to_hybrid_collection.py primeiro (ou atualize o "
+                f"Qdrant para >= v1.18)."
+            )
+
+        updated_count = 0
+        scanned_count = 0
+        next_offset = None
+
+        while True:
+            points, next_offset = await qdrant.scroll(
+                collection_name=collection,
+                limit=batch_size,
+                offset=next_offset,
+                with_payload=["title", "raw_content", "summary_markdown"],
+                with_vectors=True,
+            )
+            if not points:
+                break
+            scanned_count += len(points)
+
+            updates: list[qdrant_models.PointVectors] = []
+            for point in points:
+                existing_vectors = point.vector or {}
+                if isinstance(existing_vectors, dict) and SPARSE_VECTOR_NAME in existing_vectors:
+                    continue
+
+                payload = point.payload or {}
+                sparse_text = " ".join(
+                    (
+                        payload.get("title") or "",
+                        payload.get("raw_content") or "",
+                        payload.get("summary_markdown") or "",
+                    )
+                )
+                sparse_vector = build_sparse_vector(sparse_text)
+                updates.append(
+                    qdrant_models.PointVectors(
+                        id=point.id,
+                        vector={SPARSE_VECTOR_NAME: sparse_vector},
+                    )
+                )
+
+            if updates:
+                await qdrant.update_vectors(collection_name=collection, points=updates)
+                updated_count += len(updates)
+                log.info(
+                    "+%d pontos neste lote (escaneados=%d, atualizados_total=%d)",
+                    len(updates), scanned_count, updated_count,
+                )
+
+            if next_offset is None:
+                break
 
         log.info(
-            "Backfill concluído com sucesso | %d ponto(s) atualizado(s) "
-            "com vetor esparso.",
-            total_updated,
+            "Backfill concluído | escaneados=%d atualizados=%d já_migrados=%d",
+            scanned_count, updated_count, scanned_count - updated_count,
         )
     finally:
         await qdrant.close()
 
 
 if __name__ == "__main__":
-    batch_size_arg = int(sys.argv[1]) if len(sys.argv) > 1 else 200
-    asyncio.run(main(batch_size=batch_size_arg))
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--host", default="qdrant")
+    parser.add_argument("--port", type=int, default=6333)
+    parser.add_argument("--collection", default="ue5_docs")
+    parser.add_argument("--batch-size", type=int, default=200)
+    args = parser.parse_args()
+
+    asyncio.run(backfill(args.host, args.port, args.collection, args.batch_size))

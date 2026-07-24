@@ -1,12 +1,45 @@
 """
-migrate_to_hybrid_collection.py
-=================================
+migrate_to_hybrid_collection.py  (STANDALONE — sem dependências do pacote app.*)
+==================================================================================
 Migração de schema para busca híbrida em servidores Qdrant ANTERIORES à
 v1.18 — onde adicionar um vetor NOMEADO NOVO a uma coleção que já existe,
-sem recriá-la, não é suportado pelo servidor (ver
-ingestion_service.ensure_sparse_vectors_enabled para a explicação completa
-do porquê `update_collection` falha com 'Not existing vector name error'
-nessas versões).
+sem recriá-la, não é suportado pelo servidor ("Wrong input: Not existing
+vector name error" — ver ingestion_service.ensure_sparse_vectors_enabled
+para a explicação completa).
+
+POR QUE ESTE SCRIPT É STANDALONE (não importa nada de `app.*`):
+    O Dockerfile do projeto só copia a pasta `app/` para dentro da imagem
+    (`COPY --chown=appuser:appuser app/ ./app/`) — qualquer script fora
+    dela (ex: em `/scripts` na raiz do repo) simplesmente não existe
+    dentro do container, e tentar rodá-lo como `-m app.scripts.algo` ou
+    `-m scripts.algo` sempre vai dar ModuleNotFoundError, não importa o
+    nome do módulo. Em vez de mexer no Dockerfile/volumes só por causa de
+    um script de manutenção pontual, este arquivo NÃO depende de nada do
+    pacote `app` — só de `qdrant-client` (já instalado no venv do
+    container, faz parte do requirements.txt do projeto). A lógica de
+    tokenização/hashing do vetor esparso está DUPLICADA aqui de propósito
+    (copiada de app/services/ai/sparse_vector_service.py) — são ~30 linhas
+    puras, sem risco real de desalinhar, e o ganho é poder rodar este
+    script de QUALQUER lugar sem se preocupar com PYTHONPATH/pacotes.
+
+COMO RODAR — duas opções:
+
+  OPÇÃO 1 (recomendada, dentro do container, sem precisar ser um módulo):
+    docker cp migrate_to_hybrid_collection.py ue5-agent-api:/tmp/migrate.py
+    docker compose exec ue5-agent python /tmp/migrate.py
+
+  OPÇÃO 2 (direto do host, fora do container — funciona porque o
+  docker-compose.yml expõe a porta do Qdrant: "6333:6333"):
+    # de dentro do seu venv local (o mesmo que já tem qdrant-client, ou
+    # rode `pip install qdrant-client --break-system-packages` /
+    # `.venv/bin/pip install qdrant-client` primeiro se não tiver)
+    python migrate_to_hybrid_collection.py --host localhost --port 6333
+
+Em ambos os casos, argumentos customizáveis:
+    python migrate_to_hybrid_collection.py \\
+        --host qdrant --port 6333 \\
+        --source ue5_docs --target ue5_docs_hybrid \\
+        --batch-size 200
 
 O QUE ESTE SCRIPT FAZ (e o que NÃO faz):
   1. Lê a config da coleção ORIGEM (distância, tamanho do vetor denso,
@@ -18,8 +51,8 @@ O QUE ESTE SCRIPT FAZ (e o que NÃO faz):
   3. Copia TODOS os pontos da origem para o destino via scroll + upsert em
      lote, reaproveitando o vetor denso JÁ CALCULADO (sem chamar o
      LiteLLM/modelo de embedding de novo) e computando o vetor esparso
-     LOCALMENTE (build_sparse_vector — CPU, sem chamada de rede) a partir
-     de title + raw_content + summary_markdown já armazenados no payload.
+     LOCALMENTE (CPU, sem chamada de rede) a partir de title +
+     raw_content + summary_markdown já armazenados no payload.
   4. NÃO apaga a coleção origem. NÃO troca a coleção que a aplicação usa
      automaticamente — isso é uma decisão manual sua, feita DEPOIS de
      validar a coleção nova (ver instruções impressas ao final).
@@ -27,17 +60,6 @@ O QUE ESTE SCRIPT FAZ (e o que NÃO faz):
 Ou seja: isto NÃO é um re-ingestão do zero. Nenhuma chamada à LLM
 documentadora (Canal A) nem ao modelo de embedding acontece — é uma cópia
 de pontos + geração local do vetor esparso.
-
-USO:
-    docker compose exec ue5-agent python -m app.scripts.migrate_to_hybrid_collection
-
-    # Customizando nomes/batch:
-    docker compose exec ue5-agent python -m app.scripts.migrate_to_hybrid_collection \\
-        --source ue5_docs --target ue5_docs_hybrid --batch-size 200
-
-    # Rodar de novo depois de interromper: idempotente na criação da
-    # coleção destino (pula se já existir) e sobrescreve pontos já
-    # copiados (upsert por id) — seguro reexecutar.
 
 DEPOIS DE RODAR (passo manual):
     1. Confira o total de pontos na coleção destino (compare com a origem).
@@ -55,12 +77,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import re
+import zlib
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qdrant_models
-
-from app.core.config import settings
-from app.services.ai.sparse_vector_service import SPARSE_VECTOR_NAME, build_sparse_vector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,15 +90,62 @@ logging.basicConfig(
 log = logging.getLogger("migrate_to_hybrid_collection")
 
 
-async def migrate(source: str, target: str, batch_size: int) -> None:
-    qdrant = AsyncQdrantClient(
-        host=settings.qdrant_host,
-        port=settings.qdrant_port,
-        timeout=60.0,
-    )
+# =============================================================================
+# TOKENIZAÇÃO/HASHING DO VETOR ESPARSO — cópia intencional e mínima de
+# app/services/ai/sparse_vector_service.py (ver docstring do módulo acima
+# para o porquê da duplicação). Mantenha as duas em sincronia se um dia
+# mudar a estratégia de tokenização.
+# =============================================================================
+
+SPARSE_VECTOR_NAME = "keywords_sparse"
+_SPARSE_VECTOR_DIM = 2**24
+_NON_ALNUM_RE = re.compile(r"[^A-Za-z0-9]+")
+_CAMEL_SPLIT_RE = re.compile(
+    r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+"
+)
+
+
+def _tokenize(text: str) -> list[str]:
+    tokens: list[str] = []
+    for raw_word in _NON_ALNUM_RE.split(text):
+        if not raw_word:
+            continue
+        lowered = raw_word.lower()
+        if len(lowered) > 1:
+            tokens.append(lowered)
+        sub_parts = _CAMEL_SPLIT_RE.findall(raw_word)
+        if len(sub_parts) > 1:
+            for part in sub_parts:
+                part_lower = part.lower()
+                if len(part_lower) > 1:
+                    tokens.append(part_lower)
+    return tokens
+
+
+def build_sparse_vector(text: str) -> qdrant_models.SparseVector:
+    if not text:
+        return qdrant_models.SparseVector(indices=[], values=[])
+    tokens = _tokenize(text)
+    if not tokens:
+        return qdrant_models.SparseVector(indices=[], values=[])
+    term_frequency: dict[int, float] = {}
+    for token in tokens:
+        idx = zlib.crc32(token.encode("utf-8")) % _SPARSE_VECTOR_DIM
+        term_frequency[idx] = term_frequency.get(idx, 0.0) + 1.0
+    indices = list(term_frequency.keys())
+    values = [term_frequency[i] for i in indices]
+    return qdrant_models.SparseVector(indices=indices, values=values)
+
+
+# =============================================================================
+# MIGRAÇÃO
+# =============================================================================
+
+async def migrate(host: str, port: int, source: str, target: str, batch_size: int) -> None:
+    qdrant = AsyncQdrantClient(host=host, port=port, timeout=60.0)
     try:
         if not await qdrant.collection_exists(source):
-            raise RuntimeError(f"Coleção de origem '{source}' não existe em {settings.qdrant_url}.")
+            raise RuntimeError(f"Coleção de origem '{source}' não existe em http://{host}:{port}.")
 
         if await qdrant.collection_exists(target):
             log.info(
@@ -181,10 +249,12 @@ async def migrate(source: str, target: str, batch_size: int) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", default=settings.qdrant_collection, help="Coleção de origem (padrão: settings.qdrant_collection)")
-    parser.add_argument("--target", default=f"{settings.qdrant_collection}_hybrid", help="Coleção destino a criar")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--host", default="qdrant", help="Host do Qdrant (padrão: 'qdrant' — hostname interno do Docker; use 'localhost' se rodar do seu host, fora do container)")
+    parser.add_argument("--port", type=int, default=6333)
+    parser.add_argument("--source", default="ue5_docs")
+    parser.add_argument("--target", default="ue5_docs_hybrid")
     parser.add_argument("--batch-size", type=int, default=200)
     args = parser.parse_args()
 
-    asyncio.run(migrate(args.source, args.target, args.batch_size))
+    asyncio.run(migrate(args.host, args.port, args.source, args.target, args.batch_size))
