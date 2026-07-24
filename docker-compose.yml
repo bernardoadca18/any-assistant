@@ -56,9 +56,18 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          # CORREÇÃO: 1G era baixo demais para a carga de escrita em lote
+          # da migração de coleção (~40k+ pontos, vetor denso 1024-dim +
+          # esparso, múltiplos segmentos abertos simultaneamente) — o
+          # kernel matava o processo com SIGKILL (OOM killer do cgroup,
+          # visível no log como "Killed" sem nenhuma mensagem de erro do
+          # próprio Qdrant antes). 4G dá folga suficiente para esse volume
+          # de dados; ajuste para baixo depois que a migração terminar, se
+          # quiser economizar memória em regime de operação normal
+          # (retrieval puro usa bem menos que ingestão/migração em lote).
+          memory: 4G
         reservations:
-          memory: 512M
+          memory: 1G
 
   # ---------------------------------------------------------------------------
   # QDRANT HEALTHCHECK — container sidecar usando alpine (tem wget nativo)
