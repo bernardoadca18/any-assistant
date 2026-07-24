@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     # --- Qdrant --------------------------------------------------------------
     qdrant_host: str = "qdrant"
     qdrant_port: int = 6333
-    qdrant_collection: str = "ue5_docs"
+    qdrant_collection: str = "ue5_docs_hybrid"
 
     @property
     def qdrant_url(self) -> str:
