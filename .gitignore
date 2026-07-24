@@ -7,3 +7,4 @@ logs
 report.json
 report.md
 scripts/migration_audit.jsonl
+backups
