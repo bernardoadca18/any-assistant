@@ -96,6 +96,7 @@ from typing import Iterator
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qdrant_models
+from qdrant_client.http.exceptions import UnexpectedResponse
 from redis.asyncio import Redis
 from redis.asyncio.lock import Lock
 
@@ -1290,7 +1291,10 @@ async def ensure_collection_exists(qdrant: AsyncQdrantClient) -> None:
         settings.embedding_dim,
     )
 
-async def ensure_sparse_vectors_enabled(qdrant: AsyncQdrantClient) -> None:
+async def ensure_sparse_vectors_enabled(
+    qdrant: AsyncQdrantClient,
+    _retry: int = 0,
+) -> None:
     """
     Migração idempotente e ADITIVA: adiciona o espaço de vetor esparso
     'keywords_sparse' à coleção existente, sem tocar no vetor denso
@@ -1310,6 +1314,19 @@ async def ensure_sparse_vectors_enabled(qdrant: AsyncQdrantClient) -> None:
     retornamos, já que o ingestor ainda vai criar a coleção (com o espaço
     esparso já habilitado desde o início, ver `_flush_batch`/upsert) na
     primeira execução.
+
+    RESILIENTE A CORRIDA ENTRE MÚLTIPLOS WORKERS: esta função é chamada no
+    lifespan startup do FastAPI (main.py) — se o Uvicorn/Gunicorn estiver
+    rodando com mais de 1 worker, TODOS os processos executam o lifespan de
+    forma independente e chamam esta função ao mesmo tempo. Cada um vê o
+    schema ainda sem 'keywords_sparse' e tenta criar o espaço
+    simultaneamente; o Qdrant pode rejeitar a escrita concorrente perdedora
+    com um 400 transitório ("Not existing vector name error: ...") enquanto
+    a escrita vencedora ainda está sendo aplicada. Isso NÃO é uma falha real
+    da migração — é uma leitura desatualizada da corrida. Em vez de desistir
+    na primeira falha, reconferimos o schema (pode ser que outro worker já
+    tenha terminado) e, se ainda não estiver lá, tentamos de novo com um
+    backoff curto, por até 5 tentativas.
     """
     collection_name = settings.qdrant_collection
 
@@ -1330,14 +1347,43 @@ async def ensure_sparse_vectors_enabled(qdrant: AsyncQdrantClient) -> None:
         log.info("Sparse vector '%s' já habilitado — nada a fazer.", SPARSE_VECTOR_NAME)
         return
 
-    await qdrant.update_collection(
-        collection_name=collection_name,
-        sparse_vectors_config={
-            SPARSE_VECTOR_NAME: qdrant_models.SparseVectorParams(
-                modifier=qdrant_models.Modifier.IDF,
-            ),
-        },
-    )
+    try:
+        await qdrant.update_collection(
+            collection_name=collection_name,
+            sparse_vectors_config={
+                SPARSE_VECTOR_NAME: qdrant_models.SparseVectorParams(
+                    modifier=qdrant_models.Modifier.IDF,
+                ),
+            },
+        )
+    except UnexpectedResponse as exc:
+        max_retries = 5
+        if _retry >= max_retries:
+            log.error(
+                "Falha definitiva ao habilitar sparse vector '%s' após %d "
+                "tentativas: %s",
+                SPARSE_VECTOR_NAME,
+                max_retries,
+                exc,
+            )
+            raise
+
+        backoff_seconds = 0.5 * (2**_retry)  # 0.5s, 1s, 2s, 4s, 8s
+        log.warning(
+            "update_collection para '%s' falhou (%s) — provável corrida "
+            "entre múltiplos workers chamando a migração ao mesmo tempo no "
+            "startup. Retentativa %d/%d em %.1fs (reconferindo schema antes "
+            "de tentar de novo).",
+            SPARSE_VECTOR_NAME,
+            exc,
+            _retry + 1,
+            max_retries,
+            backoff_seconds,
+        )
+        await asyncio.sleep(backoff_seconds)
+        await ensure_sparse_vectors_enabled(qdrant, _retry=_retry + 1)
+        return
+
     log.info(
         "Sparse vector '%s' habilitado na coleção '%s' (modifier=IDF). "
         "Vetor denso existente não foi alterado.",
