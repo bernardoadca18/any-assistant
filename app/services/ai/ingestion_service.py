@@ -103,6 +103,7 @@ from app.core.config import settings
 from app.db.redis import ingestion_failures_key, ingestion_lock_key, ingestion_manifest_key
 from app.services.ai.embedding_service import embed_text
 from app.services.ai.rag_service import call_litellm
+from app.services.ai.sparse_vector_service import SPARSE_VECTOR_NAME, build_sparse_vector
 
 log = logging.getLogger(__name__)
 
@@ -1289,8 +1290,6 @@ async def ensure_collection_exists(qdrant: AsyncQdrantClient) -> None:
         settings.embedding_dim,
     )
 
-SPARSE_VECTOR_NAME = "keywords_sparse"
-
 async def ensure_sparse_vectors_enabled(qdrant: AsyncQdrantClient) -> None:
     """
     Migração idempotente e ADITIVA: adiciona o espaço de vetor esparso
@@ -1302,8 +1301,28 @@ async def ensure_sparse_vectors_enabled(qdrant: AsyncQdrantClient) -> None:
     IDF em nível de coleção internamente e aplica na hora da busca — não
     precisamos calcular IDF manualmente nem re-processar a coleção toda
     quando novos documentos entram.
+
+    DEFENSIVO (chamável a qualquer momento, inclusive no startup do
+    FastAPI antes de qualquer ingestão ter rodado): se a coleção ainda não
+    existir, `get_collection` lançaria UnexpectedResponse 404. Em vez de
+    propagar isso como erro, seguimos o mesmo padrão de
+    `app/db/qdrant.py::_validate_collection` — registramos um warning e
+    retornamos, já que o ingestor ainda vai criar a coleção (com o espaço
+    esparso já habilitado desde o início, ver `_flush_batch`/upsert) na
+    primeira execução.
     """
     collection_name = settings.qdrant_collection
+
+    exists = await qdrant.collection_exists(collection_name)
+    if not exists:
+        log.warning(
+            "Coleção '%s' ainda não existe — migração de sparse vectors "
+            "adiada. Será aplicada automaticamente quando a ingestão "
+            "criar a coleção, ou pode ser chamada de novo depois.",
+            collection_name,
+        )
+        return
+
     info = await qdrant.get_collection(collection_name)
     existing_sparse = (info.config.params.sparse_vectors or {})
 
@@ -1598,8 +1617,34 @@ async def _flush_batch(
         point_id = str(
             uuid.uuid5(uuid.NAMESPACE_URL, f"{chunk['source_file']}::{chunk['chunk_id']}")
         )
+
+        # BUSCA HÍBRIDA: o vetor esparso é gerado a partir da concatenação
+        # de title + raw_content + summary_markdown — cobre tanto os
+        # identificadores técnicos exatos (ex: "AddMovementInput",
+        # "UPROPERTY") presentes no código/título quanto os termos do
+        # resumo semântico gerado pela LLM documentadora. raw_content é
+        # None para chunk_id != 0 (ver _build_chunks_with_metadata) — o
+        # `or ""` cobre esse caso sem quebrar a concatenação.
+        sparse_text = " ".join(
+            (
+                chunk.get("title") or "",
+                chunk.get("raw_content") or "",
+                chunk.get("summary_markdown") or "",
+            )
+        )
+        sparse_vector = build_sparse_vector(sparse_text)
+
         points.append(
-            qdrant_models.PointStruct(id=point_id, vector=vector, payload=chunk)
+            qdrant_models.PointStruct(
+                id=point_id,
+                # Vetor denso mantido na chave "" (não-nomeada, mesmo
+                # esquema já usado antes da migração híbrida) + vetor
+                # esparso nomeado 'keywords_sparse' — coexistem no mesmo
+                # ponto sem conflito, já que são espaços de índice
+                # independentes no Qdrant.
+                vector={"": vector, SPARSE_VECTOR_NAME: sparse_vector},
+                payload=chunk,
+            )
         )
 
     if not points:
@@ -1639,6 +1684,129 @@ async def _flush_batch(
         per_file_counts[source_file_root] = per_file_counts.get(source_file_root, 0) + 1
 
     return per_file_counts
+
+
+# =============================================================================
+# BACKFILL DE SPARSE VECTORS — dados legados (busca híbrida)
+# =============================================================================
+# Popula o espaço esparso 'keywords_sparse' (ver ensure_sparse_vectors_enabled)
+# em pontos que já existiam na coleção ANTES da migração para busca híbrida —
+# ou seja, pontos cujo `vector` até aqui só tem a chave "" (denso).
+#
+# Não re-ingere nada: não chama a LLM documentadora, não recalcula o
+# embedding denso, não toca em nenhum campo do payload. Apenas lê os campos
+# de texto já armazenados (title, raw_content, summary_markdown) via scroll,
+# gera o vetor esparso localmente (build_sparse_vector — CPU, síncrono,
+# sem chamada de rede) e grava só esse vetor via `update_vectors`.
+#
+# IDEMPOTENTE: pontos que já têm o vetor esparso (detectado via
+# `with_vectors=True` no scroll) são pulados — seguro rodar múltiplas vezes,
+# inclusive em paralelo com ingestões novas (que já gravam o esparso desde
+# o upsert, ver _flush_batch).
+async def backfill_sparse_vectors(
+    qdrant: AsyncQdrantClient,
+    batch_size: int = 200,
+) -> int:
+    """
+    Percorre TODOS os pontos já existentes na coleção (via `scroll`) e
+    aplica `update_vectors` para popular o espaço esparso 'keywords_sparse'
+    nos pontos legados que ainda não o têm, sem tocar nos vetores densos
+    nem nos payloads existentes.
+
+    Args:
+        qdrant: Cliente Qdrant assíncrono.
+        batch_size: Tamanho do lote de scroll/update_vectors por iteração.
+            200 é um valor conservador — build_sparse_vector é puramente
+            local (sem I/O), então o gargalo real é a rede para
+            scroll/update_vectors, não a geração do vetor em si.
+
+    Returns:
+        Número total de pontos efetivamente atualizados com o vetor
+        esparso (pontos já migrados anteriormente não contam).
+    """
+    collection_name = settings.qdrant_collection
+    updated_count = 0
+    scanned_count = 0
+    next_offset = None
+
+    log.info(
+        "Backfill de sparse vectors iniciado | coleção=%s batch_size=%d",
+        collection_name,
+        batch_size,
+    )
+
+    while True:
+        points, next_offset = await qdrant.scroll(
+            collection_name=collection_name,
+            limit=batch_size,
+            offset=next_offset,
+            with_payload=["title", "raw_content", "summary_markdown"],
+            with_vectors=True,
+        )
+        if not points:
+            break
+
+        scanned_count += len(points)
+
+        updates: list[qdrant_models.PointVectors] = []
+        for point in points:
+            existing_vectors = point.vector or {}
+            # Pontos já migrados (por este backfill ou por uma ingestão
+            # nova pós-migração) têm o vetor esparso no dict — pula.
+            if isinstance(existing_vectors, dict) and SPARSE_VECTOR_NAME in existing_vectors:
+                continue
+
+            payload = point.payload or {}
+            sparse_text = " ".join(
+                (
+                    payload.get("title") or "",
+                    payload.get("raw_content") or "",
+                    payload.get("summary_markdown") or "",
+                )
+            )
+            sparse_vector = build_sparse_vector(sparse_text)
+            updates.append(
+                qdrant_models.PointVectors(
+                    id=point.id,
+                    vector={SPARSE_VECTOR_NAME: sparse_vector},
+                )
+            )
+
+        if updates:
+            try:
+                await qdrant.update_vectors(
+                    collection_name=collection_name,
+                    points=updates,
+                )
+            except Exception as exc:
+                log.error(
+                    "Falha ao gravar lote de sparse vectors (%d pontos): %s. "
+                    "Backfill continua com o próximo lote — os pontos deste "
+                    "lote serão retentados numa próxima execução.",
+                    len(updates),
+                    exc,
+                )
+            else:
+                updated_count += len(updates)
+                log.info(
+                    "Backfill de sparse vectors: +%d pontos neste lote "
+                    "(escaneados=%d, atualizados_total=%d)",
+                    len(updates),
+                    scanned_count,
+                    updated_count,
+                )
+
+        if next_offset is None:
+            break
+
+    log.info(
+        "Backfill de sparse vectors concluído | escaneados=%d atualizados=%d "
+        "já_migrados=%d",
+        scanned_count,
+        updated_count,
+        scanned_count - updated_count,
+    )
+    return updated_count
 
 
 # =============================================================================
@@ -1801,6 +1969,21 @@ async def _run_ingestion(
             exc_info=True,
         )
         return
+
+    # BUSCA HÍBRIDA: garante que o espaço de vetor esparso 'keywords_sparse'
+    # esteja habilitado ANTES de qualquer upsert deste run — idempotente e
+    # aditivo (ver ensure_sparse_vectors_enabled), não bloqueante em caso de
+    # falha (a ingestão pode prosseguir gravando só o vetor denso; o
+    # backfill/retry da migração cobre esse caso depois).
+    try:
+        await ensure_sparse_vectors_enabled(qdrant)
+    except Exception as exc:
+        log.warning(
+            "Falha ao habilitar sparse vectors na coleção '%s': %s. "
+            "Ingestão prossegue apenas com vetor denso para este run.",
+            collection_name,
+            exc,
+        )
 
     manifest_cache = await _load_manifest_cache(redis, manifest_key)
     failures_cache = await _load_failures_cache(redis, failures_key)
