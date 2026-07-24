@@ -38,6 +38,7 @@ import json
 import logging
 import re
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -55,6 +56,7 @@ from app.core.config import settings
 from app.schemas.chat import ChatRequest, ChatResponse, RetrievedChunk
 from app.services.ai.embedding_service import embed_text
 from app.services.ai.session_service import build_messages_for_llm, save_turn
+from app.services.ai.sparse_vector_service import SPARSE_VECTOR_NAME, build_sparse_vector
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +87,38 @@ _DECOMPOSITION_TIMEOUT: float = 12.0
 # FlashRank: modelo Cross-Encoder embutido (baixa latência, sem GPU)
 # Sobrescrito em runtime por settings.rag_reranker_model
 _FLASHRANK_MODEL: str = "ms-marco-MiniLM-L-12-v2"
+
+
+# ---------------------------------------------------------------------------
+# Estrutura de dados — saída tipada de decompose_query
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DecomposedQuery:
+    """
+    Saída tipada da Fase 1 (Query Decomposition).
+
+    Attributes:
+        translated_query: Tradução literal em inglês técnico da pergunta
+            original do usuário — a âncora usada como substituta da query
+            original em todas as buscas (nunca vazia; cai para a pergunta
+            original em PT-BR apenas no caso extremo de falha total de
+            tradução, ver decompose_query).
+        sub_queries: Até 3 sub-queries técnicas adicionais, cada uma
+            otimizada para recuperar um conjunto específico de chunks via
+            similaridade semântica (pode ser vazia).
+        keywords_exact: Até `settings.rag_decomposition_max_keywords`
+            identificadores técnicos plausíveis em C++/UE5 (ex:
+            "ACharacter", "AddMovementInput", "UPROPERTY"), usados como
+            âncora do canal esparso (BM25-like) na busca híbrida — ver
+            retrieve_chunks_for_query/_hybrid_search. Pode ser vazia, caso
+            em que o retrieval cai automaticamente para busca densa pura.
+    """
+
+    translated_query: str
+    sub_queries: list[str] = field(default_factory=list)
+    keywords_exact: list[str] = field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # System Prompt principal — especializado em Unreal Engine 5
@@ -133,14 +167,22 @@ cross-lingual contra o corpus e recupera chunks ruins ou nenhum chunk. \
 Por isso NENHUMA query em português pode ser usada para embedding — \
 inclusive a "query 0" (tradução literal) abaixo.
 
-Sua função tem DUAS partes:
+Sua função tem TRÊS partes:
 1. TRADUÇÃO LITERAL (query 0): traduza a pergunta do usuário para inglês \
 técnico da forma mais fiel possível, preservando a intenção original sem \
 reformular ou expandir. Esta é a âncora usada como substituta da query \
 original nas buscas.
 2. SUB-QUERIES TÉCNICAS (1 a 3 adicionais): decomponha em sub-queries \
 técnicas e concisas, cada uma otimizada para recuperar um conjunto \
-específico de chunks via similaridade semântica.
+específico de chunks via similaridade semântica (busca DENSA/vetorial).
+3. KEYWORDS EXATAS (até 6): extraia identificadores técnicos EXATOS e \
+plausíveis em C++/UE5 mencionados ou implícitos na pergunta — nomes de \
+classe, função, macro ou propriedade tal como apareceriam no código-fonte \
+(ex: "ACharacter", "AddMovementInput", "UPROPERTY", "UMovementComponent"). \
+Estas keywords alimentam um canal de busca ESPARSO (BM25-like) que \
+complementa a busca vetorial, priorizando match exato de identificador \
+sobre similaridade semântica — essencial quando o usuário já sabe (ou o \
+contexto técnico implica) o nome exato de uma classe/função da Engine.
 
 REGRAS ESTRITAS:
 1. "translated_query" é OBRIGATÓRIA em todo resultado — é a tradução \
@@ -152,28 +194,80 @@ tudo).
 focada em um único conceito ou tarefa da UE5.
 4. Use terminologia UE5 precisa: ACharacter, UMovementComponent, AnimBlueprint, \
 AnimInstance, BlueprintCallable, UFUNCTION, etc.
-5. NÃO inclua explicações, numeração ou texto extra. Retorne APENAS JSON válido.
-6. Formato de saída OBRIGATÓRIO (JSON puro, sem markdown, sem texto extra):
-{"translated_query": "tradução literal em inglês", "sub_queries": ["query técnica 1", "query técnica 2"]}
+5. Gere no MÁXIMO 6 "keywords_exact". Só inclua identificadores plausíveis \
+de existir literalmente no código/documentação (convenção de prefixo UE5: \
+A=Actor, U=UObject/Component, F=struct, E=enum, I=interface). Se a \
+pergunta for genérica demais para sugerir identificadores exatos (ex: \
+"como funciona renderização no UE5?"), retorne uma lista vazia — não invente.
+6. NÃO inclua explicações, numeração ou texto extra. Retorne APENAS JSON válido.
+7. Formato de saída OBRIGATÓRIO (JSON puro, sem markdown, sem texto extra):
+{"translated_query": "tradução literal em inglês", "sub_queries": ["query técnica 1", "query técnica 2"], "keywords_exact": ["Identifier1", "Identifier2"]}
 
 EXEMPLOS:
 
 Pergunta: "Como programar o pulo em C++ e configurar a animação de salto?"
-Saída: {"translated_query": "How to program jumping in C++ and set up the jump animation?", "sub_queries": ["ACharacter Jump input binding C++ AddMovementInput", "UE5 Animation Blueprint state machine jump transition", "AnimNotify jump landing C++ Blueprint integration"]}
+Saída: {"translated_query": "How to program jumping in C++ and set up the jump animation?", "sub_queries": ["ACharacter Jump input binding C++ AddMovementInput", "UE5 Animation Blueprint state machine jump transition", "AnimNotify jump landing C++ Blueprint integration"], "keywords_exact": ["ACharacter", "AddMovementInput", "Jump", "AnimNotify", "UCharacterMovementComponent"]}
 
 Pergunta: "O que é o Lumen e como ativar GI global no UE5?"
-Saída: {"translated_query": "What is Lumen and how to enable global GI in UE5?", "sub_queries": ["Lumen Global Illumination system UE5 architecture", "enable dynamic global illumination Lumen project settings"]}
+Saída: {"translated_query": "What is Lumen and how to enable global GI in UE5?", "sub_queries": ["Lumen Global Illumination system UE5 architecture", "enable dynamic global illumination Lumen project settings"], "keywords_exact": ["Lumen"]}
 
 Pergunta: "Como usar Niagara para efeitos de partícula de fogo?"
-Saída: {"translated_query": "How to use Niagara for fire particle effects?", "sub_queries": ["Niagara particle system fire emitter UE5 setup"]}
+Saída: {"translated_query": "How to use Niagara for fire particle effects?", "sub_queries": ["Niagara particle system fire emitter UE5 setup"], "keywords_exact": ["Niagara", "UNiagaraComponent"]}
 """
+
+
+# ---------------------------------------------------------------------------
+# Client HTTP compartilhado — decomposição/tradução de queries
+# ---------------------------------------------------------------------------
+# CORREÇÃO (ALTO — connection pooling ausente): decompose_query costumava
+# abrir um httpx.AsyncClient NOVO a cada chamada (dentro de
+# _call_decomposition_model), pagando handshake TCP/TLS do zero em toda
+# requisição de chat — o mesmo problema que já tinha sido corrigido para
+# call_litellm (ver _litellm_client/init_litellm_client acima). Agora
+# reutilizamos um client singleton com connection pooling, inicializado no
+# lifespan do FastAPI (ver main.py) junto dos demais clients HTTP da app.
+_decomposition_client: httpx.AsyncClient | None = None
+
+
+async def init_decomposition_client() -> httpx.AsyncClient:
+    """
+    Cria o client HTTP compartilhado para chamadas de decomposição/tradução
+    de query ao LiteLLM. Deve ser chamado no lifespan startup do FastAPI.
+    """
+    global _decomposition_client
+    decomp_timeout = getattr(settings, "rag_decomposition_timeout", _DECOMPOSITION_TIMEOUT)
+    _decomposition_client = httpx.AsyncClient(
+        base_url=settings.litellm_base_url,
+        headers=settings.litellm_headers,
+        timeout=httpx.Timeout(connect=5.0, read=decomp_timeout, write=5.0, pool=5.0),
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    )
+    log.info("Client HTTP do LiteLLM (decomposição de queries) inicializado.")
+    return _decomposition_client
+
+
+async def close_decomposition_client() -> None:
+    """Fecha o client HTTP compartilhado de decomposição. Chamado no shutdown."""
+    global _decomposition_client
+    if _decomposition_client:
+        await _decomposition_client.aclose()
+        _decomposition_client = None
+        log.info("Client HTTP do LiteLLM (decomposição de queries) encerrado.")
+
+
+def _get_decomposition_client() -> httpx.AsyncClient:
+    if _decomposition_client is None:
+        raise RuntimeError(
+            "Client HTTP de decomposição não inicializado. Verifique o lifespan."
+        )
+    return _decomposition_client
 
 
 # ---------------------------------------------------------------------------
 # FASE 1 — Query Decomposition
 # ---------------------------------------------------------------------------
 
-async def decompose_query(user_question: str) -> list[str]:
+async def decompose_query(user_question: str) -> DecomposedQuery:
     """
     Traduz a query do usuário para inglês técnico e a decompõe em sub-queries
     técnicas para busca vetorial.
@@ -198,15 +292,15 @@ async def decompose_query(user_question: str) -> list[str]:
         user_question: Pergunta original do usuário.
 
     Returns:
-        Lista de queries em inglês para busca vetorial: [tradução_literal,
-        *sub_queries_técnicas], sem duplicatas. Só contém texto em português
-        no caso extremo de falha total de tradução (ver NOTA acima).
+        DecomposedQuery com translated_query (nunca vazia — só contém texto
+        em português no caso extremo de falha total de tradução, ver NOTA
+        acima), sub_queries (sem duplicatas da tradução) e keywords_exact
+        (identificadores técnicos exatos para o canal esparso da busca
+        híbrida — pode ser vazia).
     """
     # Lê configurações em runtime para permitir override sem recompilação
     decomp_model = getattr(settings, "rag_decomposition_model", _DECOMPOSITION_MODEL)
-    decomp_timeout = getattr(settings, "rag_decomposition_timeout", _DECOMPOSITION_TIMEOUT)
 
-    url = f"{settings.litellm_base_url}/chat/completions"
     payload = {
         "model": decomp_model,
         "messages": [
@@ -226,22 +320,15 @@ async def decompose_query(user_question: str) -> list[str]:
     # e erro de conexão são justamente os casos mais comuns de falha
     # transitória. Agora QUALQUER falha do modelo principal tenta o
     # fallback antes de degradar.
+    #
+    # CORREÇÃO (connection pooling): usa o client HTTP singleton
+    # (_decomposition_client, ver init_decomposition_client) em vez de
+    # abrir um httpx.AsyncClient novo a cada chamada.
     async def _call_decomposition_model(model_name: str) -> str:
         request_payload = {**payload, "model": model_name}
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                connect=5.0,
-                read=decomp_timeout,
-                write=5.0,
-                pool=5.0,
-            )
-        ) as client:
-            resp = await client.post(
-                url,
-                json=request_payload,
-                headers=settings.litellm_headers,
-            )
-            resp.raise_for_status()
+        client = _get_decomposition_client()
+        resp = await client.post("/chat/completions", json=request_payload)
+        resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 
@@ -269,34 +356,47 @@ async def decompose_query(user_question: str) -> list[str]:
                 _DECOMPOSITION_MODEL_FALLBACK,
                 fallback_exc,
             )
-            return [user_question]
+            return DecomposedQuery(translated_query=user_question, sub_queries=[], keywords_exact=[])
 
     # --- Parse robusto da resposta JSON ---
-    translated_query, sub_queries = _parse_decomposition_response(raw_content, user_question)
+    translated_query, sub_queries, keywords_exact = _parse_decomposition_response(
+        raw_content, user_question
+    )
 
     # A tradução literal em inglês é a âncora da busca — NUNCA a query
     # original em português (ver docstring desta função para o porquê).
-    all_queries: list[str] = [translated_query]
+    deduped_sub_queries: list[str] = []
     for sq in sub_queries:
         sq_stripped = sq.strip()
         # Evita duplicar a tradução se o modelo a devolveu idêntica
         if sq_stripped and sq_stripped.lower() != translated_query.lower():
-            all_queries.append(sq_stripped)
+            deduped_sub_queries.append(sq_stripped)
+
+    max_keywords = getattr(settings, "rag_decomposition_max_keywords", 6)
+    clean_keywords = [kw.strip() for kw in keywords_exact if isinstance(kw, str) and kw.strip()]
+    clean_keywords = clean_keywords[:max_keywords]
 
     log.info(
-        "Query traduzida e decomposta em %d queries | tradução + %d sub-queries",
-        len(all_queries),
-        len(all_queries) - 1,
+        "Query traduzida e decomposta | tradução + %d sub-queries + %d keywords_exact",
+        len(deduped_sub_queries),
+        len(clean_keywords),
     )
-    for i, q in enumerate(all_queries):
-        log.debug("  Query[%d]: %s", i, q)
+    log.debug("  Tradução: %s", translated_query)
+    for i, q in enumerate(deduped_sub_queries):
+        log.debug("  Sub-query[%d]: %s", i, q)
+    if clean_keywords:
+        log.debug("  Keywords exatas: %s", clean_keywords)
 
-    return all_queries
+    return DecomposedQuery(
+        translated_query=translated_query,
+        sub_queries=deduped_sub_queries,
+        keywords_exact=clean_keywords,
+    )
 
 
 def _parse_decomposition_response(
     raw: str, fallback_query: str
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], list[str]]:
     """
     Parser ultra-robusto para a saída do modelo de decomposição/tradução.
 
@@ -305,7 +405,8 @@ def _parse_decomposition_response(
     2. Extração de bloco JSON via regex (se o modelo envolveu em markdown)
     3. Extração de JSON embutido sem markdown
     4. Extração de lista simples via regex de aspas (sem 'translated_query'
-       confiável — usa a primeira string extraída como tradução aproximada)
+       confiável — usa a primeira string extraída como tradução aproximada;
+       sem keywords_exact confiáveis nesta estratégia — retorna vazio)
     5. Fallback total: 'fallback_query' (PT-BR) como tradução — só ocorre se
        TODAS as estratégias de parse falharem, e é logado como erro alto,
        nunca como comportamento silencioso esperado.
@@ -316,8 +417,11 @@ def _parse_decomposition_response(
             nenhuma tradução puder ser extraída da resposta do modelo.
 
     Returns:
-        Tupla (translated_query, sub_queries). translated_query nunca é
-        vazia — cai para fallback_query apenas se o parse falhar por completo.
+        Tupla (translated_query, sub_queries, keywords_exact).
+        translated_query nunca é vazia — cai para fallback_query apenas se
+        o parse falhar por completo. keywords_exact pode ser vazia em
+        qualquer estratégia — ausência de identificadores exatos é um
+        resultado válido, não uma falha de parse.
     """
     raw = raw.strip()
     if not raw:
@@ -325,17 +429,22 @@ def _parse_decomposition_response(
             "Decomposição: resposta vazia do LLM. Usando query original como "
             "tradução — sem tradução real disponível para esta requisição."
         )
-        return fallback_query, []
+        return fallback_query, [], []
 
-    def _extract(parsed: dict[str, Any]) -> tuple[str, list[str]] | None:
+    def _extract(parsed: dict[str, Any]) -> tuple[str, list[str], list[str]] | None:
         translated = parsed.get("translated_query")
         queries = parsed.get("sub_queries", [])
         if not isinstance(queries, list) or not all(isinstance(q, str) for q in queries):
             queries = []
         clean_queries = [q for q in queries if isinstance(q, str) and q.strip()]
 
+        keywords = parsed.get("keywords_exact", [])
+        if not isinstance(keywords, list) or not all(isinstance(k, str) for k in keywords):
+            keywords = []
+        clean_keywords = [k for k in keywords if isinstance(k, str) and k.strip()]
+
         if isinstance(translated, str) and translated.strip():
-            return translated.strip(), clean_queries
+            return translated.strip(), clean_queries, clean_keywords
 
         # Campo 'translated_query' ausente/inválido: modelo pode ter usado
         # formato antigo (só sub_queries). Reaproveita a primeira sub-query
@@ -346,7 +455,7 @@ def _parse_decomposition_response(
                 "modelo. Reaproveitando primeira sub-query como tradução "
                 "aproximada."
             )
-            return clean_queries[0], clean_queries[1:]
+            return clean_queries[0], clean_queries[1:], clean_keywords
 
         return None
 
@@ -389,7 +498,7 @@ def _parse_decomposition_response(
             "Primeira string extraída assumida como tradução aproximada. raw=%r",
             raw[:120],
         )
-        return quoted_queries[0], quoted_queries[1:]
+        return quoted_queries[0], quoted_queries[1:], []
 
     log.error(
         "Decomposição: impossível parsear resposta do LLM em nenhum formato. "
@@ -397,7 +506,7 @@ def _parse_decomposition_response(
         "cross-lingual esperado para esta requisição. raw=%r",
         raw[:200],
     )
-    return fallback_query, []
+    return fallback_query, [], []
 
 
 # ---------------------------------------------------------------------------
@@ -442,14 +551,80 @@ def _build_project_source_filter(
 # FASE 2.1 — Busca Expandida no Qdrant
 # ---------------------------------------------------------------------------
 
+async def _hybrid_search(
+    qdrant: AsyncQdrantClient,
+    query_vector: list[float],
+    keywords_text: str,
+    limit: int,
+    query_filter: qdrant_models.Filter | None,
+) -> list[qdrant_models.ScoredPoint]:
+    """
+    Busca híbrida (Dense + Sparse/BM25-like) fundida via Reciprocal Rank
+    Fusion (RRF), tudo resolvido na própria camada do Qdrant via
+    `query_points` com dois `Prefetch`:
+
+    1. Denso — usa o vetor denso não-nomeado (chave "", mesmo esquema já
+       usado antes da migração híbrida).
+    2. Esparso — usa `sparse_vector_service.build_sparse_vector(keywords_text)`
+       no espaço nomeado `keywords_sparse` (ver
+       ingestion_service.ensure_sparse_vectors_enabled).
+
+    Propaga o mesmo `query_filter` (procedência via project_source) para os
+    dois Prefetches, para que a restrição valha igualmente nos dois canais
+    antes da fusão.
+
+    Não trata exceções aqui — deixa o chamador (retrieve_chunks_for_query)
+    decidir o fallback (busca densa pura) quando esta função falhar, por
+    exemplo numa coleção legada ainda não migrada para o espaço esparso.
+    """
+    sparse_vector = build_sparse_vector(keywords_text)
+
+    prefetch = [
+        qdrant_models.Prefetch(
+            query=query_vector,
+            using="",
+            limit=limit,
+            filter=query_filter,
+        ),
+        qdrant_models.Prefetch(
+            query=sparse_vector,
+            using=SPARSE_VECTOR_NAME,
+            limit=limit,
+            filter=query_filter,
+        ),
+    ]
+
+    response = await qdrant.query_points(
+        collection_name=settings.qdrant_collection,
+        prefetch=prefetch,
+        query=qdrant_models.FusionQuery(fusion=qdrant_models.Fusion.RRF),
+        limit=limit,
+        with_payload=True,
+        query_filter=query_filter,
+    )
+    return response.points
+
+
 async def retrieve_chunks_for_query(
     qdrant: AsyncQdrantClient,
     query_vector: list[float],
     limit: int,
     project_source_filter: str | None = None,
+    keywords_exact: list[str] | None = None,
 ) -> list[RetrievedChunk]:
     """
-    Executa uma única busca vetorial no Qdrant com limite expandido.
+    Executa uma única busca no Qdrant com limite expandido.
+
+    BUSCA HÍBRIDA (Dense + Sparse via RRF): quando `keywords_exact` traz ao
+    menos um identificador utilizável E `settings.rag_hybrid_search_enabled`
+    está ligado (kill-switch), a busca combina o vetor denso com um vetor
+    esparso BM25-like construído a partir dos identificadores exatos (ver
+    `_hybrid_search`), fundindo os dois rankings via Reciprocal Rank Fusion
+    direto no Qdrant. Sem keywords utilizáveis (ou com o kill-switch
+    desligado, ou se a busca híbrida falhar — ex: coleção legada ainda sem
+    o espaço esparso migrado), cai transparentemente para a busca densa
+    pura de sempre — o comportamento é idêntico ao pré-hybrid para quem não
+    passa `keywords_exact`.
 
     Não aplica score_threshold aqui — o reranker vai cuidar da qualidade.
     Threshold é aplicado apenas se o reranker não estiver disponível.
@@ -469,20 +644,55 @@ async def retrieve_chunks_for_query(
         project_source_filter: Se informado, restringe a busca a pontos com
             esse valor exato no campo `project_source` do payload. None
             (padrão) busca em todo o corpus, sem restrição de procedência.
+        keywords_exact: Identificadores técnicos exatos extraídos pelo
+            decompositor (ver DecomposedQuery.keywords_exact). Quando
+            presentes, ativam o canal esparso da busca híbrida.
 
     Returns:
         Lista de RetrievedChunk, possivelmente vazia se Qdrant falhar.
     """
     query_filter = _build_project_source_filter(project_source_filter)
+
+    hybrid_enabled = getattr(settings, "rag_hybrid_search_enabled", True)
+    usable_keywords = [kw.strip() for kw in (keywords_exact or []) if kw and kw.strip()]
+
     try:
-        results = await qdrant.search(
-            collection_name=settings.qdrant_collection,
-            query_vector=query_vector,
-            limit=limit,
-            with_payload=True,
-            query_filter=query_filter,
-            # Sem score_threshold aqui — deixamos o reranker filtrar a qualidade
-        )
+        if hybrid_enabled and usable_keywords:
+            try:
+                results = await _hybrid_search(
+                    qdrant=qdrant,
+                    query_vector=query_vector,
+                    keywords_text=" ".join(usable_keywords),
+                    limit=limit,
+                    query_filter=query_filter,
+                )
+                log.debug(
+                    "Busca híbrida (RRF) OK | %d keywords_exact | %d resultados",
+                    len(usable_keywords),
+                    len(results),
+                )
+            except Exception as hybrid_exc:
+                log.warning(
+                    "Busca híbrida (RRF) falhou (%s). Fallback transparente "
+                    "para busca densa pura nesta query.",
+                    hybrid_exc,
+                )
+                results = await qdrant.search(
+                    collection_name=settings.qdrant_collection,
+                    query_vector=query_vector,
+                    limit=limit,
+                    with_payload=True,
+                    query_filter=query_filter,
+                )
+        else:
+            results = await qdrant.search(
+                collection_name=settings.qdrant_collection,
+                query_vector=query_vector,
+                limit=limit,
+                with_payload=True,
+                query_filter=query_filter,
+                # Sem score_threshold aqui — deixamos o reranker filtrar a qualidade
+            )
         log.debug("Recebidos %d resultados do Qdrant.", len(results))
         if results:
             log.debug("Payload de exemplo (1º resultado): %s", results[0].payload)
@@ -1241,18 +1451,24 @@ async def _run_advanced_retrieval(
     # de embedding, mas eliminamos a busca cross-lingual garantida em toda requisição.
     log.info("Advanced RAG: traduzindo e decompondo a query...")
 
-    all_queries = await decompose_query(user_question)
-    translated_query = all_queries[0]
-    sub_queries = all_queries[1:]
+    decomposed = await decompose_query(user_question)
+    translated_query = decomposed.translated_query
+    sub_queries = decomposed.sub_queries
+    keywords_exact = decomposed.keywords_exact
 
     log.info(
-        "Buscando no Qdrant: 1 query traduzida + %d sub-queries em paralelo...",
+        "Buscando no Qdrant: 1 query traduzida + %d sub-queries em paralelo "
+        "(%d keywords_exact para o canal esparso)...",
         len(sub_queries),
+        len(keywords_exact),
     )
 
     # Todas as queries (tradução + sub-queries) são embedadas e buscadas em
     # paralelo entre si — nenhuma delas está em português neste ponto, exceto
     # no caso extremo de falha total de tradução (ver decompose_query).
+    # As mesmas keywords_exact (extraídas uma vez para a pergunta inteira)
+    # são propagadas a TODAS as buscas paralelas — ativam o canal esparso
+    # da busca híbrida em cada uma (ver retrieve_chunks_for_query).
     retrieval_tasks: list[asyncio.Task] = [
         asyncio.create_task(
             _embed_and_retrieve(
@@ -1260,6 +1476,7 @@ async def _run_advanced_retrieval(
                 qdrant,
                 retrieval_limit,
                 project_source_filter=project_source_filter,
+                keywords_exact=keywords_exact,
             )
         )
     ]
@@ -1272,6 +1489,7 @@ async def _run_advanced_retrieval(
                     qdrant,
                     retrieval_limit,
                     project_source_filter=project_source_filter,
+                    keywords_exact=keywords_exact,
                 )
             )
         )
@@ -1384,6 +1602,7 @@ async def _embed_and_retrieve(
     qdrant: AsyncQdrantClient,
     limit: int,
     project_source_filter: str | None = None,
+    keywords_exact: list[str] | None = None,
 ) -> list[RetrievedChunk]:
     """
     Função helper: gera embedding de uma query e busca no Qdrant.
@@ -1399,6 +1618,8 @@ async def _embed_and_retrieve(
         limit: Número máximo de chunks a recuperar.
         project_source_filter: Repassado para retrieve_chunks_for_query —
             restringe a busca por procedência quando informado (Correção 1).
+        keywords_exact: Repassado para retrieve_chunks_for_query — ativa o
+            canal esparso da busca híbrida quando presente.
 
     Returns:
         Lista de RetrievedChunk, ou lista vazia em caso de falha.
@@ -1406,7 +1627,11 @@ async def _embed_and_retrieve(
     try:
         vector = await embed_text(query)
         return await retrieve_chunks_for_query(
-            qdrant, vector, limit, project_source_filter=project_source_filter
+            qdrant,
+            vector,
+            limit,
+            project_source_filter=project_source_filter,
+            keywords_exact=keywords_exact,
         )
     except Exception as exc:
         log.warning("Falha ao processar sub-query '%s': %s", query[:60], exc)
