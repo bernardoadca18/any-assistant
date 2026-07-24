@@ -14,6 +14,12 @@ Arquitetura de chamadas de modelo (toda via LiteLLM):
 O campo ollama_base_url foi removido do FastAPI — não é mais necessário
 porque o FastAPI nunca chama o Ollama diretamente. Toda comunicação com
 modelos passa pelo LiteLLM proxy, que já tem o Ollama configurado.
+
+Persistência (adicionado): Postgres é a fonte de verdade durável do
+histórico de chat (sessões/mensagens/chunks citados) — ver app/db/postgres.py
+e app/services/db/session_service.py. O Redis segue existindo, sem
+mudanças, como cache de curto prazo do contexto multi-turn usado para
+montar o prompt (app/services/ai/session_service.py).
 """
 
 from functools import lru_cache
@@ -63,6 +69,24 @@ class Settings(BaseSettings):
     @property
     def redis_url(self) -> str:
         return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
+
+    # --- Postgres (Persistência durável do histórico) -------------------------
+    # Fonte de verdade de sessões/mensagens/chunks citados — ver
+    # app/db/postgres.py e app/services/db/session_service.py. Diferente do
+    # Redis acima (cache de curto prazo do contexto do LLM), aqui os dados
+    # nunca expiram sozinhos.
+    postgres_host: str = "agent-postgres"
+    postgres_port: int = 5432
+    postgres_user: str = "ue5rag"
+    postgres_password: str = Field(..., description="Senha do Postgres do agente — obrigatória")
+    postgres_db: str = "ue5_rag_assistant"
+
+    @property
+    def database_url(self) -> str:
+        return (
+            f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
 
     # --- LiteLLM Proxy -------------------------------------------------------
     # Ponto único de entrada para TODOS os modelos: LLM + embeddings + decomposição.

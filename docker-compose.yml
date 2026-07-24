@@ -16,6 +16,11 @@ volumes:
     name: agent-redis-data
     labels:
       description: "Redis for agent session memory and conversation history"
+  agent-postgres-data:
+    name: agent-postgres-data
+    labels:
+      description: "Postgres — persistência durável do histórico de chat/mensagens do agente UE5"
+
 
 services:
 
@@ -56,16 +61,7 @@ services:
     deploy:
       resources:
         limits:
-          # CORREÇÃO: 1G era baixo demais para a carga de escrita em lote
-          # da migração de coleção (~40k+ pontos, vetor denso 1024-dim +
-          # esparso, múltiplos segmentos abertos simultaneamente) — o
-          # kernel matava o processo com SIGKILL (OOM killer do cgroup,
-          # visível no log como "Killed" sem nenhuma mensagem de erro do
-          # próprio Qdrant antes). 4G dá folga suficiente para esse volume
-          # de dados; ajuste para baixo depois que a migração terminar, se
-          # quiser economizar memória em regime de operação normal
-          # (retrieval puro usa bem menos que ingestão/migração em lote).
-          memory: 4G
+          memory: 1G
         reservations:
           memory: 1G
 
@@ -128,6 +124,38 @@ services:
       resources:
         limits:
           memory: 128M
+  # ---------------------------------------------------------------------------
+  # POSTGRES — Persistência durável de sessões, mensagens e chunks citados
+  # (fonte de verdade do histórico de chat; o Redis acima segue existindo
+  # como cache de curto prazo do contexto recente por sessão)
+  # ---------------------------------------------------------------------------
+  agent-postgres:
+    image: postgres:16-alpine
+    container_name: ue5-agent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${AGENT_POSTGRES_USER:-ue5rag}
+      POSTGRES_PASSWORD: ${AGENT_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${AGENT_POSTGRES_DB:-ue5_rag_assistant}
+      LANG: en_US.utf8
+    volumes:
+      - agent-postgres-data:/var/lib/postgresql/data
+      # Scripts aqui rodam automaticamente (ordem alfabética), só na
+      # primeira inicialização do volume — ver 001_init_schema.sql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    expose:
+      - "5432"
+    networks:
+      - assistant_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AGENT_POSTGRES_USER:-ue5rag} -d ${AGENT_POSTGRES_DB:-ue5_rag_assistant}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
   # ---------------------------------------------------------------------------
   # FASTAPI — UE5 AI Agent Service
@@ -150,6 +178,12 @@ services:
       REDIS_HOST: agent-redis
       REDIS_PORT: "6379"
       REDIS_PASSWORD: ${AGENT_REDIS_PASSWORD}
+      POSTGRES_HOST: agent-postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${AGENT_POSTGRES_USER:-ue5rag}
+      POSTGRES_PASSWORD: ${AGENT_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${AGENT_POSTGRES_DB:-ue5_rag_assistant}
+      DATABASE_URL: "postgresql+asyncpg://${AGENT_POSTGRES_USER:-ue5rag}:${AGENT_POSTGRES_PASSWORD}@agent-postgres:5432/${AGENT_POSTGRES_DB:-ue5_rag_assistant}"
       LITELLM_BASE_URL: "http://litellm-proxy:4000"
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-ollama-embed}
@@ -160,6 +194,8 @@ services:
       qdrant-healthcheck:
         condition: service_healthy
       agent-redis:
+        condition: service_healthy
+      agent-postgres:
         condition: service_healthy
     networks:
       - assistant_internal

@@ -1819,3 +1819,194 @@ async def run_rag_pipeline(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
     )
+    
+
+async def call_litellm_stream(
+    messages: list[dict],
+    model: str,
+):
+    """
+    Chama o LiteLLM em modo streaming (SSE, formato OpenAI-compatible) e
+    faz yield de cada pedaço de texto (delta) assim que chega.
+ 
+    Yields:
+        str — pedaço de texto (pode ser vazio, pular nesse caso).
+ 
+    Ao final, deixa disponível via atributo do generator (`.prompt_tokens`,
+    `.completion_tokens`) os valores de usage, SE o provider os enviar —
+    ver run_rag_pipeline_stream para como isso é lido.
+ 
+    Raises:
+        RuntimeError: erro HTTP na abertura da conexão (mesmo tratamento
+            de call_litellm — sem retry automático depois que o stream
+            já começou a chegar, para não duplicar tokens já emitidos).
+    """
+    client = _get_litellm_client()
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": 2048,
+        "stream": True,
+        "stream_options": {"include_usage": True},  # OpenAI-compatible; ignorado se o backend não suportar
+    }
+ 
+    try:
+        async with client.stream("POST", "/chat/completions", json=payload) as response:
+            response.raise_for_status()
+ 
+            usage: dict = {}
+            async for line in response.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line.removeprefix("data:").strip()
+                if data_str == "[DONE]":
+                    break
+ 
+                try:
+                    chunk = _json.loads(data_str)
+                except _json.JSONDecodeError:
+                    log.warning("Chunk SSE não-JSON ignorado do LiteLLM: %r", data_str[:200])
+                    continue
+ 
+                choices = chunk.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        yield content
+ 
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+ 
+            call_litellm_stream.last_usage = usage  # type: ignore[attr-defined]
+ 
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(
+            f"LiteLLM retornou HTTP {exc.response.status_code} (model={model}, stream=True): "
+            f"{exc.response.text[:300]}"
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(
+            f"Timeout ao chamar LiteLLM em modo streaming (model={model})."
+        ) from exc
+ 
+ 
+async def run_rag_pipeline_stream(
+    request: ChatRequest,
+    qdrant: AsyncQdrantClient,
+    redis: Redis,
+):
+    """
+    Versão streaming de run_rag_pipeline(). Mesma Fase 1 (decomposição) +
+    Fase 2 (retrieval expandido + reranking) + mesmo fallback Naive RAG —
+    só a Fase 3 (geração) muda para streaming.
+ 
+    Yields eventos no formato consumido por
+    app/api/v1/endpoints/chat.py::_stream_chat_response:
+ 
+        {"type": "sources", "retrieved_chunks": [RetrievedChunk, ...]}
+        {"type": "token", "content": "..."}
+        {"type": "done", "model_used", "prompt_tokens", "completion_tokens"}
+ 
+    Não levanta exceção para o chamador em caso de falha do LLM depois que
+    o retrieval já deu certo — nesse caso levanta RuntimeError normalmente
+    (igual run_rag_pipeline), e quem trata isso é o endpoint (persiste como
+    mensagem de erro e emite {"type": "error", ...} via SSE).
+    """
+    log.info(
+        "Advanced RAG pipeline (stream) | session=%s model=%s top_k=%d",
+        request.session_id,
+        request.model,
+        request.top_k,
+    )
+ 
+    effective_top_k = max(request.top_k, 8)
+    project_source_filter = request.project_source_filter
+ 
+    # -------------------------------------------------------------------
+    # FASE 1 + 2 — idêntico a run_rag_pipeline (retrieval + fallback naive)
+    # -------------------------------------------------------------------
+    chunks: list[RetrievedChunk] = []
+    pipeline_used = "advanced"
+ 
+    try:
+        chunks = await _run_advanced_retrieval(
+            user_question=request.message,
+            qdrant=qdrant,
+            top_k=effective_top_k,
+            project_source_filter=project_source_filter,
+        )
+    except Exception as exc:
+        log.warning(
+            "Advanced RAG (stream) falhou com erro inesperado: %s. Fazendo fallback para Naive RAG.",
+            exc,
+            exc_info=True,
+        )
+        pipeline_used = "naive_fallback"
+        try:
+            original_vector = await embed_text(request.message)
+            chunks = await retrieve_chunks(
+                qdrant, original_vector, effective_top_k, project_source_filter=project_source_filter
+            )
+        except RuntimeError as naive_exc:
+            log.error("Naive RAG fallback (stream) também falhou: %s", naive_exc)
+            raise
+ 
+    log.info("Retrieval (stream) concluído | pipeline=%s chunks=%d", pipeline_used, len(chunks))
+ 
+    if chunks:
+        chunks = await _backfill_raw_content(qdrant, chunks)
+ 
+    yield {"type": "sources", "retrieved_chunks": chunks}
+ 
+    # -------------------------------------------------------------------
+    # FASE 3 — geração via streaming
+    # -------------------------------------------------------------------
+    context = _format_context(chunks)
+    augmented_user_message = _build_augmented_message(request.message, context)
+ 
+    messages = await build_messages_for_llm(
+        redis=redis,
+        session_id=request.session_id,
+        user_message=augmented_user_message,
+        system_prompt=_SYSTEM_PROMPT,
+    )
+ 
+    full_answer_parts: list[str] = []
+    async for token in call_litellm_stream(messages=messages, model=request.model):
+        full_answer_parts.append(token)
+        yield {"type": "token", "content": token}
+ 
+    full_answer = "".join(full_answer_parts)
+    usage = getattr(call_litellm_stream, "last_usage", {}) or {}
+ 
+    # -------------------------------------------------------------------
+    # PERSISTÊNCIA — mesmo save_turn do caminho síncrono (Redis, contexto
+    # multi-turn). A persistência DURÁVEL (Postgres) é feita pelo endpoint
+    # depois que o generator termina — ver chat.py::_stream_chat_response.
+    # -------------------------------------------------------------------
+    await save_turn(
+        redis=redis,
+        session_id=request.session_id,
+        user_message=request.message,
+        assistant_reply=full_answer,
+        model_used=request.model,
+    )
+ 
+    log.info(
+        "Pipeline (stream) concluído | session=%s pipeline=%s chunks=%d tokens_in=%s tokens_out=%s",
+        request.session_id,
+        pipeline_used,
+        len(chunks),
+        usage.get("prompt_tokens"),
+        usage.get("completion_tokens"),
+    )
+ 
+    yield {
+        "type": "done",
+        "model_used": request.model,
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+    }
+ 
