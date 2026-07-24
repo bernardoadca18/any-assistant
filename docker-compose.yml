@@ -40,6 +40,19 @@ services:
       - "127.0.0.1:6334:6334"
     networks:
       - assistant_internal
+    # CORREÇÃO: o RocksDB (storage engine do Qdrant nesta versão) abre
+    # muitos arquivos simultâneos por segmento (.sst/.log/.dbtmp) — em
+    # cargas de escrita em lote (ex: migração de coleção, ingestão grande)
+    # isso estoura o limite padrão de file descriptors do container
+    # (geralmente 1024 no Docker Desktop/WSL2), travando o processo com
+    # "Too many open files (os error 24)" e deixando a collection num
+    # estado instável (segmentos que falharam no meio de um flush). Subimos
+    # o limite explicitamente — 65536 é uma folga generosa para o volume
+    # de segmentos gerado por uma coleção deste tamanho.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     deploy:
       resources:
         limits:
