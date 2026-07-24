@@ -140,6 +140,36 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Advanced RAG — Busca Híbrida (Dense + Sparse via RRF) ---------------
+    rag_hybrid_search_enabled: bool = Field(
+        default=True,
+        description=(
+            "Kill-switch da busca híbrida (Dense Vector + Sparse/BM25-like "
+            "via Reciprocal Rank Fusion — ver "
+            "rag_service.py::retrieve_chunks_for_query/_hybrid_search). "
+            "Desabilitar faz TODA busca cair para o caminho denso puro de "
+            "sempre, mesmo quando keywords_exact estiver disponível — útil "
+            "para isolar/reverter rapidamente o comportamento híbrido sem "
+            "precisar reverter deploy, ex: se o canal esparso introduzir "
+            "regressão de qualidade em produção."
+        ),
+    )
+    rag_decomposition_max_keywords: int = Field(
+        default=6,
+        ge=0,
+        le=20,
+        description=(
+            "Número máximo de identificadores técnicos (keywords_exact) "
+            "extraídos pelo decompositor de query por requisição — ver "
+            "_DECOMPOSITION_SYSTEM_PROMPT e DecomposedQuery.keywords_exact. "
+            "Essas keywords alimentam o canal esparso da busca híbrida. "
+            "0 desativa a extração de keywords_exact no efeito prático "
+            "(lista sempre truncada para vazia), fazendo toda busca cair "
+            "para o caminho denso puro sem precisar desligar "
+            "rag_hybrid_search_enabled."
+        ),
+    )
+
     # --- Advanced RAG — FlashRank Reranker -----------------------------------
     rag_reranker_enabled: bool = Field(
         default=True,
