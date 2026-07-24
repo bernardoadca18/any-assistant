@@ -1296,15 +1296,36 @@ async def ensure_sparse_vectors_enabled(
     _retry: int = 0,
 ) -> None:
     """
-    Migração idempotente e ADITIVA: adiciona o espaço de vetor esparso
-    'keywords_sparse' à coleção existente, sem tocar no vetor denso
-    já indexado (não-nomeado) nem nos payloads.
+    Tenta habilitar o espaço de vetor esparso 'keywords_sparse' numa coleção
+    já existente, via `update_collection` (PATCH /collections/{name}).
 
-    modifier=Modifier.IDF: os pontos guardam só term-frequency bruto
-    (ver build_sparse_vector); o Qdrant calcula e mantém a estatística de
-    IDF em nível de coleção internamente e aplica na hora da busca — não
-    precisamos calcular IDF manualmente nem re-processar a coleção toda
-    quando novos documentos entram.
+    modifier=Modifier.IDF: os pontos guardam só term-frequency bruto (ver
+    build_sparse_vector); o Qdrant calcula e mantém a estatística de IDF em
+    nível de coleção internamente e aplica na hora da busca.
+
+    LIMITAÇÃO REAL DO SERVIDOR (não é corrida entre workers — correção de
+    uma suposição anterior deste código): `update_collection` só permite
+    alterar PARÂMETROS de um vetor nomeado que JÁ EXISTE no schema (ex:
+    hnsw_config, quantization, on_disk). Adicionar um vetor NOMEADO NOVO
+    (denso ou esparso) a uma coleção que já existe, sem recriá-la, só é
+    suportado pelo Qdrant a partir da v1.18 ("Adding and Removing Named
+    Vectors" — ver release notes oficiais), via um endpoint dedicado
+    (`PUT /collections/{name}/vectors/{vector_name}`,
+    `client.create_vector_name()` no qdrant-client). Em qualquer versão
+    anterior, `update_collection` SEMPRE retorna
+    'Wrong input: Not existing vector name error: keywords_sparse' pra essa
+    operação — de forma consistente e determinística, não esporádica.
+
+    Por isso esta função:
+    1. Tenta o `update_collection` (funciona de primeira em Qdrant >= 1.18).
+    2. Se falhar com essa mensagem específica, trata como PERMANENTE — não
+       adianta re-tentar — loga um erro claro apontando o caminho de
+       migração real (ver app/scripts/migrate_to_hybrid_collection.py ou
+       upgrade do Qdrant) e retorna sem propagar exceção (não bloqueia o
+       startup da aplicação, igual ao caso "coleção não existe" abaixo).
+    3. Para qualquer OUTRA falha de `UnexpectedResponse` (ex: hiccup de
+       rede, indisponibilidade momentânea do Qdrant) — essas sim podem ser
+       transitórias — faz um retry curto com backoff antes de desistir.
 
     DEFENSIVO (chamável a qualquer momento, inclusive no startup do
     FastAPI antes de qualquer ingestão ter rodado): se a coleção ainda não
@@ -1314,19 +1335,6 @@ async def ensure_sparse_vectors_enabled(
     retornamos, já que o ingestor ainda vai criar a coleção (com o espaço
     esparso já habilitado desde o início, ver `_flush_batch`/upsert) na
     primeira execução.
-
-    RESILIENTE A CORRIDA ENTRE MÚLTIPLOS WORKERS: esta função é chamada no
-    lifespan startup do FastAPI (main.py) — se o Uvicorn/Gunicorn estiver
-    rodando com mais de 1 worker, TODOS os processos executam o lifespan de
-    forma independente e chamam esta função ao mesmo tempo. Cada um vê o
-    schema ainda sem 'keywords_sparse' e tenta criar o espaço
-    simultaneamente; o Qdrant pode rejeitar a escrita concorrente perdedora
-    com um 400 transitório ("Not existing vector name error: ...") enquanto
-    a escrita vencedora ainda está sendo aplicada. Isso NÃO é uma falha real
-    da migração — é uma leitura desatualizada da corrida. Em vez de desistir
-    na primeira falha, reconferimos o schema (pode ser que outro worker já
-    tenha terminado) e, se ainda não estiver lá, tentamos de novo com um
-    backoff curto, por até 5 tentativas.
     """
     collection_name = settings.qdrant_collection
 
@@ -1357,23 +1365,53 @@ async def ensure_sparse_vectors_enabled(
             },
         )
     except UnexpectedResponse as exc:
-        max_retries = 5
+        error_body = getattr(exc, "content", b"") or b""
+        error_text = (
+            error_body.decode("utf-8", errors="ignore")
+            if isinstance(error_body, (bytes, bytearray))
+            else str(error_body)
+        )
+
+        if "Not existing vector name error" in error_text:
+            log.error(
+                "MIGRAÇÃO ADITIVA NÃO SUPORTADA NESTA VERSÃO DO QDRANT: "
+                "adicionar o vetor nomeado '%s' a uma coleção JÁ EXISTENTE "
+                "sem recriá-la só funciona a partir do Qdrant v1.18 "
+                "('Adding and Removing Named Vectors'). Sua instância está "
+                "numa versão anterior a essa, então esta operação falha de "
+                "forma DETERMINÍSTICA (não é transitório — retentativas não "
+                "resolvem, por isso não vamos re-tentar). Duas opções: "
+                "(a) atualize a imagem do Qdrant em docker-compose.yml para "
+                ">= v1.18 — faça isso incrementalmente, uma minor version "
+                "por vez, pois a v1.17 trocou o storage engine (RocksDB -> "
+                "Gridstore) e pular versões pode quebrar o storage "
+                "existente; ou (b) rode "
+                "'app/scripts/migrate_to_hybrid_collection.py', que copia os "
+                "pontos existentes (SEM re-chamar a LLM documentadora nem "
+                "recalcular embeddings) para uma coleção nova já criada com "
+                "os dois espaços de vetor. Erro original do Qdrant: %s",
+                SPARSE_VECTOR_NAME,
+                error_text.strip(),
+            )
+            return
+
+        # Qualquer outra falha de UnexpectedResponse (rede, indisponibilidade
+        # momentânea) — aqui sim pode valer a pena um retry curto.
+        max_retries = 3
         if _retry >= max_retries:
             log.error(
-                "Falha definitiva ao habilitar sparse vector '%s' após %d "
-                "tentativas: %s",
+                "Falha ao habilitar sparse vector '%s' após %d tentativas "
+                "(erro não relacionado à limitação de versão do Qdrant): %s",
                 SPARSE_VECTOR_NAME,
                 max_retries,
                 exc,
             )
             raise
 
-        backoff_seconds = 0.5 * (2**_retry)  # 0.5s, 1s, 2s, 4s, 8s
+        backoff_seconds = 1.0 * (2**_retry)  # 1s, 2s, 4s
         log.warning(
-            "update_collection para '%s' falhou (%s) — provável corrida "
-            "entre múltiplos workers chamando a migração ao mesmo tempo no "
-            "startup. Retentativa %d/%d em %.1fs (reconferindo schema antes "
-            "de tentar de novo).",
+            "update_collection para '%s' falhou (%s) — tentando de novo "
+            "(%d/%d) em %.1fs.",
             SPARSE_VECTOR_NAME,
             exc,
             _retry + 1,
