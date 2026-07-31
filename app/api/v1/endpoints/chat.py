@@ -23,12 +23,14 @@ import json
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.responses import StreamingResponse
 from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
+from app.core.domains.registry import domain_registry
 from app.db.postgres import get_db_session
 from app.db.qdrant import get_qdrant_client
 from app.db.redis import get_redis_client
@@ -44,7 +46,7 @@ router = APIRouter()
     "",  # router.py inclui este router com prefix="/chat" → path final /v1/chat
     response_model=None,  # pode retornar ChatResponse (JSON) OU StreamingResponse (SSE)
     status_code=status.HTTP_200_OK,
-    summary="Enviar mensagem ao Assistente UE5",
+    summary="Enviar mensagem ao Assistente (multi-domain: Godot 4.x / UE5)",
     tags=["agent"],
 )
 async def chat(
@@ -52,7 +54,24 @@ async def chat(
     qdrant: AsyncQdrantClient = Depends(get_qdrant_client),
     redis: Redis = Depends(get_redis_client),
     db: AsyncSession = Depends(get_db_session),
+    x_domain_id: str | None = Header(default=None, alias="X-Domain-ID"),
 ):
+    # CORREÇÃO (ALTO — domain_id nunca era resolvido no endpoint): antes,
+    # run_rag_pipeline/run_rag_pipeline_stream sempre operavam com o domínio
+    # default hardcoded (UE5). Resolução por prioridade: domain_id explícito
+    # no payload → header X-Domain-ID → settings.active_domain (ver
+    # app.core.domains.registry.DomainRegistry.resolve).
+    domain_id = domain_registry.resolve(
+        explicit_domain_id=request.domain_id,
+        header_domain_id=x_domain_id,
+        default_domain_id=settings.active_domain,
+    ).domain_id
+    # Reescreve no próprio request: run_rag_pipeline/_stream leem
+    # `getattr(request, "domain_id", None)` — sem isso, uma resolução vinda
+    # do header X-Domain-ID (sem domain_id no payload) nunca chegaria ao
+    # pipeline.
+    request.domain_id = domain_id
+
     # Garante a sessão no Postgres (cria na primeira mensagem) e persiste a
     # mensagem do usuário ANTES de gerar a resposta — assim, mesmo que a
     # geração falhe, a pergunta do usuário não se perde.
@@ -62,9 +81,12 @@ async def chat(
         default_model=request.model,
         default_top_k=request.top_k,
         project_source_filter=request.project_source_filter,
+        domain_id=domain_id,
     )
     await session_service.touch_session_title_if_needed(db, session, request.message)
-    await session_service.append_user_message(db, session.id, request.message, request.model_dump())
+    await session_service.append_user_message(
+        db, session.id, request.message, request.model_dump(), domain_id=domain_id
+    )
     await db.commit()
 
     if request.stream:
@@ -103,6 +125,7 @@ async def _sync_chat_response(
             completion_tokens=None,
             retrieved_chunks=[],
             request_payload=request.model_dump(),
+            domain_id=request.domain_id,
         )
         await db.commit()
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
@@ -119,6 +142,7 @@ async def _sync_chat_response(
             completion_tokens=None,
             retrieved_chunks=[],
             request_payload=request.model_dump(),
+            domain_id=request.domain_id,
         )
         await db.commit()
         raise HTTPException(
@@ -137,6 +161,7 @@ async def _sync_chat_response(
         completion_tokens=result.completion_tokens,
         retrieved_chunks=result.retrieved_chunks,
         request_payload=request.model_dump(),
+        domain_id=request.domain_id,
     )
     await db.commit()
 
@@ -209,6 +234,7 @@ async def _stream_chat_response(
             completion_tokens=final_completion_tokens,
             retrieved_chunks=final_chunks,
             request_payload=request.model_dump(),
+            domain_id=request.domain_id,
         )
         await db.commit()
 
@@ -228,6 +254,7 @@ async def _stream_chat_response(
             completion_tokens=None,
             retrieved_chunks=final_chunks,
             request_payload=request.model_dump(),
+            domain_id=request.domain_id,
         )
         await db.commit()
 

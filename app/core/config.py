@@ -28,6 +28,12 @@ from typing import Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Import tardio dentro de propriedades/métodos (não no topo do módulo) para
+# evitar qualquer risco de import circular: app.core.domains.registry é
+# importado por praticamente todo o resto da app, e config.py é importado
+# extremamente cedo no bootstrap (inclusive por domains/base.py indiretamente
+# no futuro) — mantemos o import local dentro de qdrant_collection_for().
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -47,14 +53,63 @@ class Settings(BaseSettings):
     def is_development(self) -> bool:
         return self.app_env == "development"
 
+    # --- Multi-Domain (Godot 4.x default, UE5 plugin) -------------------------
+    # Resolvido pela aplicação quando a requisição (ChatRequest/IngestRequest)
+    # não especifica domain_id explícito — ver app.core.domains.registry e
+    # PATCH_NOTES.md. Godot 4 é o domínio operacional primário desta versão;
+    # UE5 permanece registrado para compatibilidade retroativa com a coleção
+    # já existente em produção.
+    active_domain: str = Field(
+        default="godot_4",
+        description=(
+            "domain_id resolvido como fallback quando a requisição não informa "
+            "domain_id explicitamente. Deve corresponder a um domain_id "
+            "registrado em app.core.domains.registry.domain_registry."
+        ),
+    )
+
     # --- Qdrant --------------------------------------------------------------
     qdrant_host: str = "qdrant"
     qdrant_port: int = 6333
-    qdrant_collection: str = "ue5_docs_hybrid"
+
+    # CORREÇÃO (CRÍTICO — namespace único impedia multi-domain): este campo
+    # era uma string fixa ("ue5_docs_hybrid"), usada diretamente em TODA
+    # chamada ao Qdrant (rag_service.py, ingestion_service.py). Numa
+    # arquitetura multi-domain, cada domínio precisa da sua PRÓPRIA coleção
+    # (schema de payload, dimensão de embedding e estatísticas de IDF do
+    # canal esparso não podem ser compartilhados entre UE5 e Godot 4 sem
+    # colisão). O campo é mantido (default inalterado, "ue5_docs_hybrid")
+    # apenas para não quebrar quem ainda lê `settings.qdrant_collection`
+    # direto em código legado não migrado — mas é considerado DEPRECATED.
+    # Todo código NOVO deve chamar `settings.qdrant_collection_for(domain_id)`.
+    qdrant_collection: str = Field(
+        default="ue5_docs_hybrid",
+        description=(
+            "DEPRECATED — mantido por compatibilidade com código legado ainda "
+            "não migrado. Use qdrant_collection_for(domain_id) em código novo."
+        ),
+    )
 
     @property
     def qdrant_url(self) -> str:
         return f"http://{self.qdrant_host}:{self.qdrant_port}"
+
+    def qdrant_collection_for(self, domain_id: str | None = None) -> str:
+        """
+        Resolve o nome da coleção Qdrant isolada do domínio ativo.
+
+        Args:
+            domain_id: domain_id explícito da requisição. Se None, cai para
+                `self.active_domain` (comportamento single-tenant/legado).
+
+        Returns:
+            Nome da coleção (`BaseDomainProfile.default_collection_name`)
+            do domínio resolvido — ex: "godot_4_docs_hybrid", "ue5_docs_hybrid".
+        """
+        from app.core.domains.registry import domain_registry  # import tardio — evita ciclo
+
+        profile = domain_registry.get(domain_id or self.active_domain)
+        return profile.default_collection_name
 
     # --- Redis (Agent Memory) ------------------------------------------------
     redis_host: str = "agent-redis"

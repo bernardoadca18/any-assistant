@@ -25,6 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.domains.registry import domain_registry
 from app.db.models import ChatMessage, ChatSession, DocType, Project, RetrievedChunk
 from app.db.redis import session_history_key, session_meta_key
 from app.schemas.chat import ChatRequest, RetrievedChunk as RetrievedChunkSchema
@@ -38,46 +39,59 @@ REDIS_HISTORY_MAX_MESSAGES = 20          # janela de contexto multi-turn
 # ---------------------------------------------------------------------------
 # Lookups (project/doc_type) com cache local em processo — tabelas pequenas
 # e praticamente estáticas.
+#
+# CORREÇÃO (ALTO — cache/lookup ignorava domain_id): as chaves eram apenas
+# `code` (str). Com `projects`/`doc_types` migradas para UNIQUE composto
+# (code, domain_id) — ver db/init/002_domain_multi_tenant_schema.sql — dois
+# domínios diferentes podem ter o MESMO code (ex: um futuro doc_type
+# "api_reference" em ue5 E em godot_4) apontando para linhas distintas. O
+# cache agora é indexado por (domain_id, code).
 # ---------------------------------------------------------------------------
-_project_id_cache: dict[str, int] = {}
-_doc_type_id_cache: dict[str, int] = {}
+_project_id_cache: dict[tuple[str, str], int] = {}
+_doc_type_id_cache: dict[tuple[str, str], int] = {}
 
 
-async def _resolve_project_id(db: AsyncSession, code: str | None) -> int | None:
+async def _resolve_project_id(db: AsyncSession, code: str | None, domain_id: str) -> int | None:
     if not code:
         return None
-    if code in _project_id_cache:
-        return _project_id_cache[code]
+    cache_key = (domain_id, code)
+    if cache_key in _project_id_cache:
+        return _project_id_cache[cache_key]
 
-    result = await db.execute(select(Project).where(Project.code == code))
+    result = await db.execute(
+        select(Project).where(Project.code == code, Project.domain_id == domain_id)
+    )
     project = result.scalar_one_or_none()
     if project is None:
         # Procedência nova, não cadastrada ainda (ex: novo projeto de amostra
         # ingerido) — cria on-the-fly em vez de falhar a gravação da mensagem.
-        project = Project(code=code, display_name=code)
+        project = Project(code=code, display_name=code, domain_id=domain_id)
         db.add(project)
         await db.flush()
-        log.info("Novo project_source registrado dinamicamente: %s", code)
+        log.info("Novo project_source registrado dinamicamente: %s (domain=%s)", code, domain_id)
 
-    _project_id_cache[code] = project.id
+    _project_id_cache[cache_key] = project.id
     return project.id
 
 
-async def _resolve_doc_type_id(db: AsyncSession, code: str | None) -> int | None:
+async def _resolve_doc_type_id(db: AsyncSession, code: str | None, domain_id: str) -> int | None:
     if not code:
         return None
-    if code in _doc_type_id_cache:
-        return _doc_type_id_cache[code]
+    cache_key = (domain_id, code)
+    if cache_key in _doc_type_id_cache:
+        return _doc_type_id_cache[cache_key]
 
-    result = await db.execute(select(DocType).where(DocType.code == code))
+    result = await db.execute(
+        select(DocType).where(DocType.code == code, DocType.domain_id == domain_id)
+    )
     doc_type = result.scalar_one_or_none()
     if doc_type is None:
-        doc_type = DocType(code=code, display_name=code)
+        doc_type = DocType(code=code, display_name=code, domain_id=domain_id)
         db.add(doc_type)
         await db.flush()
-        log.info("Novo doc_type registrado dinamicamente: %s", code)
+        log.info("Novo doc_type registrado dinamicamente: %s (domain=%s)", code, domain_id)
 
-    _doc_type_id_cache[code] = doc_type.id
+    _doc_type_id_cache[cache_key] = doc_type.id
     return doc_type.id
 
 
@@ -92,11 +106,18 @@ async def get_or_create_session(
     default_model: str,
     default_top_k: int,
     project_source_filter: str | None,
+    domain_id: str,
 ) -> ChatSession:
     """
     Busca a sessão pelo UUID vindo do frontend; cria se ainda não existir
     (primeira mensagem de uma conversa nova — o frontend já gera o UUID
     antes de enviar a primeira mensagem).
+
+    CORREÇÃO (MÉDIO — título de sessão hardcoded para UE5): `domain_id` é
+    obrigatório e usado para (a) gravar `ChatSession.domain_id` e (b)
+    resolver o título default via `BaseDomainProfile.default_session_title`
+    do domínio ativo (ex: "Conversa Godot Engine 4" em vez de "Conversa
+    Unreal Engine 5" fixo) — ver também touch_session_title_if_needed.
     """
     try:
         sid = uuid.UUID(session_id)
@@ -108,8 +129,11 @@ async def get_or_create_session(
     if session is not None:
         return session
 
+    profile = domain_registry.get(domain_id)
     session = ChatSession(
         id=sid,
+        title=profile.default_session_title,
+        domain_id=domain_id,
         default_model=default_model,
         default_top_k=default_top_k,
         project_source_filter=project_source_filter,
@@ -148,8 +172,20 @@ async def delete_session(db: AsyncSession, session_id: uuid.UUID) -> bool:
 
 
 async def touch_session_title_if_needed(db: AsyncSession, session: ChatSession, first_user_content: str) -> None:
-    """Define o título da sessão a partir da primeira mensagem do usuário, uma única vez."""
-    if session.title != "Conversa Unreal Engine 5":
+    """
+    Define o título da sessão a partir da primeira mensagem do usuário, uma
+    única vez.
+
+    CORREÇÃO (MÉDIO — comparação hardcoded para UE5): a condição de "ainda é
+    o título default, pode sobrescrever" comparava contra a string fixa
+    "Conversa Unreal Engine 5". Isso fazia com que sessões Godot 4 (cujo
+    título default é "Conversa Godot Engine 4" — ver get_or_create_session)
+    nunca tivessem o título atualizado a partir da primeira mensagem, já que
+    a comparação sempre dava falso. Agora compara contra o
+    `default_session_title` do PRÓPRIO domain_id da sessão.
+    """
+    profile = domain_registry.get(session.domain_id)
+    if session.title != profile.default_session_title:
         return
     trimmed = first_user_content.strip()
     session.title = trimmed[:40] + ("..." if len(trimmed) > 40 else "")
@@ -171,11 +207,12 @@ async def _next_sequence_number(db: AsyncSession, session_id: uuid.UUID) -> int:
 
 
 async def append_user_message(
-    db: AsyncSession, session_id: uuid.UUID, content: str, request_payload: dict
+    db: AsyncSession, session_id: uuid.UUID, content: str, request_payload: dict, domain_id: str
 ) -> ChatMessage:
     seq = await _next_sequence_number(db, session_id)
     msg = ChatMessage(
         session_id=session_id,
+        domain_id=domain_id,
         role="user",
         status="success",
         content=content,
@@ -199,10 +236,12 @@ async def append_assistant_message(
     completion_tokens: int | None,
     retrieved_chunks: list[RetrievedChunkSchema],
     request_payload: dict,
+    domain_id: str,
 ) -> ChatMessage:
     seq = await _next_sequence_number(db, session_id)
     msg = ChatMessage(
         session_id=session_id,
+        domain_id=domain_id,
         role="assistant",
         status=status,
         content=content,
@@ -217,11 +256,12 @@ async def append_assistant_message(
     await db.flush()
 
     for idx, chunk in enumerate(retrieved_chunks, start=1):
-        project_id = await _resolve_project_id(db, chunk.project_source)
-        doc_type_id = await _resolve_doc_type_id(db, chunk.doc_type)
+        project_id = await _resolve_project_id(db, chunk.project_source, domain_id=domain_id)
+        doc_type_id = await _resolve_doc_type_id(db, chunk.doc_type, domain_id=domain_id)
         db.add(
             RetrievedChunk(
                 message_id=msg.id,
+                domain_id=domain_id,
                 qdrant_chunk_id=chunk.chunk_id,
                 project_id=project_id,
                 doc_type_id=doc_type_id,

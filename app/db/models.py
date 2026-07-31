@@ -62,16 +62,25 @@ class Project(Base):
     __tablename__ = "projects"
 
     id: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
-    code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
     display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    # NOVO (multi-domain) — troca o UNIQUE simples de `code` por composto
+    # (code, domain_id): permite o mesmo code existir em domínios distintos
+    # sem colisão (ver db/init/002_domain_multi_tenant_schema.sql).
+    domain_id: Mapped[str] = mapped_column(String(64), nullable=False, default="godot_4")
+
+    __table_args__ = (UniqueConstraint("code", "domain_id", name="uq_projects_code_domain"),)
 
 
 class DocType(Base):
     __tablename__ = "doc_types"
 
     id: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
-    code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
     display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    domain_id: Mapped[str] = mapped_column(String(64), nullable=False, default="godot_4")
+
+    __table_args__ = (UniqueConstraint("code", "domain_id", name="uq_doc_types_code_domain"),)
 
 
 class ChatSession(Base):
@@ -81,7 +90,17 @@ class ChatSession(Base):
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
-    title: Mapped[str] = mapped_column(String(160), nullable=False, default="Conversa Unreal Engine 5")
+    # NOTA: este default só se aplica se ChatSession for instanciado sem
+    # `title` explícito — get_or_create_session() (session_service.py)
+    # SEMPRE passa o título resolvido de BaseDomainProfile.default_session_title,
+    # então este valor é apenas uma rede de segurança neutra, não mais o
+    # texto UE5 fixo de antes.
+    title: Mapped[str] = mapped_column(String(160), nullable=False, default="Nova Conversa")
+    # NOVO (multi-domain — ver db/init/002_domain_multi_tenant_schema.sql e
+    # app/core/domains/registry.py). `default` do ORM só se aplica a INSERTs
+    # feitos via SQLAlchemy sem valor explícito; a migração SQL já cobre o
+    # backfill retroativo das sessões pré-existentes (todas 'ue5').
+    domain_id: Mapped[str] = mapped_column(String(64), nullable=False, default="godot_4")
     default_model: Mapped[str] = mapped_column(String(120), nullable=False, default="ollama/qwen2.5-coder:7b")
     default_top_k: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=5)
     project_source_filter: Mapped[str | None] = mapped_column(String(64))
@@ -104,6 +123,9 @@ class ChatMessage(Base):
     session_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False
     )
+    # NOVO (multi-domain) — denormalizado da sessão no momento da escrita
+    # (ver docstring da migração 002 para o motivo de não depender de JOIN).
+    domain_id: Mapped[str] = mapped_column(String(64), nullable=False, default="godot_4")
     role: Mapped[str] = mapped_column(message_role_enum, nullable=False)
     status: Mapped[str] = mapped_column(message_status_enum, nullable=False, default="success")
     content: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -130,6 +152,9 @@ class RetrievedChunk(Base):
     message_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("chat_messages.id", ondelete="CASCADE"), nullable=False
     )
+    # NOVO (multi-domain) — denormalizado da mensagem, mesmo racional do
+    # ChatMessage.domain_id acima.
+    domain_id: Mapped[str] = mapped_column(String(64), nullable=False, default="godot_4")
     qdrant_chunk_id: Mapped[int] = mapped_column(Integer, nullable=False)
     project_id: Mapped[int | None] = mapped_column(SmallInteger, ForeignKey("projects.id"))
     doc_type_id: Mapped[int | None] = mapped_column(SmallInteger, ForeignKey("doc_types.id"))
