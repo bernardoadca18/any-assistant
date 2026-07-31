@@ -104,6 +104,7 @@ async def process_folder(
         ue_version_override=payload.ue_version,
         project_source=payload.project_source,
         sample_mode=payload.sample_mode,
+        domain_id=payload.domain_id,
     )
 
     log.info(

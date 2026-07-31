@@ -1905,6 +1905,7 @@ async def process_folder_ingestion(
     ue_version_override: str | None = None,
     project_source: str = "UE5_Engine",
     sample_mode: bool = False,
+    domain_id: str | None = None,
 ) -> None:
     """
     Entrypoint chamado pelo BackgroundTasks. Serializa a execução por
@@ -1930,6 +1931,8 @@ async def process_folder_ingestion(
             Chaos Mover/Vehicles, Motion Warping) recebem o mesmo
             tratamento do sample_mode — allowlist desligada e .cpp
             descoberto — de forma escopada, sem afetar o resto da Engine.
+        domain_id: identificador do domínio (ex: "godot_4", "ue5").
+            Se None, usa settings.active_domain.
 
     NOTA DE CONCORRÊNCIA: sem esse lock, duas ingestões concorrentes para a
     mesma coleção (ex: um retry acidental do operador, ou dois canais
@@ -1942,7 +1945,9 @@ async def process_folder_ingestion(
     vez por coleção; uma segunda tentativa concorrente é simplesmente
     rejeitada com um aviso, em vez de rodar em paralelo.
     """
-    collection_name = settings.qdrant_collection
+    # Resolve domain_id e coleção correspondente
+    resolved_domain_id = domain_id or settings.active_domain
+    collection_name = settings.qdrant_collection_for(resolved_domain_id)
     lock_key = ingestion_lock_key(collection_name)
     lock = Lock(
         redis,
