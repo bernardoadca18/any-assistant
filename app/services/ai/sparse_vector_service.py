@@ -5,95 +5,83 @@ Gerador de vetores esparsos (estilo BM25) para a busca híbrida do Qdrant.
 
 Este módulo é INTENCIONALMENTE desacoplado de qualquer outro serviço da
 aplicação — não importa `rag_service` nem `ingestion_service` — para evitar
-qualquer risco de import circular (ingestion_service já importa
-`call_litellm` de rag_service; rag_service agora também precisa deste
-módulo para o retrieval híbrido). Ambos importam só daqui.
+qualquer risco de import circular. Ambos importam só daqui.
 
-ESTRATÉGIA DE TOKENIZAÇÃO E HASHING:
-    Em vez de manter um vocabulário fixo (dicionário token → índice, que
-    precisaria ser versionado e sincronizado entre ingestão e retrieval),
-    usamos "hashing trick": cada token é mapeado para um índice em um
-    espaço esparso fixo de tamanho `2**24` via `zlib.crc32` (biblioteca
-    padrão do Python — sem dependências externas pesadas como scikit-learn
-    ou sentence-transformers só para isso).
+CORREÇÃO (multi-domain — ver app/core/domains/): a regex de sub-split
+CamelCase/snake_case ERA uma constante módulo-level fixa, hardcoded para as
+convenções de nomenclatura da UE5 (prefixos A/U/F/E). Isso quebra
+silenciosamente para outros domínios que usam convenções diferentes (ou,
+no caso de Godot 4, uma convenção suficientemente parecida que a mesma
+regex ainda funciona, mas por coincidência, não por design). A função
+principal agora aceita `camel_split_regex` — o chamador (rag_service.py na
+query, ingestion_service.py na ingestão) resolve essa regex a partir do
+`BaseDomainProfile.sparse_camel_split_regex` do domínio ativo e a repassa
+explicitamente. Nenhum default é assumido aqui para evitar reintroduzir o
+acoplamento oculto a um domínio específico.
 
-    A tokenização é feita em duas passadas complementares, pensando
-    especificamente em identificadores de código C++/UE5:
-    1. Split por qualquer caractere não-alfanumérico (pontuação, espaços,
-       `::`, `->`, etc.) — captura o token "bruto" completo (ex:
-       "AddMovementInput", "UPROPERTY").
-    2. Sub-split desse token bruto por fronteiras de CamelCase, snake_case
-       e dígitos (ex: "AddMovementInput" → "add", "movement", "input";
-       "max_health_points" → "max", "health", "points") — captura também
-       as partes semânticas individuais, para que uma busca por "movement"
-       ou "health" ainda encontre o identificador composto.
+ESTRATÉGIA DE TOKENIZAÇÃO E HASHING (inalterada):
+    Hashing trick via zlib.crc32 num espaço esparso fixo de 2**24 buckets,
+    sem vocabulário fixo versionado. Tokenização em duas passadas: (1) split
+    por caractere não-alfanumérico, capturando o token bruto; (2) sub-split
+    do token bruto via `camel_split_regex`, capturando componentes
+    semânticos individuais. União das duas passadas.
 
-    O resultado é a UNIÃO dos tokens das duas passadas (com o token bruto
-    também incluído quando tiver mais de 1 caractere), permitindo tanto
-    match exato do identificador quanto match parcial por componente.
-
-TF vs IDF:
-    `build_sparse_vector` retorna apenas term-frequency BRUTO (contagem de
-    ocorrências por índice, sem normalização). O IDF é responsabilidade do
-    próprio Qdrant em tempo de busca — a coleção deve ter o espaço esparso
-    configurado com `modifier=Modifier.IDF` (ver
-    `ingestion_service.ensure_sparse_vectors_enabled`), que calcula e
-    aplica a estatística de IDF em nível de coleção automaticamente,
-    inclusive conforme novos documentos entram.
+TF vs IDF (inalterado):
+    Apenas term-frequency bruto é retornado; o IDF é responsabilidade do
+    Qdrant via `modifier=Modifier.IDF` na configuração do espaço esparso
+    nomeado (ver ingestion_service.ensure_sparse_vectors_enabled).
 """
 
 from __future__ import annotations
 
 import re
 import zlib
+from functools import lru_cache
 
 from qdrant_client.http import models as qdrant_models
 
 # ---------------------------------------------------------------------------
-# Nome do espaço de vetor esparso nomeado na coleção do Qdrant.
-# Compartilhado entre ingestion_service.py (migração de schema + upsert +
-# backfill) e rag_service.py (retrieval híbrido) — definido aqui, num módulo
-# sem dependências internas, para que nenhum dos dois precise importar do
-# outro só por causa desta constante.
+# Nome do espaço de vetor esparso nomeado na coleção do Qdrant. Compartilhado
+# entre todos os domínios — cada domínio tem sua PRÓPRIA coleção Qdrant
+# (ver BaseDomainProfile.default_collection_name), então não há colisão em
+# usar o mesmo nome de espaço esparso dentro de cada coleção isolada.
 # ---------------------------------------------------------------------------
 SPARSE_VECTOR_NAME: str = "keywords_sparse"
 
-# Tamanho do espaço esparso — 2**24 (~16.7M) buckets. Grande o suficiente
-# para tornar colisões de hash raras em corpora do porte de uma base de
-# documentação técnica, sem precisar de um vocabulário fixo versionado.
+# Tamanho do espaço esparso — 2**24 (~16.7M) buckets.
 _SPARSE_VECTOR_DIM: int = 2**24
 
 # Passada 1: quebra por qualquer sequência de caracteres não-alfanuméricos
-# (espaços, pontuação, `::`, `->`, `()`, etc).
+# (espaços, pontuação, `::`, `->`, `()`, `@`, etc). Domain-agnostic — não
+# há necessidade de parametrizar esta passada por domínio.
 _NON_ALNUM_RE = re.compile(r"[^A-Za-z0-9]+")
 
-# Passada 2: sub-divide um token bruto em partes CamelCase / snake_case /
-# dígitos. Cobre os padrões mais comuns de identificadores C++/UE5:
-#   - "AddMovementInput"   -> ["Add", "Movement", "Input"]
-#   - "UPROPERTY"          -> ["UPROPERTY"] (sigla toda maiúscula, mantida)
-#   - "bIsJumping"         -> ["b", "Is", "Jumping"]
-#   - "max_health_points"  -> já quebrado pela Passada 1 (underscore não é
-#     alfanumérico), então cada parte chega aqui sozinha.
-#   - "UE5"                -> ["UE", "5"]
-_CAMEL_SPLIT_RE = re.compile(
-    r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+"
-)
+# Regex de fallback (idêntica à antiga constante fixa) — usada apenas se um
+# chamador legado não passar `camel_split_regex` explicitamente, para não
+# quebrar em produção durante o rollout da migração multi-domain. Chamadores
+# NOVOS (rag_service.py, ingestion_service.py pós-refactor) devem sempre
+# passar a regex resolvida do domain_profile ativo.
+_LEGACY_DEFAULT_CAMEL_SPLIT_RE = r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+"
 
 
-def _tokenize(text: str) -> list[str]:
+@lru_cache(maxsize=32)
+def _compiled_camel_split(pattern: str) -> re.Pattern[str]:
+    return re.compile(pattern)
+
+
+def _tokenize(text: str, camel_split_regex: str) -> list[str]:
     """
-    Tokeniza texto livre (título, resumo, conteúdo bruto) em uma lista de
-    termos em minúsculas, prontos para hashing.
+    Tokeniza texto livre em termos minúsculos, prontos para hashing.
 
     Une o token bruto (Passada 1) com seus componentes CamelCase/snake_case
-    (Passada 2) sempre que a sub-divisão produzir mais de uma parte — um
-    token de uma palavra só (ex: "jump") não precisa de sub-split.
+    (Passada 2, via `camel_split_regex` — específica do domínio ativo)
+    sempre que a sub-divisão produzir mais de uma parte.
 
-    Termos de 1 caractere são descartados (ruído — normalmente artigos
-    partidos, iniciais de prefixo UE como o "A" de "ACharacter" sozinho,
-    etc.) EXCETO quando são o único conteúdo do token bruto original.
+    Termos de 1 caractere são descartados, exceto quando são o único
+    conteúdo do token bruto original.
     """
     tokens: list[str] = []
+    camel_re = _compiled_camel_split(camel_split_regex)
 
     for raw_word in _NON_ALNUM_RE.split(text):
         if not raw_word:
@@ -103,7 +91,7 @@ def _tokenize(text: str) -> list[str]:
         if len(lowered) > 1:
             tokens.append(lowered)
 
-        sub_parts = _CAMEL_SPLIT_RE.findall(raw_word)
+        sub_parts = camel_re.findall(raw_word)
         if len(sub_parts) > 1:
             for part in sub_parts:
                 part_lower = part.lower()
@@ -118,27 +106,30 @@ def _token_to_index(token: str) -> int:
     return zlib.crc32(token.encode("utf-8")) % _SPARSE_VECTOR_DIM
 
 
-def build_sparse_vector(text: str) -> qdrant_models.SparseVector:
+def build_sparse_vector(
+    text: str,
+    camel_split_regex: str | None = None,
+) -> qdrant_models.SparseVector:
     """
     Constrói um SparseVector (estilo BM25/TF) a partir de texto livre.
 
     Args:
-        text: Texto de origem (tipicamente a concatenação de title +
-            raw_content + summary_markdown na ingestão, ou os
-            `keywords_exact` extraídos pelo decompositor de query no
-            retrieval — ver rag_service._hybrid_search).
+        text: Texto de origem (title + raw_content + summary_markdown na
+            ingestão, ou keywords_exact do decompositor no retrieval).
+        camel_split_regex: Regex de sub-split específica do domínio ativo
+            (ver `BaseDomainProfile.sparse_camel_split_regex`). Se None,
+            usa a regex legada (equivalente à UE5) por compatibilidade —
+            todo chamador novo deve passar este valor explicitamente.
 
     Returns:
-        qdrant_models.SparseVector com `indices` (posições no espaço
-        esparso) e `values` (term-frequency bruto, sem normalização — o
-        IDF é aplicado pelo próprio Qdrant via modifier=Modifier.IDF).
-        Vazio (indices=[], values=[]) se `text` não produzir nenhum token
-        utilizável.
+        qdrant_models.SparseVector com `indices` e `values` (TF bruto, sem
+        normalização — IDF aplicado pelo Qdrant). Vazio se `text` não
+        produzir nenhum token utilizável.
     """
     if not text:
         return qdrant_models.SparseVector(indices=[], values=[])
 
-    tokens = _tokenize(text)
+    tokens = _tokenize(text, camel_split_regex or _LEGACY_DEFAULT_CAMEL_SPLIT_RE)
     if not tokens:
         return qdrant_models.SparseVector(indices=[], values=[])
 
