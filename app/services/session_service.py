@@ -103,6 +103,7 @@ async def get_or_create_session(
     db: AsyncSession,
     session_id: str,
     *,
+    tenant_id: uuid.UUID,
     default_model: str,
     default_top_k: int,
     project_source_filter: str | None,
@@ -132,6 +133,7 @@ async def get_or_create_session(
     profile = domain_registry.get(domain_id)
     session = ChatSession(
         id=sid,
+        tenant_id=tenant_id,
         title=profile.default_session_title,
         domain_id=domain_id,
         default_model=default_model,
@@ -143,18 +145,34 @@ async def get_or_create_session(
     return session
 
 
-async def list_sessions(db: AsyncSession, *, include_archived: bool = False) -> list[ChatSession]:
-    stmt = select(ChatSession).order_by(ChatSession.updated_at.desc())
+async def list_sessions(
+    db: AsyncSession, *, tenant_id: uuid.UUID, include_archived: bool = False
+) -> list[ChatSession]:
+    """
+    Lista sessões de um tenant específico.
+
+    IMPORTANTE: O isolamento multi-tenant exige que tenant_id seja sempre
+    fornecido para garantir que um tenant não acesse sessões de outro.
+    """
+    stmt = select(ChatSession).where(ChatSession.tenant_id == tenant_id).order_by(ChatSession.updated_at.desc())
     if not include_archived:
         stmt = stmt.where(ChatSession.is_archived.is_(False))
     result = await db.execute(stmt)
     return list(result.scalars().all())
 
 
-async def get_session_with_messages(db: AsyncSession, session_id: uuid.UUID) -> ChatSession | None:
+async def get_session_with_messages(
+    db: AsyncSession, session_id: uuid.UUID, *, tenant_id: uuid.UUID
+) -> ChatSession | None:
+    """
+    Obtém sessão com mensagens, garantindo isolamento multi-tenant.
+
+    IMPORTANTE: O tenant_id é obrigatório para garantir que um tenant não
+    acesse sessões de outro.
+    """
     stmt = (
         select(ChatSession)
-        .where(ChatSession.id == session_id)
+        .where(ChatSession.id == session_id, ChatSession.tenant_id == tenant_id)
         .options(
             selectinload(ChatSession.messages).selectinload(ChatMessage.retrieved_chunks)
         )
@@ -163,9 +181,15 @@ async def get_session_with_messages(db: AsyncSession, session_id: uuid.UUID) -> 
     return result.scalar_one_or_none()
 
 
-async def delete_session(db: AsyncSession, session_id: uuid.UUID) -> bool:
+async def delete_session(db: AsyncSession, session_id: uuid.UUID, *, tenant_id: uuid.UUID) -> bool:
+    """
+    Remove sessão, garantindo isolamento multi-tenant.
+
+    IMPORTANTE: O tenant_id é obrigatório para garantir que um tenant não
+    remova sessões de outro.
+    """
     session = await db.get(ChatSession, session_id)
-    if session is None:
+    if session is None or session.tenant_id != tenant_id:
         return False
     await db.delete(session)  # cascade cuida de messages/retrieved_chunks
     return True

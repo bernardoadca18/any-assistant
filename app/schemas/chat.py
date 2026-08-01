@@ -63,3 +63,18 @@ class ChatResponse(BaseModel):
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     retrieved_chunks: list[RetrievedChunk] = Field(default_factory=list)
+
+
+class DependencyStatus(BaseModel):
+    """Status of a single dependency in health check."""
+    status: str  # "ok", "degraded", "error"
+    latency_ms: float | None = None
+    detail: str | None = None
+
+
+class HealthResponse(BaseModel):
+    """Health check response with dependency statuses."""
+    status: str  # "ok", "degraded", "error"
+    version: str
+    environment: str
+    dependencies: dict[str, DependencyStatus]

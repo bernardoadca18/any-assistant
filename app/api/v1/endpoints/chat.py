@@ -29,6 +29,7 @@ from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import CurrentTenant
 from app.core.config import settings
 from app.core.domains.registry import domain_registry
 from app.db.postgres import get_db_session
@@ -36,7 +37,7 @@ from app.db.qdrant import get_qdrant_client
 from app.db.redis import get_redis_client
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.services.ai.rag_service import run_rag_pipeline, run_rag_pipeline_stream
-from app.services.db import session_service
+from app.services import session_service
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -50,6 +51,7 @@ router = APIRouter()
     tags=["agent"],
 )
 async def chat(
+    auth: CurrentTenant,
     request: ChatRequest,
     qdrant: AsyncQdrantClient = Depends(get_qdrant_client),
     redis: Redis = Depends(get_redis_client),
@@ -78,6 +80,7 @@ async def chat(
     session = await session_service.get_or_create_session(
         db,
         request.session_id,
+        tenant_id=auth.tenant_id,
         default_model=request.model,
         default_top_k=request.top_k,
         project_source_filter=request.project_source_filter,

@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.logging import setup_logging
+from app.db.postgres import close_postgres, init_postgres
 from app.db.qdrant import close_qdrant, init_qdrant
 from app.db.redis import close_redis, init_redis
 from app.services.ai.embedding_service import close_embedding_client, init_embedding_client
@@ -96,6 +97,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         startup_errors.append(f"Redis: {exc}")
 
     try:
+        await init_postgres()
+    except ConnectionError as exc:
+        log.error("FALHA ao conectar Postgres: %s", exc)
+        startup_errors.append(f"Postgres: {exc}")
+
+    try:
         await init_embedding_client()
     except Exception as exc:
         log.error("FALHA ao inicializar EmbeddingService: %s", exc)
@@ -133,6 +140,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await close_litellm_client()
     await close_embedding_client()
     await close_redis()
+    await close_postgres()
     await close_qdrant()
     log.info("Shutdown concluído.")
 

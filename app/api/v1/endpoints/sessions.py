@@ -24,32 +24,44 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import CurrentTenant
 from app.db.postgres import get_db_session
 from app.schemas.sessions import SessionDetailResponse, SessionSummaryResponse
-from app.services.db import session_service
+from app.services import session_service
 
 log = logging.getLogger(__name__)
 router = APIRouter()
 
 
 @router.get("/sessions", response_model=list[SessionSummaryResponse], tags=["sessions"])
-async def list_sessions(db: AsyncSession = Depends(get_db_session)) -> list[SessionSummaryResponse]:
-    sessions = await session_service.list_sessions(db)
+async def list_sessions(
+    auth: CurrentTenant, db: AsyncSession = Depends(get_db_session)
+) -> list[SessionSummaryResponse]:
+    """Lista sessões do tenant autenticado."""
+    sessions = await session_service.list_sessions(db, tenant_id=auth.tenant_id)
     return [SessionSummaryResponse.model_validate(s) for s in sessions]
 
 
 @router.get("/sessions/{session_id}", response_model=SessionDetailResponse, tags=["sessions"])
 async def get_session(
-    session_id: uuid.UUID, db: AsyncSession = Depends(get_db_session)
+    auth: CurrentTenant,
+    session_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db_session),
 ) -> SessionDetailResponse:
-    session = await session_service.get_session_with_messages(db, session_id)
+    """Obtém detalhes de uma sessão do tenant autenticado."""
+    session = await session_service.get_session_with_messages(db, session_id, tenant_id=auth.tenant_id)
     if session is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sessão não encontrada.")
     return SessionDetailResponse.model_validate(session)
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["sessions"])
-async def remove_session(session_id: uuid.UUID, db: AsyncSession = Depends(get_db_session)) -> None:
-    deleted = await session_service.delete_session(db, session_id)
+async def remove_session(
+    auth: CurrentTenant,
+    session_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Remove sessão do tenant autenticado."""
+    deleted = await session_service.delete_session(db, session_id, tenant_id=auth.tenant_id)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sessão não encontrada.")

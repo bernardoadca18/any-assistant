@@ -90,6 +90,10 @@ class ChatSession(Base):
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
+    # Multi-tenant: each session belongs to a tenant
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="SET NULL"), nullable=False
+    )
     # NOTA: este default só se aplica se ChatSession for instanciado sem
     # `title` explícito — get_or_create_session() (session_service.py)
     # SEMPRE passa o título resolvido de BaseDomainProfile.default_session_title,
