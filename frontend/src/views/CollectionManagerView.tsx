@@ -34,8 +34,13 @@ const CreateCollectionModal: React.FC<{
   const [description, setDescription] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const { tenantsList } = useAppStore();
 
   if (!isOpen) return null;
+
+  // Resolve tenant UUID from slug
+  const tenant = tenantsList.find(t => t.slug === defaultTenantId || t.id === defaultTenantId);
+  const tenantUuid = tenant?.id;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -44,10 +49,14 @@ const CreateCollectionModal: React.FC<{
       setError('Nome, qdrant_collection_name e display_name são obrigatórios.');
       return;
     }
+    if (!tenantUuid) {
+      setError(`Tenant não encontrado: ${defaultTenantId}. Verifique se o tenant existe.`);
+      return;
+    }
     setSubmitting(true);
     try {
       const payload: CollectionCreate = {
-        tenant_id: defaultTenantId,
+        tenant_id: tenantUuid,
         name: name.trim(),
         qdrant_collection_name: qdrantCollectionName.trim(),
         domain_id: domainId,

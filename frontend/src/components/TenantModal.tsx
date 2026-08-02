@@ -52,8 +52,18 @@ export const TenantModal: React.FC<TenantModalProps> = ({ isOpen, onClose }) => 
     setErrorMessage(null);
 
     try {
+      // Resolve tenant UUID from slug
+      const tenant = tenantsList.find(t => t.slug === activeTenant || t.id === activeTenant);
+      const tenantUuid = tenant?.id;
+
+      if (!tenantUuid) {
+        setErrorMessage(`Tenant não encontrado: ${activeTenant}`);
+        setIsSubmitting(false);
+        return;
+      }
+
       await tenantService.createCollection({
-        tenant_id: activeTenant,
+        tenant_id: tenantUuid,
         name: newCollName.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_'),
         qdrant_collection_name: newCollName.trim(),
         display_name: newCollDisplayName.trim(),

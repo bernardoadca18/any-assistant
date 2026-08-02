@@ -252,12 +252,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       const { activeTenant } = get();
 
-      // Fetch collections for current active tenant
-      const collectionsRes = await tenantService.listCollections({
-        tenant_id: activeTenant,
-        page_size: 100,
-      });
-
       // Try fetching tenants list if user has admin permissions
       let tenantsList: TenantResponse[] = [];
       try {
@@ -267,7 +261,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         // Fallback if not admin: provide active tenant in list
         tenantsList = [
           {
-            id: 'current',
+            id: activeTenant,
             slug: activeTenant,
             name: `Tenant (${activeTenant})`,
             description: 'Tenant atualmente selecionado',
@@ -275,6 +269,16 @@ export const useAppStore = create<AppState>((set, get) => ({
           },
         ];
       }
+
+      // Resolve tenant UUID from slug
+      const tenant = tenantsList.find(t => t.slug === activeTenant || t.id === activeTenant);
+      const tenantUuid = tenant?.id || activeTenant;
+
+      // Fetch collections for current active tenant (use UUID if available)
+      const collectionsRes = await tenantService.listCollections({
+        tenant_id: tenantUuid,
+        page_size: 100,
+      });
 
       const items = collectionsRes.items || [];
       // Default collection selection if current activeCollection is not in list
