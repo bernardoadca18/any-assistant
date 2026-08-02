@@ -14,7 +14,9 @@ import {
   Database,
   Gamepad2,
   Loader2,
+  Lock,
   Plus,
+  ShieldOff,
   X,
 } from 'lucide-react';
 import { useAppStore } from '@/store/useAppStore';
@@ -218,13 +220,19 @@ const CollectionCard: React.FC<{ collection: CollectionResponse }> = ({ collecti
 };
 
 export const CollectionManagerView: React.FC = () => {
-  const { activeTenant } = useAppStore();
+  const { activeTenant, isAuthenticated, user } = useAppStore();
+
   const [collections, setCollections] = useState<CollectionResponse[]>([]);
   const [loading, setLoading] = useState(false);
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [domainFilter, setDomainFilter] = useState<string>('all');
 
+  // Check if user has admin privileges
+  const isAdmin = user?.role === 'admin';
+  const canManage = isAuthenticated && isAdmin;
+
   const loadCollections = async () => {
+    if (!canManage) return;
     setLoading(true);
     try {
       const res = await tenantService.listCollections({
@@ -243,7 +251,49 @@ export const CollectionManagerView: React.FC = () => {
   useEffect(() => {
     loadCollections();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTenant, domainFilter]);
+  }, [activeTenant, domainFilter, canManage]);
+
+  // Not authenticated state
+  if (!isAuthenticated) {
+    return (
+      <div className="flex-1 overflow-y-auto p-6 md:p-8">
+        <div className="max-w-5xl mx-auto">
+          <div className="flex flex-col items-center justify-center py-16 text-center gap-4">
+            <div className="w-14 h-14 rounded-2xl bg-zinc-800/50 flex items-center justify-center">
+              <Lock className="w-7 h-7 text-zinc-500" />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold text-zinc-300">Autenticação Necessária</h2>
+              <p className="text-sm text-zinc-500 mt-1 max-w-md">
+                Faça login com uma API Key válida para gerenciar coleções vetoriais.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Not admin state
+  if (!isAdmin) {
+    return (
+      <div className="flex-1 overflow-y-auto p-6 md:p-8">
+        <div className="max-w-5xl mx-auto">
+          <div className="flex flex-col items-center justify-center py-16 text-center gap-4">
+            <div className="w-14 h-14 rounded-2xl bg-amber-900/30 flex items-center justify-center">
+              <ShieldOff className="w-7 h-7 text-amber-400" />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold text-zinc-300">Privilégios de Admin Necessários</h2>
+              <p className="text-sm text-zinc-500 mt-1 max-w-md">
+                Sua API Key não possui privilégios de administrador. A gestão de coleções requer uma chave com is_admin=true.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex-1 overflow-y-auto p-6 md:p-8">

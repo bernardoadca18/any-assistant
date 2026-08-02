@@ -1,12 +1,17 @@
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
- * 
+ *
  * Authentication Service:
- * Handles JWT and API Key login, logout, token verification, and user profile loading.
+ * Handles API Key validation, logout, token verification, and user profile loading.
+ *
+ * Authentication flow:
+ * 1. User provides API Key (starts with 'ue5_')
+ * 2. We validate it by calling an authenticated endpoint
+ * 3. If valid, we store the key and create a user session
  */
 
-import { apiClient, STORAGE_KEYS } from './apiClient';
+import { apiClient, STORAGE_KEYS, isApiKey } from './apiClient';
 import type {
   AuthTokenPayload,
   LoginRequest,
@@ -14,86 +19,131 @@ import type {
 } from '@/types';
 
 /**
+ * Validates an API Key by attempting an authenticated request.
+ * Tries /admin/tenants first (requires admin), falls back to /sessions.
+ */
+async function validateApiKey(apiKey: string): Promise<{ valid: boolean; isAdmin: boolean; tenantSlug: string }> {
+  // Temporarily store the key so the interceptor picks it up
+  const previousToken = localStorage.getItem(STORAGE_KEYS.TOKEN);
+  localStorage.setItem(STORAGE_KEYS.TOKEN, apiKey);
+
+  try {
+    // Try admin endpoint first
+    await apiClient.get('/admin/tenants', { params: { page_size: 1 } });
+    // If successful, user has admin privileges
+    return { valid: true, isAdmin: true, tenantSlug: 'default' };
+  } catch (err) {
+    // If 403, the key is valid but not admin
+    // If 401, the key is invalid
+    const status = err && typeof err === 'object' && 'status' in err ? (err as { status: number }).status : 0;
+
+    if (status === 403) {
+      // Key is valid but not admin - try to get tenant info from sessions
+      try {
+        await apiClient.get('/sessions');
+        return { valid: true, isAdmin: false, tenantSlug: 'default' };
+      } catch {
+        // Sessions endpoint also failed, but key is valid (403 means authenticated)
+        return { valid: true, isAdmin: false, tenantSlug: 'default' };
+      }
+    }
+
+    if (status === 401) {
+      // Invalid credentials
+      return { valid: false, isAdmin: false, tenantSlug: '' };
+    }
+
+    // Other error (network, 500, etc.) - restore previous token and rethrow
+    if (previousToken) {
+      localStorage.setItem(STORAGE_KEYS.TOKEN, previousToken);
+    } else {
+      localStorage.removeItem(STORAGE_KEYS.TOKEN);
+    }
+    throw err;
+  }
+}
+
+/**
  * Validates credentials and initializes an authenticated session.
- * Supports API Key authentication or JWT Bearer Token exchange.
+ * Supports API Key authentication (recommended) or development mode fallback.
  */
 export async function login(request: LoginRequest): Promise<AuthTokenPayload> {
   const tenantId = request.tenant_slug || 'default';
 
-  // 1. If API Key is provided, validate it against the backend health/sessions
+  // 1. API Key authentication
   if (request.apiKey) {
     const apiKey = request.apiKey.trim();
-    
-    // Store temporarily in localStorage so headers attach to verify call
-    localStorage.setItem(STORAGE_KEYS.TOKEN, apiKey);
-    localStorage.setItem(STORAGE_KEYS.ACTIVE_TENANT, tenantId);
 
-    try {
-      // Verify connectivity and authorization by calling health check
-      await apiClient.get('/health');
-    } catch (err) {
-      localStorage.removeItem(STORAGE_KEYS.TOKEN);
-      throw new Error('Falha na autenticação: API Key inválida ou sem permissão para o tenant informado.');
+    // Validate API Key format
+    if (!isApiKey(apiKey)) {
+      throw new Error('Formato de API Key inválido. A chave deve começar com "ue5_".');
     }
 
-    const user: User = {
-      id: 'api-key-user',
-      name: request.username || 'API Key Developer',
+    try {
+      // Validate the API Key against the backend
+      const validation = await validateApiKey(apiKey);
+
+      if (!validation.valid) {
+        throw new Error('API Key inválida ou expirada. Verifique a chave e tente novamente.');
+      }
+
+      // Store the validated key
+      localStorage.setItem(STORAGE_KEYS.TOKEN, apiKey);
+      localStorage.setItem(STORAGE_KEYS.ACTIVE_TENANT, tenantId);
+
+      const user: User = {
+        id: `api-key-user-${Date.now()}`,
+        name: request.username || 'API Key Developer',
+        role: validation.isAdmin ? 'admin' : 'user',
+        tenant_id: tenantId,
+        active_tenant_id: tenantId,
+        active_collection: 'ue5_docs',
+        active_domain_id: 'godot_4',
+      };
+
+      localStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(user));
+
+      return {
+        token: apiKey,
+        user,
+      };
+    } catch (err) {
+      // Clean up on failure
+      localStorage.removeItem(STORAGE_KEYS.TOKEN);
+
+      // Re-throw with better message if it's a generic error
+      if (err instanceof Error) {
+        throw err;
+      }
+      throw new Error('Falha na conexão com o servidor. Verifique se o backend está acessível.');
+    }
+  }
+
+  // 2. Development mode fallback (only in DEV mode with VITE_DEV_AUTH_FALLBACK)
+  if (import.meta.env.DEV || import.meta.env.VITE_DEV_AUTH_FALLBACK === 'true') {
+    const devUser: User = {
+      id: 'dev-user-001',
+      name: request.username || 'Developer (Dev Mode)',
+      email: 'dev@ai.studio',
       role: 'admin',
       tenant_id: tenantId,
       active_tenant_id: tenantId,
       active_collection: 'ue5_docs',
       active_domain_id: 'godot_4',
     };
+    const devToken = `dev-jwt-token-${Date.now()}`;
 
-    localStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(user));
+    localStorage.setItem(STORAGE_KEYS.TOKEN, devToken);
+    localStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(devUser));
+    localStorage.setItem(STORAGE_KEYS.ACTIVE_TENANT, tenantId);
 
     return {
-      token: apiKey,
-      user,
+      token: devToken,
+      user: devUser,
     };
   }
 
-  // 2. Standard JWT Login Endpoint (if username / password provided)
-  try {
-    const response = await apiClient.post<AuthTokenPayload>('/auth/token', {
-      username: request.username,
-      password: request.password,
-      tenant_slug: tenantId,
-    });
-
-    const payload = response.data;
-    localStorage.setItem(STORAGE_KEYS.TOKEN, payload.token);
-    localStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(payload.user));
-    localStorage.setItem(STORAGE_KEYS.ACTIVE_TENANT, payload.user.tenant_id || tenantId);
-
-    return payload;
-  } catch (err) {
-    // If standard /auth/token endpoint isn't enabled yet, support Dev Mode login
-    if (import.meta.env.DEV || import.meta.env.VITE_DEV_AUTH_FALLBACK === 'true') {
-      const devUser: User = {
-        id: 'dev-user-001',
-        name: request.username || 'UE5 Developer (Dev Mode)',
-        email: 'dev@ai.studio',
-        role: 'admin',
-        tenant_id: tenantId,
-        active_tenant_id: tenantId,
-        active_collection: 'ue5_docs',
-        active_domain_id: 'godot_4',
-      };
-      const devToken = `dev-jwt-token-${Date.now()}`;
-
-      localStorage.setItem(STORAGE_KEYS.TOKEN, devToken);
-      localStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(devUser));
-      localStorage.setItem(STORAGE_KEYS.ACTIVE_TENANT, tenantId);
-
-      return {
-        token: devToken,
-        user: devUser,
-      };
-    }
-    throw err;
-  }
+  throw new Error('Credenciais inválidas. Forneça uma API Key válida.');
 }
 
 /**
@@ -104,6 +154,7 @@ export function logout(): void {
   localStorage.removeItem(STORAGE_KEYS.USER);
   localStorage.removeItem(STORAGE_KEYS.ACTIVE_TENANT);
   localStorage.removeItem(STORAGE_KEYS.ACTIVE_COLLECTION);
+  localStorage.removeItem(STORAGE_KEYS.ACTIVE_DOMAIN);
 }
 
 /**
@@ -126,17 +177,46 @@ export async function getCurrentUser(): Promise<User | null> {
   return {
     id: 'active-user',
     name: 'Authenticated User',
-    role: 'admin',
+    role: 'user',
     tenant_id: localStorage.getItem(STORAGE_KEYS.ACTIVE_TENANT) || 'default',
   };
 }
 
 /**
+ * Verifies if the current session is still valid by making an authenticated request.
+ */
+export async function verifySession(): Promise<boolean> {
+  const token = localStorage.getItem(STORAGE_KEYS.TOKEN);
+  if (!token) return false;
+
+  try {
+    // Try a lightweight authenticated endpoint
+    await apiClient.get('/sessions');
+    return true;
+  } catch (err) {
+    const status = err && typeof err === 'object' && 'status' in err ? (err as { status: number }).status : 0;
+    if (status === 401) {
+      // Session is invalid - clear it
+      logout();
+      return false;
+    }
+    // Other errors don't necessarily mean the session is invalid
+    return true;
+  }
+}
+
+/**
  * Renews / refreshes the JWT token if supported by backend.
+ * Note: API Keys don't support refresh - they remain valid until revoked.
  */
 export async function refreshToken(): Promise<string | null> {
   const token = localStorage.getItem(STORAGE_KEYS.TOKEN);
   if (!token) return null;
+
+  // API Keys don't support refresh
+  if (isApiKey(token)) {
+    return token;
+  }
 
   try {
     const response = await apiClient.post<{ token: string }>('/auth/refresh');

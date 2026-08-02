@@ -48,6 +48,13 @@ export function getStoredToken(): string | null {
 }
 
 /**
+ * Checks if a token appears to be an API Key (starts with 'ue5_').
+ */
+export function isApiKey(token: string | null): boolean {
+  return token !== null && token.startsWith('ue5_');
+}
+
+/**
  * Retrieves the currently selected Tenant ID (e.g. 'ue5-official' or 'default').
  */
 export function getStoredTenantId(): string | null {
@@ -71,6 +78,7 @@ export function getStoredDomainId(): string | null {
 
 /**
  * Returns complete Headers object for native Fetch API calls (e.g., SSE streaming).
+ * API Keys (ue5_*) are sent as X-API-Key header, JWT tokens as Authorization: Bearer.
  */
 export function getAuthHeaders(additionalHeaders: Record<string, string> = {}): Record<string, string> {
   const headers: Record<string, string> = {
@@ -80,11 +88,13 @@ export function getAuthHeaders(additionalHeaders: Record<string, string> = {}): 
 
   const token = getStoredToken();
   if (token) {
-    // Supports either standard JWT Bearer token or custom API key
-    if (token.startsWith('Bearer ') || token.length > 50) {
-      headers['Authorization'] = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
-    } else {
+    // API Keys (prefixed with 'ue5_') go in X-API-Key header
+    // JWT tokens go in Authorization: Bearer header
+    if (isApiKey(token)) {
       headers['X-API-Key'] = token;
+    } else if (token.startsWith('Bearer ')) {
+      headers['Authorization'] = token;
+    } else {
       headers['Authorization'] = `Bearer ${token}`;
     }
   }
@@ -105,12 +115,21 @@ export function getAuthHeaders(additionalHeaders: Record<string, string> = {}): 
 // ============================================================================
 // REQUEST INTERCEPTOR
 // Automatically injects Authorization token and X-Tenant-ID / X-Domain-ID headers
+// API Keys are sent as X-API-Key header, JWT tokens as Authorization: Bearer
 // ============================================================================
 apiClient.interceptors.request.use(
   (config: InternalAxiosRequestConfig) => {
     const token = getStoredToken();
     if (token && config.headers) {
-      config.headers.Authorization = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
+      // API Keys (prefixed with 'ue5_') go in X-API-Key header
+      // JWT tokens go in Authorization: Bearer header
+      if (isApiKey(token)) {
+        config.headers['X-API-Key'] = token;
+      } else if (token.startsWith('Bearer ')) {
+        config.headers.Authorization = token;
+      } else {
+        config.headers.Authorization = `Bearer ${token}`;
+      }
     }
 
     const tenantId = getStoredTenantId();

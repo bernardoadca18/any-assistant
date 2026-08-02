@@ -33,6 +33,7 @@ export interface AppState {
   isAuthenticated: boolean;
   authLoading: boolean;
   authError: string | null;
+  isVerifying: boolean;
 
   // Active Multi-Tenant & Collection Contexts
   activeTenant: string;
@@ -53,6 +54,7 @@ export interface AppState {
   loginWithCredentials: (username?: string, password?: string, tenantSlug?: string) => Promise<void>;
   logout: () => void;
   setUser: (user: User | null) => void;
+  verifySession: () => Promise<boolean>;
   setToken: (token: string | null) => void;
   setActiveTenant: (tenantId: string) => Promise<void>;
   setActiveCollection: (collectionName: string) => void;
@@ -125,6 +127,31 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   systemHealth: null,
   isHealthChecking: false,
+  isVerifying: false,
+
+  /**
+   * Verifies if the current session is still valid
+   */
+  verifySession: async () => {
+    set({ isVerifying: true });
+    try {
+      const isValid = await authService.verifySession();
+      if (!isValid) {
+        set({
+          isAuthenticated: false,
+          user: null,
+          token: null,
+          isVerifying: false,
+        });
+      } else {
+        set({ isVerifying: false });
+      }
+      return isValid;
+    } catch {
+      set({ isVerifying: false });
+      return false;
+    }
+  },
 
   /**
    * Login with API Key (attaches API Key header to requests)

@@ -129,39 +129,34 @@ export const TenantModal: React.FC<TenantModalProps> = ({ isOpen, onClose }) => 
             </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-              {[
-                { id: 'Enterprise_Alpha', slug: 'Enterprise_Alpha', name: 'Enterprise_Alpha' },
-                { id: 'ue5-official', slug: 'ue5-official', name: 'ue5-official' },
-                { id: 'godot-core', slug: 'godot-core', name: 'godot-core' },
-                { id: 'default', slug: 'default', name: 'default' },
-                ...tenantsList.filter(
-                  (t) =>
-                    !['Enterprise_Alpha', 'ue5-official', 'godot-core', 'default'].includes(
-                      t.slug
-                    )
-                ),
-              ].map((tenant) => {
-                const isActive = activeTenant === tenant.id || activeTenant === tenant.slug;
-                return (
-                  <button
-                    key={tenant.id}
-                    onClick={() => setActiveTenant(tenant.slug || tenant.id)}
-                    type="button"
-                    className={`px-3 py-2 rounded-lg border text-left transition-all ${
-                      isActive
-                        ? 'bg-indigo-950/80 border-indigo-600 text-indigo-200 font-semibold'
-                        : 'bg-[#1C1C1F] border-[#27272A] text-zinc-400 hover:text-zinc-200 hover:border-zinc-700'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs truncate font-mono">
-                        {tenant.name || tenant.id}
-                      </span>
-                      {isActive && <Check className="w-3.5 h-3.5 text-indigo-400 flex-shrink-0" />}
-                    </div>
-                  </button>
-                );
-              })}
+              {tenantsList.length === 0 ? (
+                <div className="col-span-2 sm:col-span-3 py-6 text-center text-zinc-500 text-xs">
+                  {registriesLoading ? 'Carregando tenants...' : 'Nenhum tenant disponível. Faça login com uma API Key de admin.'}
+                </div>
+              ) : (
+                tenantsList.map((tenant) => {
+                  const isActive = activeTenant === tenant.id || activeTenant === tenant.slug;
+                  return (
+                    <button
+                      key={tenant.id}
+                      onClick={() => setActiveTenant(tenant.slug || tenant.id)}
+                      type="button"
+                      className={`px-3 py-2 rounded-lg border text-left transition-all ${
+                        isActive
+                          ? 'bg-indigo-950/80 border-indigo-600 text-indigo-200 font-semibold'
+                          : 'bg-[#1C1C1F] border-[#27272A] text-zinc-400 hover:text-zinc-200 hover:border-zinc-700'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs truncate font-mono">
+                          {tenant.name || tenant.id}
+                        </span>
+                        {isActive && <Check className="w-3.5 h-3.5 text-indigo-400 flex-shrink-0" />}
+                      </div>
+                    </button>
+                  );
+                })
+              )}
             </div>
           </div>
 
@@ -259,48 +254,40 @@ export const TenantModal: React.FC<TenantModalProps> = ({ isOpen, onClose }) => 
               </form>
             ) : (
               <div className="grid grid-cols-2 gap-2 max-h-40 overflow-y-auto pr-1">
-                {[
-                  { name: 'ue5_docs', qdrant_collection_name: 'ue5_docs', display_name: 'UE5 Core Documentation', domain_id: 'ue5' },
-                  { name: 'ue5_samples', qdrant_collection_name: 'ue5_samples', display_name: 'UE5 Samples & Lyra', domain_id: 'ue5' },
-                  { name: 'godot4_docs', qdrant_collection_name: 'godot4_docs', display_name: 'Godot 4.x Reference', domain_id: 'godot_4' },
-                  { name: 'FinOps_Collection', qdrant_collection_name: 'FinOps_Collection', display_name: 'Financial Reports Q4', domain_id: 'godot_4' },
-                  ...collectionsList.filter(
-                    (c) =>
-                      ![
-                        'ue5_docs',
-                        'ue5_samples',
-                        'godot4_docs',
-                        'FinOps_Collection',
-                      ].includes(c.qdrant_collection_name)
-                  ),
-                ].map((coll) => {
-                  const isActive =
-                    activeCollection === coll.name || activeCollection === coll.qdrant_collection_name;
-                  return (
-                    <button
-                      key={coll.name || coll.qdrant_collection_name}
-                      onClick={() =>
-                        setActiveCollection(coll.name || coll.qdrant_collection_name)
-                      }
-                      type="button"
-                      className={`p-3 rounded-lg border text-left transition-all ${
-                        isActive
-                          ? 'bg-indigo-950/80 border-indigo-600 text-indigo-200 font-semibold'
-                          : 'bg-[#1C1C1F] border-[#27272A] text-zinc-400 hover:text-zinc-200 hover:border-zinc-700'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs truncate font-mono">
-                          {coll.name || coll.qdrant_collection_name}
+                {collectionsList.length === 0 ? (
+                  <div className="col-span-2 py-4 text-center text-zinc-500 text-xs">
+                    Nenhuma coleção disponível. Crie uma nova coleção para começar.
+                  </div>
+                ) : (
+                  collectionsList.map((coll) => {
+                    const isActive =
+                      activeCollection === coll.name || activeCollection === coll.qdrant_collection_name;
+                    return (
+                      <button
+                        key={coll.name || coll.qdrant_collection_name}
+                        onClick={() =>
+                          setActiveCollection(coll.name || coll.qdrant_collection_name)
+                        }
+                        type="button"
+                        className={`p-3 rounded-lg border text-left transition-all ${
+                          isActive
+                            ? 'bg-indigo-950/80 border-indigo-600 text-indigo-200 font-semibold'
+                            : 'bg-[#1C1C1F] border-[#27272A] text-zinc-400 hover:text-zinc-200 hover:border-zinc-700'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs truncate font-mono">
+                            {coll.name || coll.qdrant_collection_name}
+                          </span>
+                          {isActive && <Check className="w-3.5 h-3.5 text-indigo-400 flex-shrink-0" />}
+                        </div>
+                        <span className="text-[10px] text-zinc-500 block truncate mt-0.5">
+                          {coll.display_name}
                         </span>
-                        {isActive && <Check className="w-3.5 h-3.5 text-indigo-400 flex-shrink-0" />}
-                      </div>
-                      <span className="text-[10px] text-zinc-500 block truncate mt-0.5">
-                        {coll.display_name}
-                      </span>
-                    </button>
-                  );
-                })}
+                      </button>
+                    );
+                  })
+                )}
               </div>
             )}
           </div>

@@ -16,6 +16,7 @@ import {
   ChevronRight,
   Copy,
   Key,
+  Lock,
   Loader2,
   Plus,
   Shield,
@@ -24,6 +25,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
+import { useAppStore } from '@/store/useAppStore';
 import * as tenantService from '@/services/tenantService';
 import type { APIKeyCreateResponse, APIKeyResponse, TenantCreate, TenantResponse } from '@/types';
 
@@ -428,6 +430,8 @@ const TenantDetailDrawer: React.FC<{
 // Main View
 // ============================================================================
 export const TenantManagerView: React.FC = () => {
+  const { isAuthenticated, user } = useAppStore();
+
   const [tenants, setTenants] = useState<TenantResponse[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -435,7 +439,12 @@ export const TenantManagerView: React.FC = () => {
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [selectedTenant, setSelectedTenant] = useState<TenantResponse | null>(null);
 
+  // Check if user has admin privileges
+  const isAdmin = user?.role === 'admin';
+  const canManage = isAuthenticated && isAdmin;
+
   const loadTenants = async (targetPage: number) => {
+    if (!canManage) return;
     setLoading(true);
     try {
       const res = await tenantService.listTenants({ page: targetPage, page_size: PAGE_SIZE });
@@ -452,9 +461,51 @@ export const TenantManagerView: React.FC = () => {
   useEffect(() => {
     loadTenants(page);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page]);
+  }, [page, canManage]);
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+  // Not authenticated state
+  if (!isAuthenticated) {
+    return (
+      <div className="flex-1 overflow-y-auto p-6 md:p-8">
+        <div className="max-w-5xl mx-auto">
+          <div className="flex flex-col items-center justify-center py-16 text-center gap-4">
+            <div className="w-14 h-14 rounded-2xl bg-zinc-800/50 flex items-center justify-center">
+              <Lock className="w-7 h-7 text-zinc-500" />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold text-zinc-300">Autenticação Necessária</h2>
+              <p className="text-sm text-zinc-500 mt-1 max-w-md">
+                Faça login com uma API Key válida para gerenciar tenants e chaves de API.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Not admin state
+  if (!isAdmin) {
+    return (
+      <div className="flex-1 overflow-y-auto p-6 md:p-8">
+        <div className="max-w-5xl mx-auto">
+          <div className="flex flex-col items-center justify-center py-16 text-center gap-4">
+            <div className="w-14 h-14 rounded-2xl bg-amber-900/30 flex items-center justify-center">
+              <ShieldOff className="w-7 h-7 text-amber-400" />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold text-zinc-300">Privilégios de Admin Necessários</h2>
+              <p className="text-sm text-zinc-500 mt-1 max-w-md">
+                Sua API Key não possui privilégios de administrador. A gestão de tenants requer uma chave com is_admin=true.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex-1 overflow-y-auto p-6 md:p-8">

@@ -13,6 +13,7 @@ import {
   CheckCircle2,
   FolderInput,
   HelpCircle,
+  Lock,
   Loader2,
   Package,
   Tag,
@@ -23,9 +24,30 @@ import { processFolder, getIngestionJobHistory } from '@/services/ingestionServi
 import type { IngestAcceptedResponse, IngestionContentType, IngestionJobStatus } from '@/types';
 
 export const FolderIngestionView: React.FC = () => {
-  const { activeDomainId } = useAppStore();
+  const { activeDomainId, isAuthenticated } = useAppStore();
 
   const [folderPath, setFolderPath] = useState('');
+
+  // Not authenticated state
+  if (!isAuthenticated) {
+    return (
+      <div className="flex-1 overflow-y-auto p-6 md:p-8">
+        <div className="max-w-3xl mx-auto">
+          <div className="flex flex-col items-center justify-center py-16 text-center gap-4">
+            <div className="w-14 h-14 rounded-2xl bg-zinc-800/50 flex items-center justify-center">
+              <Lock className="w-7 h-7 text-zinc-500" />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold text-zinc-300">Autenticação Necessária</h2>
+              <p className="text-sm text-zinc-500 mt-1 max-w-md">
+                Faça login com uma API Key válida para executar pipelines de ingestão de código e documentação.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
   const [contentType, setContentType] = useState<IngestionContentType>('source_code');
   const [projectSource, setProjectSource] = useState('');
   const [ueVersion, setUeVersion] = useState('');
