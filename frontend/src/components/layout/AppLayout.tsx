@@ -22,9 +22,12 @@ import {
   ChevronRight,
   Database,
   ExternalLink,
+  FileText,
   Gamepad2,
+  LayoutDashboard,
   MessageSquare,
   Settings2,
+  Shield,
   Users,
   Wrench,
 } from 'lucide-react';
@@ -32,20 +35,32 @@ import { useAppStore } from '@/store/useAppStore';
 import { getDevHubLinks } from '@/config/links';
 import type { DependencyStatusType } from '@/types';
 
-export type AppView = 'chat' | 'ingestion' | 'tenants' | 'collections' | 'devhub';
+export type AppView =
+  | 'chat'
+  | 'ingestion'
+  | 'jobs'
+  | 'tenants'
+  | 'collections'
+  | 'collection-config'
+  | 'admin'
+  | 'devhub';
 
 interface NavItem {
   id: AppView;
   label: string;
   icon: React.ElementType;
   description: string;
+  adminOnly?: boolean;
 }
 
 const NAV_ITEMS: NavItem[] = [
   { id: 'chat', label: 'Chat Workspace', icon: MessageSquare, description: 'Converse com o assistente RAG' },
   { id: 'ingestion', label: 'Ingestão ETL', icon: Boxes, description: 'Processar pastas de código/docs' },
-  { id: 'tenants', label: 'Tenants', icon: Users, description: 'Gerenciar tenants e API keys' },
+  { id: 'jobs', label: 'Jobs', icon: FileText, description: 'Histórico de ingestão' },
+  { id: 'tenants', label: 'Tenants', icon: Users, description: 'Gerenciar tenants e API keys', adminOnly: true },
   { id: 'collections', label: 'Coleções', icon: Database, description: 'Coleções vetoriais Qdrant' },
+  { id: 'collection-config', label: 'Configuração', icon: Settings2, description: 'Configurar coleções', adminOnly: true },
+  { id: 'admin', label: 'Administração', icon: LayoutDashboard, description: 'Painel administrativo', adminOnly: true },
   { id: 'devhub', label: 'Dev Hub', icon: Wrench, description: 'Saúde do sistema e atalhos' },
 ];
 

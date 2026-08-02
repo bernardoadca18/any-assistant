@@ -12,8 +12,11 @@ import React, { useState } from 'react';
 import { AppLayout, type AppView } from '@/components/layout/AppLayout';
 import { ChatWorkspace } from '@/views/ChatWorkspace';
 import { FolderIngestionView } from '@/views/FolderIngestionView';
+import { IngestionJobsView } from '@/views/IngestionJobsView';
 import { TenantManagerView } from '@/views/TenantManagerView';
 import { CollectionManagerView } from '@/views/CollectionManagerView';
+import { CollectionConfigView } from '@/views/CollectionConfigView';
+import { AdminDashboardView } from '@/views/AdminDashboardView';
 import { DevHubView } from '@/views/DevHubView';
 
 export default function App() {
@@ -23,8 +26,11 @@ export default function App() {
     <AppLayout activeView={activeView} onChangeView={setActiveView}>
       {activeView === 'chat' && <ChatWorkspace />}
       {activeView === 'ingestion' && <FolderIngestionView />}
+      {activeView === 'jobs' && <IngestionJobsView />}
       {activeView === 'tenants' && <TenantManagerView />}
       {activeView === 'collections' && <CollectionManagerView />}
+      {activeView === 'collection-config' && <CollectionConfigView />}
+      {activeView === 'admin' && <AdminDashboardView />}
       {activeView === 'devhub' && <DevHubView />}
     </AppLayout>
   );

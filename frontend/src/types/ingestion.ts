@@ -34,7 +34,7 @@ export interface FileIngestionPayload {
   ue_version?: string;
 }
 
-export type IngestionJobStatusType = 'queued' | 'processing' | 'completed' | 'failed';
+export type IngestionJobStatusType = 'pending' | 'running' | 'completed' | 'failed';
 
 export interface IngestionJobStatus {
   id: string;
@@ -44,8 +44,9 @@ export interface IngestionJobStatus {
   sample_mode: boolean;
   domain_id: string;
   status: IngestionJobStatusType;
-  created_at: string;
-  updated_at: string;
+  started_at: string;
+  completed_at?: string;
+  error_message?: string;
   message?: string;
   processed_files?: number;
   total_files?: number;
