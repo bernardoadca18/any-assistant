@@ -420,18 +420,25 @@ async def _authenticate_via_tenant_id(
             detail="X-Tenant-ID authentication only available in development mode.",
         )
 
+    # Try to parse as UUID first, then fall back to slug lookup
+    tenant_id = None
     try:
         tenant_id = uuid.UUID(tenant_id_str)
     except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid tenant ID format.",
+        # Not a UUID, try to find tenant by slug
+        pass
+
+    if tenant_id:
+        # Fetch tenant by UUID
+        result = await db.execute(
+            select(Tenant).where(Tenant.id == tenant_id)
+        )
+    else:
+        # Fetch tenant by slug
+        result = await db.execute(
+            select(Tenant).where(Tenant.slug == tenant_id_str)
         )
 
-    # Fetch tenant
-    result = await db.execute(
-        select(Tenant).where(Tenant.id == tenant_id)
-    )
     tenant = result.scalar_one_or_none()
 
     if tenant is None or not tenant.is_active:

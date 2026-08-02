@@ -19,6 +19,7 @@ import type {
   RetrievedChunk,
   SessionDetailResponse,
   SessionSummaryResponse,
+  ModelInfo,
 } from '@/types';
 
 export interface ChatStreamCallbacks {
@@ -287,4 +288,12 @@ export async function getSessionDetail(sessionId: string): Promise<SessionDetail
  */
 export async function deleteSession(sessionId: string): Promise<void> {
   await apiClient.delete(`/sessions/${sessionId}`);
+}
+
+/**
+ * Fetches available models from the backend (proxied from LiteLLM).
+ */
+export async function listModels(): Promise<ModelInfo[]> {
+  const response = await apiClient.get<ModelInfo[]>('/chat/models');
+  return response.data;
 }

@@ -24,12 +24,14 @@ import {
 } from 'lucide-react';
 import { useAppStore } from '@/store/useAppStore';
 import * as chatService from '@/services/chatService';
+import { getBackendRootUrl, getQdrantDashboardUrl } from '@/config/links';
 import type {
   ChatAttachment,
   ChatHyperparameters,
   ChatRequest,
   MessageResponse,
   RetrievedChunk,
+  ModelInfo,
 } from '@/types';
 
 interface ChatViewProps {
@@ -48,7 +50,7 @@ export const ChatView: React.FC<ChatViewProps> = ({ sessionId, onResetSession })
       status: 'success',
       content:
         'Bem-vindo ao **RAG.CORE Assistant**! O pipeline está conectado à documentação oficial e código-fonte via LiteLLM & Qdrant.\n\nVocê pode me fazer perguntas técnicas sobre C++, GDScript ou APIs do motor, anexar arquivos de contexto inline, ou testar a resposta em streaming (**SSE**).',
-      model_used: 'ollama/qwen2.5-coder:7b',
+      model_used: '',
       sequence_number: 1,
       created_at: new Date().toISOString(),
       retrieved_chunks: [
@@ -85,7 +87,7 @@ export const ChatView: React.FC<ChatViewProps> = ({ sessionId, onResetSession })
 
   // Hyperparameters
   const [params, setParams] = useState<ChatHyperparameters>({
-    model: 'ollama/qwen2.5-coder:7b',
+    model: '',
     top_k: 5,
     temperature: 0.7,
     top_p: 0.95,
@@ -93,6 +95,9 @@ export const ChatView: React.FC<ChatViewProps> = ({ sessionId, onResetSession })
       'You are an expert engine developer AI assistant. Provide concise, highly accurate C++ and GDScript answers with direct references to official documentation and header files.',
     domain_id: activeDomainId,
   });
+
+  const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -106,10 +111,41 @@ export const ChatView: React.FC<ChatViewProps> = ({ sessionId, onResetSession })
     setParams((prev) => ({ ...prev, domain_id: activeDomainId }));
   }, [activeDomainId]);
 
+  // Fetch models on mount
+  useEffect(() => {
+    const fetchModels = async () => {
+      setModelsLoading(true);
+      try {
+        const models = await chatService.listModels();
+        setAvailableModels(models);
+        // Auto-select first model if none selected
+        if (models.length > 0) {
+          setParams((prev) => {
+            if (!prev.model) {
+              return { ...prev, model: models[0].id };
+            }
+            return prev;
+          });
+        }
+      } catch (err) {
+        console.error('Failed to fetch models:', err);
+      } finally {
+        setModelsLoading(false);
+      }
+    };
+    fetchModels();
+  }, []);
+
   const handleSendMessage = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const text = inputMessage.trim();
     if (!text || isStreaming) return;
+
+    // Validate model is selected
+    if (!params.model) {
+      alert('Selecione um modelo antes de enviar a mensagem.');
+      return;
+    }
 
     const userMessageId = `user-${Date.now()}`;
     const assistantMessageId = `assistant-${Date.now()}`;
@@ -248,7 +284,7 @@ export const ChatView: React.FC<ChatViewProps> = ({ sessionId, onResetSession })
                   status: 'error',
                   error_detail: errorMsg,
                   content:
-                    'Erro na comunicação com a API de Chat. Verifique se o servidor FastAPI está rodando em http://localhost:8000.',
+                    'Erro na comunicação com a API de Chat. Verifique se o servidor FastAPI está rodando.',
                 }
               : msg
           )
@@ -539,15 +575,28 @@ export const ChatView: React.FC<ChatViewProps> = ({ sessionId, onResetSession })
             {/* Model Input */}
             <div className="space-y-1.5">
               <span className="text-[11px] text-zinc-400 font-medium">LiteLLM Model</span>
+              {modelsLoading && (
+                <div className="flex items-center gap-2 text-xs text-zinc-500">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+                  Carregando modelos...
+                </div>
+              )}
               <select
                 value={params.model}
                 onChange={(e) => setParams({ ...params, model: e.target.value })}
                 className="w-full bg-[#1C1C1F] border border-[#27272A] rounded px-2 py-1.5 text-xs text-zinc-200 outline-none focus:border-indigo-500"
+                disabled={modelsLoading}
               >
-                <option value="ollama/qwen2.5-coder:7b">qwen2.5-coder:7b (Local)</option>
-                <option value="ollama/deepseek-r1:8b">deepseek-r1:8b</option>
-                <option value="gemini-2.5-pro">gemini-2.5-pro (LiteLLM Proxy)</option>
-                <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                {availableModels.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.id}
+                  </option>
+                ))}
+                {availableModels.length === 0 && !modelsLoading && (
+                  <option value="" disabled>
+                    Nenhum modelo disponível
+                  </option>
+                )}
               </select>
             </div>
 
@@ -625,7 +674,7 @@ export const ChatView: React.FC<ChatViewProps> = ({ sessionId, onResetSession })
             Dev Links
           </h3>
           <a
-            href="http://localhost:8000/docs"
+            href={getBackendRootUrl() + '/docs'}
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center justify-between text-xs text-zinc-400 hover:text-indigo-400 transition-colors"
@@ -634,7 +683,7 @@ export const ChatView: React.FC<ChatViewProps> = ({ sessionId, onResetSession })
             <ExternalLink className="w-3 h-3 text-zinc-600" />
           </a>
           <a
-            href="http://localhost:6333/dashboard"
+            href={getQdrantDashboardUrl()}
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center justify-between text-xs text-zinc-400 hover:text-indigo-400 transition-colors"

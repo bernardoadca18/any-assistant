@@ -3,12 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * ChatSettingsPopover — popover de parâmetros do chat:
- * modelo (default: ollama/qwen2.5-coder:7b), top_k (slider 1-20) e
+ * modelo (busca dinâmica do LiteLLM), top_k (slider 1-20) e
  * project_source_filter.
  */
 
-import React, { useState } from 'react';
-import { Filter, Settings2, Sparkles, X } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Filter, Settings2, Sparkles, X, Loader2 } from 'lucide-react';
+import { listModels } from '@/services/chatService';
+import type { ModelInfo } from '@/types';
 
 export interface ChatSettings {
   model: string;
@@ -21,20 +23,38 @@ interface ChatSettingsPopoverProps {
   onChange: (settings: ChatSettings) => void;
 }
 
-const MODEL_OPTIONS = [
-  'ollama/qwen2.5-coder:7b',
-  'ollama/qwen2.5-coder:14b',
-  'ollama/deepseek-coder-v2:16b',
-  'gemini/gemini-2.0-flash',
-];
-
 export const ChatSettingsPopover: React.FC<ChatSettingsPopoverProps> = ({ settings, onChange }) => {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<ChatSettings>(settings);
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
 
   const openPopover = () => {
     setDraft(settings);
     setOpen(true);
+    // Fetch models when popover opens if not already loaded
+    if (models.length === 0 && !modelsLoading) {
+      fetchModels();
+    }
+  };
+
+  const fetchModels = async () => {
+    setModelsLoading(true);
+    setModelsError(null);
+    try {
+      const modelList = await listModels();
+      setModels(modelList);
+      // Auto-select first model if none in draft
+      if (modelList.length > 0 && !draft.model) {
+        setDraft((d) => ({ ...d, model: modelList[0].id }));
+      }
+    } catch (err) {
+      setModelsError('Falha ao carregar modelos do LiteLLM');
+      console.error('Failed to fetch models:', err);
+    } finally {
+      setModelsLoading(false);
+    }
   };
 
   const apply = () => {
@@ -72,17 +92,45 @@ export const ChatSettingsPopover: React.FC<ChatSettingsPopoverProps> = ({ settin
               {/* Model */}
               <div className="space-y-1.5">
                 <label className="text-xs font-semibold text-zinc-300">Modelo (LiteLLM)</label>
+                {modelsLoading && (
+                  <div className="flex items-center gap-2 text-xs text-zinc-500">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+                    Carregando modelos...
+                  </div>
+                )}
+                {modelsError && (
+                  <div className="text-xs text-rose-400 flex items-center gap-1">
+                    <span>{modelsError}</span>
+                    <button
+                      type="button"
+                      onClick={fetchModels}
+                      className="text-indigo-400 hover:underline"
+                    >
+                      Tentar novamente
+                    </button>
+                  </div>
+                )}
                 <select
                   value={draft.model}
                   onChange={(e) => setDraft((d) => ({ ...d, model: e.target.value }))}
                   className="w-full bg-[#1C1C1F] border border-[#27272A] rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 outline-none focus:border-indigo-500"
+                  disabled={modelsLoading}
                 >
-                  {MODEL_OPTIONS.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
+                  {models.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.id}
                     </option>
                   ))}
-                  {!MODEL_OPTIONS.includes(draft.model) && <option value={draft.model}>{draft.model}</option>}
+                  {!modelsLoading && models.length === 0 && (
+                    <option value="" disabled>
+                      Nenhum modelo disponível
+                    </option>
+                  )}
+                  {!modelsLoading && models.length > 0 && !models.some(m => m.id === draft.model) && (
+                    <option value={draft.model}>
+                      {draft.model} (atual)
+                    </option>
+                  )}
                 </select>
               </div>
 

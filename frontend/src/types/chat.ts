@@ -90,3 +90,11 @@ export interface ChatAttachment {
   raw_content?: string;
   uploaded_at: string;
 }
+
+// Model info from LiteLLM
+export interface ModelInfo {
+  id: string;
+  object: string;
+  created?: number | null;
+  owned_by?: string | null;
+}

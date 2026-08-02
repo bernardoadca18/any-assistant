@@ -78,3 +78,11 @@ class HealthResponse(BaseModel):
     version: str
     environment: str
     dependencies: dict[str, DependencyStatus]
+
+
+class ModelInfo(BaseModel):
+    """Model information from LiteLLM."""
+    id: str
+    object: str = "model"
+    created: int | None = None
+    owned_by: str | None = None

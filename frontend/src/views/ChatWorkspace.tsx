@@ -25,11 +25,11 @@ import {
 } from 'lucide-react';
 import { useAppStore } from '@/store/useAppStore';
 import * as sessionsService from '@/services/sessionsService';
-import { sendChatMessageStream } from '@/services/chatService';
+import { sendChatMessageStream, listModels } from '@/services/chatService';
 import { MarkdownMessage } from '@/components/chat/MarkdownMessage';
 import { SourcesPanel } from '@/components/chat/SourcesPanel';
 import { ChatSettingsPopover, type ChatSettings } from '@/components/chat/ChatSettingsPopover';
-import type { MessageResponse, RetrievedChunk, SessionSummaryResponse } from '@/types';
+import type { MessageResponse, RetrievedChunk, SessionSummaryResponse, ModelInfo } from '@/types';
 
 interface UiMessage {
   id: string;
@@ -76,10 +76,13 @@ export const ChatWorkspace: React.FC = () => {
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   const [chatSettings, setChatSettings] = useState<ChatSettings>({
-    model: 'ollama/qwen2.5-coder:7b',
+    model: '',
     top_k: 5,
     project_source_filter: '',
   });
+
+  const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
 
   const isNewUnsavedSession = useMemo(
     () => !sessions.some((s) => s.id === activeSessionId),
@@ -102,6 +105,31 @@ export const ChatWorkspace: React.FC = () => {
   useEffect(() => {
     loadSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Fetch models on mount
+  useEffect(() => {
+    const fetchModels = async () => {
+      setModelsLoading(true);
+      try {
+        const models = await listModels();
+        setAvailableModels(models);
+        // Auto-select first model if none selected
+        if (models.length > 0) {
+          setChatSettings((prev) => {
+            if (!prev.model) {
+              return { ...prev, model: models[0].id };
+            }
+            return prev;
+          });
+        }
+      } catch (err) {
+        console.error('Failed to fetch models:', err);
+      } finally {
+        setModelsLoading(false);
+      }
+    };
+    fetchModels();
   }, []);
 
   useEffect(() => {
@@ -156,6 +184,12 @@ export const ChatWorkspace: React.FC = () => {
   const handleSend = async () => {
     const trimmed = input.trim();
     if (!trimmed || isStreaming) return;
+
+    // Validate model is selected
+    if (!chatSettings.model) {
+      alert('Selecione um modelo antes de enviar a mensagem.');
+      return;
+    }
 
     const userMessage: UiMessage = {
       id: newLocalId(),

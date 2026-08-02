@@ -35,12 +35,53 @@ from app.core.domains.registry import domain_registry
 from app.db.postgres import get_db_session
 from app.db.qdrant import get_qdrant_client
 from app.db.redis import get_redis_client
-from app.schemas.chat import ChatRequest, ChatResponse
+from app.schemas.chat import ChatRequest, ChatResponse, ModelInfo
 from app.services.ai.rag_service import run_rag_pipeline, run_rag_pipeline_stream
 from app.services import session_service
 
 log = logging.getLogger(__name__)
 router = APIRouter()
+
+
+@router.get(
+    "/models",
+    response_model=list[ModelInfo],
+    summary="List available models from LiteLLM",
+    tags=["agent"],
+)
+async def list_models(
+    auth: CurrentTenant,
+):
+    """
+    Returns a list of available models from the LiteLLM proxy.
+    Proxies to LiteLLM's /models endpoint.
+    """
+    import httpx
+
+    client = httpx.AsyncClient(
+        base_url=settings.litellm_base_url,
+        headers=settings.litellm_headers,
+        timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
+    )
+
+    try:
+        resp = await client.get("/models")
+        resp.raise_for_status()
+        data = resp.json()
+        # LiteLLM returns OpenAI-compatible format: {"object": "list", "data": [{"id": "model-name", ...}]}
+        models = [ModelInfo(**m) for m in data.get("data", []) if m.get("id")]
+        return models
+    except Exception as exc:
+        log.error("Failed to fetch models from LiteLLM: %s", exc)
+        # Return fallback list on error
+        return [
+            ModelInfo(id="ollama/qwen2.5-coder:7b"),
+            ModelInfo(id="ollama/qwen2.5-coder:14b"),
+            ModelInfo(id="ollama/deepseek-coder-v2:16b"),
+            ModelInfo(id="gemini/gemini-2.0-flash"),
+        ]
+    finally:
+        await client.aclose()
 
 
 @router.post(
