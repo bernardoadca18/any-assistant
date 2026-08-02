@@ -1,0 +1,6 @@
+{
+  "name": "UE5 & Godot RAG Dev Hub",
+  "description": "Modern React + TypeScript frontend for UE5 and Godot RAG backend with multi-tenant auth, ingestion pipeline, streaming SSE chat, and developer hub.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
