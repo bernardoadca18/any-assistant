@@ -7,7 +7,7 @@
  * - Quick Links: Swagger, ReDoc, Qdrant Dashboard, LiteLLM, docs oficiais UE5/Godot
  */
 
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 import {
   Activity,
   AlertCircle,
@@ -24,6 +24,9 @@ import {
 import { useAppStore } from '@/store/useAppStore';
 import { getDevHubLinks } from '@/config/links';
 import type { DependencyStatusType } from '@/types';
+
+// Health check polling interval in milliseconds (30 seconds)
+const HEALTH_POLL_INTERVAL_MS = 30000;
 
 const ICON_MAP: Record<string, React.ElementType> = {
   FileText,
@@ -69,9 +72,23 @@ function statusVisual(status: DependencyStatusType) {
 
 export const DevHubView: React.FC = () => {
   const { systemHealth, isHealthChecking, checkSystemHealth } = useAppStore();
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Initial health check
   useEffect(() => {
     checkSystemHealth();
+
+    // Set up polling interval for health checks
+    intervalRef.current = setInterval(() => {
+      checkSystemHealth();
+    }, HEALTH_POLL_INTERVAL_MS);
+
+    // Cleanup interval on unmount
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

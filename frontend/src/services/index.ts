@@ -11,7 +11,25 @@
 
 export * from './apiClient';
 export * from './authService';
-export * from './chatService';
+
+// Chat service exports (excluding session-related functions to avoid conflict)
+export {
+  sendChatMessageStream,
+  createChatReadableStream,
+  sendChatMessageSync,
+  uploadChatContextAttachment,
+  type ChatStreamCallbacks,
+} from './chatService';
+
+// Session-related functions from chatService (renamed to avoid conflict)
+export {
+  listSessions as listSessionsFromChat,
+  getSessionDetail,
+  deleteSession as deleteSessionFromChat,
+} from './chatService';
+
 export * from './ingestionService';
 export * from './tenantService';
+
+// Sessions service is the primary source for session operations
 export * from './sessionsService';
