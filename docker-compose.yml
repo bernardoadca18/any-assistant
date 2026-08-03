@@ -61,7 +61,7 @@ services:
   # QDRANT — Vector Database (sem healthcheck interno — imagem distroless)
   # ---------------------------------------------------------------------------
   qdrant:
-    image: qdrant/qdrant:v1.10.1
+    image: qdrant/qdrant:v1.18.0
     container_name: ue5-qdrant
     restart: unless-stopped
     environment:
@@ -207,7 +207,7 @@ services:
     environment:
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6333"
-      QDRANT_COLLECTION: "ue5_docs"
+      QDRANT_COLLECTION: "godot_4"
       REDIS_HOST: agent-redis
       REDIS_PORT: "6379"
       REDIS_PASSWORD: ${AGENT_REDIS_PASSWORD}
@@ -248,3 +248,6 @@ services:
       - /mnt/c/Program Files/Epic Games/UE_5.8/Engine:/data/ue5_engine_root:ro
       - /mnt/c/Users/Bernardo.DESKTOP-G7D68S2/Downloads/Ingest_projects:/data/projects_source:ro
       - /mnt/c/Users/Bernardo.DESKTOP-G7D68S2/Documents/Unreal Projects:/data/sample_projects:ro
+
+      - /home/bernardo/godot_sources/godot_engine_4:/data/godot_engine_root:ro
+      - /home/bernardo/godot_sources/godot_docs_4:/data/godot_docs_root:ro

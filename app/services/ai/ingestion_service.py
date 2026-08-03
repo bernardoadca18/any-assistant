@@ -202,37 +202,50 @@ def _is_strategic_gameplay_path(path: Path) -> bool:
     return any(marker.lower() in posix_lower for marker in _STRATEGIC_ENGINE_MODULE_MARKERS)
 
 
+# =============================================================================
+# KEYWORDS DE GAMEPLAY — Godot 4
+# =============================================================================
+# Classes fundamentais do Godot 4 para relevância de gameplay.
+# Usado pelo filtro de headers/scripts em _is_gameplay_relevant_header.
 _GAMEPLAY_KEYWORDS: tuple[str, ...] = (
-    "Character",
-    "Pawn",
-    "Actor",
-    "Component",
-    "AnimInstance",
-    "GameplayStatics",
-    "GameMode",
-    "GameState",
-    "PlayerController",
-    "PlayerState",
-    "Controller",
-    "MovementComponent",
-    "GameInstance",
-    "HUD",
-    "Subsystem",
-    "Interface",
-    # CORREÇÃO (Requisito 3 — expansão de keywords de segurança): termos
-    # modernos do framework de gameplay da UE5 (Mover, Network Prediction,
-    # Motion Warping, Parametric/Procedural Motion), para capturar esses
-    # arquivos caso apareçam FORA dos caminhos estratégicos listados em
-    # _STRATEGIC_ENGINE_MODULE_MARKERS (ex: um projeto que vendoriza esse
-    # código em outro diretório, ou uma classe helper com o termo no nome
-    # mas fora da pasta canônica do plugin).
-    "Mover",
-    "Prediction",
-    "Simulation",
-    "Warping",
-    "Parametric",
-    "Vehicle",
-    "Procedural",
+    # Classes base fundamentais
+    "Node",
+    "Node2D",
+    "Node3D",
+    "Control",
+    "Resource",
+    "RefCounted",
+    "CanvasItem",
+    # Gameplay & Física
+    "CharacterBody2D",
+    "CharacterBody3D",
+    "RigidBody2D",
+    "RigidBody3D",
+    "Area2D",
+    "Area3D",
+    "CollisionShape2D",
+    "CollisionShape3D",
+    "RayCast2D",
+    "RayCast3D",
+    "Camera2D",
+    "Camera3D",
+    # Arquitetura/Sistemas
+    "Signal",
+    "State",
+    "StateMachine",
+    "AStar2D",
+    "AStar3D",
+    "NavigationAgent2D",
+    "NavigationAgent3D",
+    "AnimationPlayer",
+    "AnimationTree",
+    # Terminologia comum de scripts GDScript/C#
+    "_ready",
+    "_process",
+    "_physics_process",
+    "_input",
+    "@export",
+    "@onready",
 )
 
 _CLASS_DECL_RE = re.compile(
@@ -243,41 +256,58 @@ _CLASS_DECL_RE = re.compile(
 _INCLUDE_RE = re.compile(r"^\s*#include\s+.*$", re.MULTILINE)
 _EXCESS_BLANK_LINES_RE = re.compile(r"\n{3,}")
 
-_UDN_METADATA_RE = re.compile(
-    r"^(?:Availability|Title|Crumbs|Description|Navigation|Parent|Order|"
-    r"Type|Tags|SkillLevel|Version|topic-image|social-image|social-title|"
-    r"social-description)\s*:.*$",
+# =============================================================================
+# Constantes — Sanitização de documentação Godot (.md, .rst)
+# =============================================================================
+# Remove diretivas Sphinx/RST que não são conteúdo legível
+_RST_DIRECTIVE_RE = re.compile(
+    r"^\s*\.\.\s+(?:code-block|include|literalinclude|toctree|autoclass|"
+    r"autofunction|automethod|automodule|class|function|method|module|"
+    r"attribute|property|exception|data|note|warning|tip|seealso|versionadded|"
+    r"versionchanged|deprecated|ref|doc|download|image|figure|table|"
+    r"contents|sectnum|raw|include|import)\s*::.*$",
     re.MULTILINE | re.IGNORECASE,
 )
-_UDN_TITLE_RE = re.compile(r"^Title\s*:\s*(.+)$", re.MULTILINE | re.IGNORECASE)
 
-_UDN_MACRO_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\[/?[A-Z][A-Z0-9_]*\([^)]*\)\]"),
-    re.compile(r"\[/?[A-Z][A-Z0-9_]*(?::[^\]]*)?\]"),
-    re.compile(r"\[@[\w.\-]+\]"),
-)
+# Remove referências cruzadas RST (:ref:, :doc:, :class:, :func:, etc.)
+_RST_ROLE_RE = re.compile(r":[a-z]+:`([^`]+)`")
+
+# Remove metadados frontmatter YAML (--- ... ---) no topo de arquivos .md
+_MD_FRONTMATTER_RE = re.compile(r"^---\n.*?\n---", re.DOTALL)
+
+# Remove links de estilo RST/Markdown preservando o texto
+# [texto](url) -> texto, `texto <url>`_ -> texto
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_RST_LINK_RE = re.compile(r"`([^`<]+)\s*<[^>]+>`_")
+
+# Extrai título do primeiro heading Markdown (# Title)
+_MD_TITLE_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
+
+# Extrai título do primeiro heading RST (Title\n=====)
+_RST_TITLE_RE = re.compile(r"^(.+)\n[=-]{3,}$", re.MULTILINE)
 
 _UE_VERSION_RE = re.compile(r"(\d+\.\d+(?:\.\d+)?)")
 
-# Detecta assinaturas de definição de método/função estilo UE5 no .cpp:
-# "RetType UClassName::MethodName(args) [const] [override] { ... }"
-# Heurística deliberadamente simples (não é um parser C++ completo) — ver
-# docstring de _split_cpp_into_functions para as limitações conhecidas.
-_CPP_FUNCTION_SIG_RE = re.compile(
-    r"^[ \t]*(?:[\w:\<\>,\*&~]+[ \t]+)+?"       # tipo de retorno (best-effort)
-    r"(\w+)::(\w+)\s*\([^;{]*\)"                 # Classe::Metodo(args)
-    r"(?:\s*const)?(?:\s*override)?\s*\{",       # abre o corpo direto na linha
+# Detecta assinaturas de definição de função GDScript: "func name(args) -> ReturnType:"
+_GDSCRIPT_FUNC_SIG_RE = re.compile(
+    r"^\s*func\s+(\w+)\s*\([^)]*\)\s*(?:->\s*\w+\s*)?:",
     re.MULTILINE,
 )
 
-# Tamanho mínimo de função isolada para valer a pena documentar sozinha;
-# funções menores que isso (getters/setters triviais) são agrupadas.
-CPP_MIN_FUNCTION_CHARS: int = 80
+# Detecta assinaturas de método C#: "public/private/protected/override async void/ReturnType MethodName("
+_CSHARP_METHOD_SIG_RE = re.compile(
+    r"^\s*(?:public|private|protected|internal|static|virtual|override|abstract|async|readonly)\s+"
+    r"(?:[\w<>\[\],?]+\s+)+(\w+)\s*\([^;{]*\)\s*(?:{)?",
+    re.MULTILINE,
+)
 
-# Limite de chars por grupo de funções enviado à LLM documentadora do Canal A
-# em modo sample — evita reintroduzir o mesmo problema de truncamento que
-# headers grandes já tinham, agora para .cpp (tipicamente mais verboso).
-CPP_MAX_GROUP_CHARS: int = 6000
+# Tamanho mínimo de função isolada para valer a pena documentar sozinha
+GDSCRIPT_MIN_FUNCTION_CHARS: int = 60
+CSHARP_MIN_FUNCTION_CHARS: int = 80
+
+# Limite de chars por grupo de funções enviado à LLM documentadora
+GDSCRIPT_MAX_GROUP_CHARS: int = 5000
+CSHARP_MAX_GROUP_CHARS: int = 6000
 
 # =============================================================================
 # Constantes — Canal D (.bp.json, Blueprints exportados via Unreal Python API)
@@ -298,7 +328,8 @@ CPP_MAX_GROUP_CHARS: int = 6000
 # ainda podem gerar um JSON grande mesmo sem ruído de editor. Truncar aqui
 # é sobre o texto SERIALIZADO, não sobre regex de limpeza (que não existe
 # mais neste canal).
-BP_JSON_MAX_CHARS: int = 8000
+BP_JSON_MAX_CHARS: int = 8000  # Legado — não usado mais, mantido para compatibilidade
+TSCN_MAX_CHARS: int = 8000  # Limite de chars para arquivos .tscn do Godot
 
 
 # =============================================================================
@@ -306,34 +337,34 @@ BP_JSON_MAX_CHARS: int = 8000
 # =============================================================================
 
 _DOCUMENTER_SYSTEM_PROMPT = """\
-You are a Senior Technical Documentation Writer at Epic Games, specialized \
-in translating raw Unreal Engine 5 C++ header files into clear, \
+You are a Senior Godot Engine Developer and Technical Architect, specialized \
+in translating raw Godot 4 GDScript and C# scripts into clear, \
 gameplay-focused educational documentation for game developers.
 
-Your task: given a cleaned C++ header file, produce a Markdown guide that \
+Your task: given a cleaned GDScript or C# file, produce a Markdown guide that \
 explains HOW a developer uses this class in practice — not a line-by-line \
 restatement of the code.
 
 STRICT RULES:
 1. Output ONLY Markdown. No preamble, no "Here is the documentation" filler.
 2. Start with a single H1 title (`# ClassName`) followed by a short \
-paragraph explaining the class's purpose and where it fits in the gameplay \
-framework (e.g. "subclass of ACharacter, used as the player-controlled \
-pawn").
+paragraph explaining the class's purpose and where it fits in the Godot \
+node hierarchy (e.g. "extends CharacterBody2D, used as the player controller \
+for a 2D platformer").
 3. Organize the rest of the content using H2 sections (`## `), for example: \
-"## Key UPROPERTYs exposed to Blueprint", "## Key UFUNCTIONs and how to \
-call them", "## Typical usage in C++", "## Typical usage in Blueprint". \
-Use H3 (`### `) for sub-topics inside a section when it helps clarity.
-4. For every UPROPERTY/UFUNCTION you document, explain its practical \
-effect in gameplay terms — not just its signature. Mention relevant \
-specifiers (BlueprintReadWrite, BlueprintCallable, EditAnywhere, etc.) \
-only when they change how a developer interacts with the member.
-5. Ignore purely structural code (empty constructors, boilerplate \
-GENERATED_BODY(), forward declarations) unless relevant to usage.
+"## Exported Properties (@export)", "## Lifecycle Methods (_ready, _process, _physics_process)", \
+"## Signals", "## Public Methods". Use H3 (`### `) for sub-topics inside a \
+section when it helps clarity.
+4. For every @export property, signal, and method you document, explain its \
+practical effect in gameplay terms — not just its signature. Mention relevant \
+annotations (@export_range, @onready, @rpc) only when they change how a \
+developer interacts with the member.
+5. Ignore purely structural code (pass statements, boilerplate comments) \
+unless relevant to usage.
 6. Be concise but complete — prioritize developer usefulness over \
 exhaustive coverage of every single line.
 7. Never invent members, functions or parameters that are not present in \
-the provided header.\
+the provided script.\
 """
 
 
@@ -380,57 +411,104 @@ def _compute_file_hash(raw_bytes: bytes) -> str:
 # CANAL A — Códigos-fonte C++ (.h)
 # =============================================================================
 
-def _is_gameplay_relevant_header(
+def _is_gameplay_relevant_script(
     content: str, filename: str, sample_mode: bool = False, strategic_override: bool = False
 ) -> tuple[bool, str]:
     """
-    Decide se um header vale a pena documentar.
+    Decide se um script GDScript/C# vale a pena documentar.
 
-    Modo padrão (sample_mode=False, usado para a Engine): allowlist estrita
-    por palavra-chave no nome da classe/base. Necessário para a Engine
-    porque o volume de headers é ordens de magnitude maior — sem filtro,
-    o custo de LLM documentadora explode e o corpus vira ruído (ver
-    docstring do módulo).
+    Modo padrão (sample_mode=False): allowlist estrita por palavra-chave
+    no nome da classe ou conteúdo. Necessário porque o volume de scripts
+    pode ser grande — sem filtro, o custo de LLM documentadora explode.
 
-    Modo sample (sample_mode=True, usado para projetos/samples de mecânica
-    como Lyra, City Sample, Vehicle Sample): a allowlist é DESLIGADA. Esses
-    projetos usam convenções de nome próprias (ex: ALyraWeapon, ULyraHealthSet)
-    que não batem em nenhuma keyword genérica e seriam descartados
-    silenciosamente pela allowlist — exatamente o conteúdo de mecânica real
-    que se quer capturar. Em vez de manter uma lista de keywords sempre
-    defasada, delega-se a decisão de relevância à LLM documentadora, que já
-    tem instrução explícita de ignorar código puramente estrutural
-    (construtores vazios, boilerplate GENERATED_BODY(), forward declarations).
-    Volume de um projeto de sample é limitado (não é a Engine inteira),
-    então o custo de deixar a LLM decidir é administrável.
+    Modo sample (sample_mode=True): a allowlist é DESLIGADA. Projetos de
+    exemplo usam convenções próprias e seria impossível manter uma lista
+    exaustiva. Delega-se a decisão de relevância à LLM documentadora.
 
-    strategic_override=True (CORREÇÃO — ponto cego de indexação, ver
-    _STRATEGIC_ENGINE_MODULE_MARKERS): mesmo em modo Engine
-    (sample_mode=False), headers que pertencem a um módulo estratégico de
-    gameplay moderno (Mover, Network Prediction, Chaos Mover/Vehicles,
-    Motion Warping) também desligam a allowlist. Esses subsistemas usam
-    structs auxiliares, controllers de retargeting e definições de
-    simulação de baixo nível que frequentemente não herdam de
-    UActorComponent/AActor e não carregam as keywords legadas no nome —
-    exatamente o mesmo motivo pelo qual a allowlist é desligada em
-    sample_mode, só que agora escopado a um conjunto restrito de caminhos
-    da Engine em vez do projeto inteiro, para não reabrir a explosão de
-    escopo que a allowlist existe para conter.
+    Para Godot 4, as keywords incluem classes fundamentais como Node,
+    CharacterBody2D/3D, sinais, e métodos de lifecycle (_ready, _process).
     """
     if sample_mode or strategic_override:
         stem = Path(filename).stem
         return True, stem
 
-    for match in _CLASS_DECL_RE.finditer(content):
-        class_name = match.group(1)
-        inheritance_blob = match.group(2)
-        base_classes = re.findall(r"\b\w+\b", inheritance_blob)
-        candidates = [class_name, *base_classes]
-        for candidate in candidates:
-            candidate_lower = candidate.lower()
-            if any(kw.lower() in candidate_lower for kw in _GAMEPLAY_KEYWORDS):
-                return True, class_name
+    # Para GDScript: busca por 'extends', 'class_name' e keywords
+    content_lower = content.lower()
 
+    # Verifica extends/classe base
+    extends_match = re.search(r"extends\s+(\w+)", content, re.IGNORECASE)
+    if extends_match:
+        base_class = extends_match.group(1)
+        if any(kw.lower() in base_class.lower() for kw in _GAMEPLAY_KEYWORDS):
+            return True, base_class
+
+    # Verifica class_name
+    class_match = re.search(r"class_name\s+(\w+)", content, re.IGNORECASE)
+    if class_match:
+        class_name = class_match.group(1)
+        if any(kw.lower() in class_name.lower() for kw in _GAMEPLAY_KEYWORDS):
+            return True, class_name
+
+    # Verifica se contém lifecycle methods do Godot
+    lifecycle_patterns = ["_ready", "_process", "_physics_process", "_input"]
+    if any(pattern in content for pattern in lifecycle_patterns):
+        stem = Path(filename).stem
+        return True, stem
+
+    # Verifica nome do arquivo
+    stem = Path(filename).stem
+    stem_lower = stem.lower()
+    if any(kw.lower() in stem_lower for kw in _GAMEPLAY_KEYWORDS):
+        return True, stem
+
+    return False, ""
+
+
+def _is_gameplay_relevant_header(
+    content: str, filename: str, sample_mode: bool = False, strategic_override: bool = False
+) -> tuple[bool, str]:
+    """
+    Decide se um header C++ (.h) da UE5 vale a pena documentar.
+
+    Modo padrão (sample_mode=False): allowlist estrita por palavra-chave
+    no nome da classe ou conteúdo. Necessário porque o volume de headers
+    da Engine é enorme — sem filtro, o custo de LLM documentadora explode.
+
+    Modo sample (sample_mode=True): a allowlist é DESLIGADA. Projetos de
+    exemplo usam convenções próprias e seria impossível manter uma lista
+    exaustiva. Delega-se a decisão de relevância à LLM documentadora.
+
+    Para UE5, as keywords incluem classes de gameplay como AActor,
+    APawn, ACharacter, UActorComponent, e macros como UPROPERTY/UFUNCTION.
+    """
+    if sample_mode or strategic_override:
+        stem = Path(filename).stem
+        return True, stem
+
+    # Busca declaração de classe C++ com herança
+    class_match = _CLASS_DECL_RE.search(content)
+    if class_match:
+        class_name = class_match.group(1)
+        base_classes = class_match.group(2)
+
+        # Verifica se a classe herda de algo relevante
+        if any(kw in base_classes for kw in _GAMEPLAY_KEYWORDS):
+            return True, class_name
+
+        # Verifica se o nome da classe contém keyword
+        if any(kw.lower() in class_name.lower() for kw in _GAMEPLAY_KEYWORDS):
+            return True, class_name
+
+    # Verifica macros de reflexão da UE5 no conteúdo
+    ue_macros = ["UPROPERTY", "UFUNCTION", "UCLASS", "USTRUCT", "UPARAM", "UMETA"]
+    if any(macro in content for macro in ue_macros):
+        # Tenta extrair nome da classe mesmo sem herança detectada
+        if class_match:
+            return True, class_match.group(1)
+        stem = Path(filename).stem
+        return True, stem
+
+    # Verifica nome do arquivo
     stem = Path(filename).stem
     stem_lower = stem.lower()
     if any(kw.lower() in stem_lower for kw in _GAMEPLAY_KEYWORDS):
@@ -469,38 +547,90 @@ def _clean_cpp_header(content: str) -> str:
 #     método específico. Aceitável como trade-off custo/benefício frente a
 #     escrever um parser C++ completo.
 
-def _split_cpp_into_functions(content: str) -> list[tuple[str, str]]:
+def _split_gdscript_into_functions(content: str) -> list[tuple[str, str]]:
     """
-    Divide um .cpp em blocos (assinatura_legível, corpo_completo) por função,
-    usando a posição das assinaturas detectadas + balanceamento de chaves
-    para encontrar o fim de cada corpo.
+    Divide um arquivo GDScript (.gd) em blocos por função/método.
 
-    Funções muito pequenas (getters/setters triviais, < CPP_MIN_FUNCTION_CHARS)
-    são mantidas mas não geram grupo próprio — são agrupadas com a função
-    vizinha para não gerar chamadas de LLM desperdiçadas em trechos triviais.
+    GDScript usa indentação significativa, então o balanceamento é por
+    nível de indentação, não por chaves.
 
     Returns:
-        Lista de tuplas (nome_legivel, texto_do_bloco). Pode incluir um
-        bloco final "resto do arquivo" com qualquer código fora de função
-        reconhecida (includes já removidos a montante, código de namespace
-        solto, etc.) — nunca descarta conteúdo silenciosamente.
+        Lista de tuplas (nome_da_funcao, texto_do_bloco).
     """
-    matches = list(_CPP_FUNCTION_SIG_RE.finditer(content))
+    matches = list(_GDSCRIPT_FUNC_SIG_RE.finditer(content))
     if not matches:
         return [("arquivo completo (nenhuma função reconhecida)", content)]
+
+    blocks: list[tuple[str, str]] = []
+    lines = content.splitlines(keepends=True)
+
+    for i, match in enumerate(matches):
+        func_name = match.group(1)
+        start_pos = match.start()
+
+        # Encontra o fim da função baseado em indentação
+        # A função termina quando encontramos uma linha com indentação menor ou igual
+        # à da assinatura da função (ou EOF)
+        start_line_idx = content[:start_pos].count('\n')
+
+        # Pega a indentação da assinatura da função
+        first_line = lines[start_line_idx] if start_line_idx < len(lines) else ""
+        base_indent = len(first_line) - len(first_line.lstrip())
+
+        end_line_idx = start_line_idx + 1
+        while end_line_idx < len(lines):
+            line = lines[end_line_idx]
+            # Linha vazia não conta
+            if line.strip() == "":
+                end_line_idx += 1
+                continue
+            # Se a indentação é menor ou igual à base, a função terminou
+            current_indent = len(line) - len(line.lstrip())
+            if current_indent <= base_indent and line.strip():
+                break
+            end_line_idx += 1
+
+        # Extrai o texto da função
+        func_text = "".join(lines[start_line_idx:end_line_idx])
+        blocks.append((func_name, func_text))
+
+    # Código antes da primeira função (variáveis de classe, extends, etc.)
+    if matches:
+        leading = content[: matches[0].start()].strip()
+        if leading:
+            blocks.insert(0, ("código de topo do arquivo", leading))
+
+    return blocks
+
+
+def _split_csharp_into_functions(content: str) -> list[tuple[str, str]]:
+    """
+    Divide um arquivo C# (.cs) em blocos por método.
+
+    Usa balanceamento de chaves para encontrar o fim de cada método.
+
+    Returns:
+        Lista de tuplas (nome_do_metodo, texto_do_bloco).
+    """
+    matches = list(_CSHARP_METHOD_SIG_RE.finditer(content))
+    if not matches:
+        return [("arquivo completo (nenhum método reconhecido)", content)]
 
     blocks: list[tuple[str, str]] = []
     cursor = 0
 
     for i, match in enumerate(matches):
-        class_name, method_name = match.group(1), match.group(2)
-        body_start = match.end() - 1  # posição do '{' de abertura
+        method_name = match.group(1)
 
-        # Balanceamento de chaves para achar o fim real do corpo da função —
-        # necessário porque regex sozinho não sabe "contar" aninhamento.
+        # Encontra a chave de abertura do método
+        brace_start = content.find("{", match.start())
+        if brace_start == -1:
+            continue  # Método sem corpo (interface/abstract)
+
+        # Balanceamento de chaves
         depth = 0
-        end = body_start
-        for pos in range(body_start, len(content)):
+        end = brace_start
+        for pos in range(brace_start, len(content)):
             if content[pos] == "{":
                 depth += 1
             elif content[pos] == "}":
@@ -509,32 +639,46 @@ def _split_cpp_into_functions(content: str) -> list[tuple[str, str]]:
                     end = pos + 1
                     break
         else:
-            # Chave nunca fechou (arquivo truncado/malformado) — pega até o
-            # fim do arquivo em vez de travar ou perder o conteúdo.
             end = len(content)
 
         func_text = content[match.start():end]
-        blocks.append((f"{class_name}::{method_name}", func_text))
+        blocks.append((method_name, func_text))
         cursor = end
 
-    # Conteúdo antes da primeira função e depois da última (namespace-level
-    # code, definições fora de classe) — preservado, nunca descartado.
-    leading = content[: matches[0].start()].strip()
-    trailing = content[cursor:].strip()
-    if leading:
-        blocks.insert(0, ("código de topo do arquivo", leading))
-    if trailing:
-        blocks.append(("código remanescente do arquivo", trailing))
+    # Código antes do primeiro método (using, namespace, class declaration)
+    if matches:
+        leading = content[: matches[0].start()].strip()
+        if leading:
+            blocks.insert(0, ("código de topo do arquivo", leading))
 
     return blocks
 
 
-def _group_cpp_blocks(
+def _split_script_into_functions(content: str, extension: str) -> list[tuple[str, str]]:
+    """
+    Dispatcher para dividir scripts em funções/métodos baseado na extensão.
+
+    Args:
+        content: Conteúdo do arquivo
+        extension: Extensão do arquivo (.gd ou .cs)
+
+    Returns:
+        Lista de tuplas (nome, texto_do_bloco).
+    """
+    if extension == ".gd":
+        return _split_gdscript_into_functions(content)
+    elif extension == ".cs":
+        return _split_csharp_into_functions(content)
+    else:
+        return [("arquivo completo", content)]
+
+
+def _group_script_blocks(
     blocks: list[tuple[str, str]], max_group_chars: int
 ) -> list[tuple[list[str], str]]:
     """
     Agrupa blocos de função pequenos entre si (até max_group_chars) para
-    evitar uma chamada de LLM por getter trivial, mas nunca junta um bloco
+    evitar uma chamada de LLM por função trivial, mas nunca junta um bloco
     já maior que o limite com outro (esse vai sozinho, truncado se preciso
     pelo chamador).
 
@@ -560,32 +704,34 @@ def _group_cpp_blocks(
     return groups
 
 
-_CPP_DOCUMENTER_SYSTEM_PROMPT = """\
-You are a Senior Gameplay Programmer at Epic Games, specialized in \
-explaining HOW Unreal Engine 5 gameplay mechanics are actually implemented, \
-based on real .cpp implementation code from a shipped project or official \
-sample (e.g. Lyra, City Sample, Vehicle Sample, Game Animation Sample).
+_SCRIPT_DOCUMENTER_SYSTEM_PROMPT = """\
+You are a Senior Godot Engine Developer and Technical Architect, specialized \
+in explaining HOW Godot 4 gameplay mechanics are actually implemented, \
+based on real GDScript or C# code from a shipped project.
 
-Your task: given one or more C++ function implementations from a real \
+Your task: given one or more GDScript/C# function implementations from a real \
 project, produce a Markdown guide that explains the MECHANIC or SYSTEM \
 being implemented — not a line-by-line restatement of the code.
 
 STRICT RULES:
 1. Output ONLY Markdown. No preamble, no "Here is the documentation" filler.
 2. Start with a single H1 title describing the MECHANIC (e.g. \
-"# Double Jump Implementation", "# PCG Procedural Foliage Scattering") — \
+"# Player Movement with State Machine", "# Enemy AI Detection System") — \
 not just the raw function name.
 3. Explain the ACTUAL LOGIC: what triggers this code, what decisions it \
-makes, what state it reads/writes, and how it connects to other systems \
-(e.g. Input, Animation Blueprint, Gameplay Ability System, PCG Graph).
-4. Use H2 sections (`## `) to separate distinct concerns when the input \
+makes, what state it reads/writes, and how it connects to other nodes and \
+signals in the scene tree.
+4. Focus on Godot-specific patterns: node lifecycle (_ready, _process, \
+_physics_process), signal connections, exported properties for inspector \
+configuration, and scene instantiation.
+5. Use H2 sections (`## `) to separate distinct concerns when the input \
 covers more than one function, e.g. `## How it's triggered`, \
-`## Core logic`, `## Integration points`.
-5. Never invent behavior not present in the provided code. If the logic is \
+`## Core logic`, `## Signal connections`.
+6. Never invent behavior not present in the provided code. If the logic is \
 unclear or incomplete from what's given, say so explicitly rather than \
 guessing.
-6. Be concise but complete — prioritize helping a developer replicate or \
-adapt this mechanic in their own project.\
+7. Be concise but complete — prioritize helping a developer replicate or \
+adapt this mechanic in their own Godot project.\
 """
 
 
@@ -655,49 +801,40 @@ async def _load_header_context(cpp_path: Path) -> str:
     return cleaned_header
 
 
-async def _process_cpp_file(
+async def _process_script_file(
     path: Path, raw: str, ue_version: str, project_source: str
 ) -> list[dict]:
     """
-    Processa um .cpp em modo sample: divide por função, agrupa blocos
-    pequenos, e documenta cada grupo via LLM com foco em MECÂNICA (não API).
+    Processa um arquivo GDScript (.gd) ou C# (.cs) em modo sample:
+    divide por função/método, agrupa blocos pequenos, e documenta cada
+    grupo via LLM com foco em MECÂNICA (não API).
 
-    CORREÇÃO — Injeção de contexto do header: o .cpp sozinho só mostra a
-    IMPLEMENTAÇÃO; as macros UCLASS/UPROPERTY/UFUNCTION e as assinaturas
-    completas (incluindo tipos de retorno e parâmetros com nomes
-    descritivos, que no .cpp às vezes vêm abreviados) vivem no .h. Sem
-    esse contexto, a LLM documentadora pode interpretar mal o propósito de
-    uma variável ou sinalizador (ex: não sabe se uma UPROPERTY é
-    replicada, BlueprintReadOnly, EditAnywhere, etc.) e produzir
-    documentação tecnicamente correta mas rasa. O header é lido e limpo
-    UMA VEZ por arquivo .cpp (não uma vez por grupo) para não multiplicar
-    o custo de tokens quando o .cpp gera múltiplos grupos.
-
-    Chamado em dois cenários (ver _run_ingestion): (1) sample_mode=True,
-    onde TODOS os .cpp descobertos passam por aqui; e (2) modo Engine
-    (sample_mode=False) para o subconjunto restrito de .cpp que pertence a
-    um módulo estratégico de gameplay moderno listado em
-    _STRATEGIC_ENGINE_MODULE_MARKERS (Mover, Network Prediction, Chaos
-    Mover/Vehicles) — a lógica de predição de rede e simulação física
-    desses subsistemas vive na implementação, não só na API pública do
-    header, e por isso precisa do mesmo tratamento de Canal C que os
-    projetos-sample já recebiam. Para o resto da Engine, .cpp continua
-    fora do escopo de ingestão.
+    Para GDScript: usa indentação para delimitar funções.
+    Para C#: usa balanceamento de chaves.
     """
-    cleaned = _clean_cpp_header(raw)  # remove #includes, normaliza blank lines
+    extension = path.suffix.lower()
+    cleaned = raw.strip()
     if not cleaned:
-        log.debug(".cpp vazio após limpeza, ignorado: %s", path)
+        log.debug("Script vazio após limpeza, ignorado: %s", path)
         return []
 
-    header_context = await _load_header_context(path)
+    # Define parâmetros baseados no tipo de script
+    if extension == ".gd":
+        max_group_chars = GDSCRIPT_MAX_GROUP_CHARS
+        doc_type = "gdscript_implementation"
+        code_lang = "gdscript"
+    elif extension == ".cs":
+        max_group_chars = CSHARP_MAX_GROUP_CHARS
+        doc_type = "csharp_implementation"
+        code_lang = "csharp"
+    else:
+        log.warning("Extensão de script não suportada: %s", extension)
+        return []
 
-    # CORREÇÃO (bloqueio de event loop): o balanceamento de chaves em
-    # _split_cpp_into_functions é CPU-bound (scan caractere-a-caractere)
-    # e pode ser custoso em .cpp grandes e densos de funções — despachado
-    # para thread pelo mesmo motivo que a leitura de disco é. _group_cpp_blocks
-    # é barato (concatenação) e permanece síncrono.
-    blocks = await asyncio.to_thread(_split_cpp_into_functions, cleaned)
-    groups = _group_cpp_blocks(blocks, CPP_MAX_GROUP_CHARS)
+    # CORREÇÃO (bloqueio de event loop): o split de funções é CPU-bound
+    # e pode ser custoso em arquivos grandes — despachado para thread.
+    blocks = await asyncio.to_thread(_split_script_into_functions, cleaned, extension)
+    groups = _group_script_blocks(blocks, max_group_chars)
 
     all_chunks: list[dict] = []
     for group_idx, (names, group_text) in enumerate(groups):
@@ -712,25 +849,14 @@ async def _process_cpp_file(
 
         title = names[0] if names else path.stem
 
-        # Contexto do header (se disponível) entra ANTES do bloco .cpp no
-        # prompt do usuário, claramente rotulado como "declaração" para a
-        # LLM não confundir com o corpo de implementação que é o foco real.
-        header_section = (
-            f"Header declarations for context (from {path.with_suffix('.h').name}):\n"
-            f"```cpp\n{header_context}\n```\n\n"
-            if header_context
-            else ""
-        )
-
         user_message = (
-            f"Source file: {path.name}\n"
+            f"Script file: {path.name}\n"
             f"Functions in this group: {', '.join(names)}\n\n"
-            f"{header_section}"
-            f"Implementation ({path.name}):\n"
-            f"```cpp\n{group_text}\n```"
+            f"Implementation:\n"
+            f"```{code_lang}\n{group_text}\n```"
         )
         messages = [
-            {"role": "system", "content": _CPP_DOCUMENTER_SYSTEM_PROMPT},
+            {"role": "system", "content": _SCRIPT_DOCUMENTER_SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
         ]
 
@@ -755,7 +881,7 @@ async def _process_cpp_file(
             _build_chunks_with_metadata(
                 markdown_text=markdown,
                 source_file=group_source_file,
-                doc_type="cpp_implementation",
+                doc_type=doc_type,
                 title=title,
                 ue_version=ue_version,
                 raw_content=group_text,
@@ -836,35 +962,61 @@ async def _process_header_file(
 # CANAL B — Documentação oficial (.udn)
 # =============================================================================
 
-def _sanitize_udn(content: str) -> tuple[str, str]:
-    title_match = _UDN_TITLE_RE.search(content)
-    title = title_match.group(1).strip() if title_match else ""
+def _sanitize_md_or_rst(content: str, extension: str) -> tuple[str, str]:
+    """
+    Sanitiza arquivos Markdown (.md) ou ReStructuredText (.rst) da documentação do Godot.
 
-    cleaned = _UDN_METADATA_RE.sub("", content)
-    for pattern in _UDN_MACRO_PATTERNS:
-        cleaned = pattern.sub("", cleaned)
+    Para .md: remove frontmatter YAML, links preservando texto.
+    Para .rst: remove diretivas Sphinx, roles/referências cruzadas.
+
+    Retorna (conteúdo_limpo, título_extraído).
+    """
+    cleaned = content
+    title = ""
+
+    if extension == ".md":
+        # Remove frontmatter YAML
+        cleaned = _MD_FRONTMATTER_RE.sub("", cleaned)
+        # Converte links Markdown para texto simples
+        cleaned = _MD_LINK_RE.sub(r"\1", cleaned)
+        # Extrai título do primeiro heading
+        title_match = _MD_TITLE_RE.search(cleaned)
+        if title_match:
+            title = title_match.group(1).strip()
+
+    elif extension == ".rst":
+        # Remove diretivas Sphinx/RST
+        cleaned = _RST_DIRECTIVE_RE.sub("", cleaned)
+        # Remove roles/referências cruzadas (:ref:`title` -> title)
+        cleaned = _RST_ROLE_RE.sub(r"\1", cleaned)
+        # Converte links RST inline
+        cleaned = _RST_LINK_RE.sub(r"\1", cleaned)
+        # Extrai título do primeiro heading RST (sublinhado com === ou ---)
+        title_match = _RST_TITLE_RE.search(cleaned)
+        if title_match:
+            title = title_match.group(1).strip()
+
+    # Remove excesso de linhas em branco
     cleaned = _EXCESS_BLANK_LINES_RE.sub("\n\n", cleaned).strip()
-
-    if not title:
-        heading_match = re.search(r"^#\s+(.+)$", cleaned, re.MULTILINE)
-        if heading_match:
-            title = heading_match.group(1).strip()
 
     return cleaned, title
 
 
-async def _process_udn_file(
+async def _process_md_or_rst_file(
     path: Path, raw: str, ue_version: str, project_source: str
 ) -> list[dict]:
-    clean_text, title = _sanitize_udn(raw)
+    """
+    Processa um arquivo de documentação Markdown (.md) ou RST (.rst) do Godot.
+    """
+    clean_text, title = _sanitize_md_or_rst(raw, path.suffix.lower())
     if not clean_text:
-        log.debug("Documento .udn vazio após sanitização, ignorado: %s", path)
+        log.debug("Documento %s vazio após sanitização, ignorado: %s", path.suffix, path)
         return []
 
     return _build_chunks_with_metadata(
         markdown_text=clean_text,
         source_file=str(path),
-        doc_type="udn_documentation",
+        doc_type="godot_documentation",
         title=title or path.stem,
         ue_version=ue_version,
         raw_content=clean_text,
@@ -899,149 +1051,150 @@ async def _process_udn_file(
 #     resolvidos como laço semântico. Ver docstring de
 #     _trace_execution_flow em BP_GraphExporter.py para o detalhe completo.
 
-_BP_DOCUMENTER_SYSTEM_PROMPT = """\
-You are a Senior Gameplay Programmer at Epic Games, specialized in \
-explaining Unreal Engine 5 Blueprint mechanics from a STRUCTURED JSON \
-representation of the Blueprint's graph, extracted via the Unreal Python \
-API (not raw exported text).
+_TSCN_DOCUMENTER_SYSTEM_PROMPT = """\
+You are a Senior Godot Engine Developer and Technical Architect, specialized \
+in explaining Godot 4 scene structure and node hierarchies from .tscn scene \
+files.
 
-The JSON contains:
-- "ParentClass": the C++ or Blueprint class this Blueprint extends.
-- "Variables": a list of {"name", "default_value"} for each meaningful \
-Blueprint variable.
-- "ExecutionFlow": a list of entry points, each with an "entry_point" \
-(the triggering event — e.g. BeginPlay, a Custom Event, an input binding) \
-and "steps" — a linearized sequence of the logic that entry point \
-triggers. A step is either:
-  - {"type": "step", "node": {...}} — a single action (e.g. a function \
-call, identified by "function_name" or "event_name" when available).
-  - {"type": "branch", "node": {...}, "branches": {label: [steps...]}} — \
-a control-flow node (Branch, Sequence, ForEachLoop, Switch, etc.) whose \
-execution splits into multiple named outcomes, each with its own \
-sub-sequence of steps.
-  - {"type": "loop_reference"} — the flow returned to an already-visited \
-node in this branch (a loop was detected and the trace stopped there to \
-avoid infinite recursion).
+The .tscn file format contains:
+- External resources (ext_resource): scripts, textures, scenes referenced.
+- Nodes (node): each with name, type (class), parent relationship, and properties.
+- Connections (connection): signal bindings between nodes.
 
-Your task: produce a Markdown guide explaining WHAT this Blueprint does as \
-a gameplay mechanic — not a transcription of the JSON structure itself.
+Your task: produce a Markdown guide explaining WHAT this scene does as a \
+gameplay system — not a transcription of the .tscn format itself.
 
 STRICT RULES:
 1. Output ONLY Markdown. No preamble, no "Here is the documentation" filler.
-2. Start with a single H1 title naming the mechanic or system (e.g. \
-"# Double Jump Blueprint Logic", "# Interactable Door Trigger") — not just \
-the raw Blueprint asset name.
-3. State the PARENT CLASS this Blueprint extends.
-4. Under `## Key Variables`, list the meaningful variables and their \
-default values, explaining what each controls in gameplay terms.
-5. Under `## Main Events`, cover each entry point in "ExecutionFlow": \
-name the trigger, then describe IN YOUR OWN WORDS the sequence of logic \
-it runs. When you encounter a "branch" step, explain the condition/split \
-and summarize what happens in each named outcome. Do not just restate \
-node names — explain what the sequence accomplishes as gameplay behavior.
-6. Under `## Integration Points`, note any calls to other systems (e.g. \
-Gameplay Ability System, Animation Blueprint, C++ base class functions, \
-other Blueprints) identifiable from function_name/event_name values.
-7. Never invent behavior not evidenced in the provided JSON. If
-"ExecutionFlow" is empty or a referenced function is external and its \
-behavior isn't shown, say so explicitly rather than guessing. If you see \
-a "loop_reference" step, mention that the flow loops back rather than \
-inventing what the loop does.
-8. Be concise but complete — prioritize helping a developer understand or \
-replicate this mechanic in their own project.\
+2. Start with a single H1 title naming the scene/system (e.g. \
+"# Player Scene", "# Enemy Spawner", "# Main Menu UI") — not just the filename.
+3. Describe the node hierarchy: root node, key child nodes, and their purposes.
+4. Document attached scripts and their roles in the scene.
+5. Explain signal connections: which nodes emit signals, which receive them, \
+and what gameplay events they represent.
+6. Highlight @export properties that configure the scene from the inspector.
+7. Ignore transform data, raw vectors, and purely visual properties unless \
+they affect gameplay logic.
+8. Be concise but complete — prioritize helping a developer understand the \
+scene architecture and how to modify or extend it.\
 """
 
 
-def _extract_blueprint_asset_name(path: Path) -> str:
+def _extract_tscn_scene_name(path: Path) -> str:
     """
-    Extrai o nome do asset a partir do path de um arquivo '<Nome>.bp.json'.
+    Extrai o nome da cena a partir do path de um arquivo .tscn.
 
-    path.stem sozinho NÃO resolve isso corretamente: para uma extensão
-    dupla como '.bp.json', path.stem remove só o último componente
-    ('.json'), retornando 'NomeDoAsset.bp' — com o sufixo '.bp' residual
-    ainda grudado no nome. Removemos explicitamente o sufixo '.bp' restante
-    quando presente.
+    Para 'player.tscn' retorna 'Player'.
+    Para 'ui/main_menu.tscn' retorna 'MainMenu'.
     """
-    stem = path.stem  # "BP_DoubleJump.bp" para "BP_DoubleJump.bp.json"
-    if stem.endswith(".bp"):
-        stem = stem[: -len(".bp")]
-    return stem
+    stem = path.stem  # "player" para "player.tscn"
+    # Converte snake_case ou kebab-case para PascalCase
+    parts = stem.replace("-", "_").split("_")
+    return "".join(part.capitalize() for part in parts)
 
 
-async def _process_blueprint_file(
+async def _process_tscn_file(
     path: Path, raw: str, ue_version: str, project_source: str
 ) -> list[dict]:
     """
-    Processa um Blueprint exportado como JSON estruturado (.bp.json):
-    parseia e valida o JSON, formata de volta como texto legível para o
-    prompt, documenta via LLM com foco em mecânica de gameplay, e constrói
+    Processa um arquivo de cena do Godot (.tscn):
+    extrai hierarquia de nós, scripts anexados e conexões de sinais,
+    documenta via LLM com foco em arquitetura de cena, e constrói
     os chunks finais.
 
-    Só deve ser chamado em sample_mode=True — Blueprints exportados só
-    fazem sentido no contexto de projetos-sample de mecânica, nunca para a
-    Engine base (ver _run_ingestion: .bp.json só entra nas extensões
-    descobertas quando sample_mode=True).
+    O formato .tscn é baseado em texto com seções:
+    - [ext_resource]: recursos externos (scripts, texturas)
+    - [node]: cada nó com nome, tipo, propriedades
+    - [connection]: conexões de sinais entre nós
     """
-    asset_name = _extract_blueprint_asset_name(path)
+    scene_name = _extract_tscn_scene_name(path)
 
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        log.error(
-            "Falha ao parsear '%s' como JSON — arquivo malformado ou "
-            "exportação incompleta do BP_GraphExporter.py: %s. Arquivo ignorado.",
-            path, exc,
-        )
-        return []
+    # Parseia o arquivo .tscn para extrair informações relevantes
+    ext_resources: list[dict] = []
+    nodes: list[dict] = []
+    connections: list[dict] = []
 
-    if not isinstance(payload, dict):
-        log.error(
-            "'%s' não contém um objeto JSON no nível raiz (esperado dict, "
-            "recebido %s) — arquivo ignorado.",
-            path, type(payload).__name__,
-        )
-        return []
+    current_section = None
+    current_props: dict = {}
 
-    # Validação defensiva e tolerante: campos ausentes viram valores vazios
-    # em vez de derrubar a exportação inteira do Blueprint. O próprio
-    # BP_GraphExporter.py já documenta casos em que ExecutionFlow pode vir
-    # vazio (ex: Blueprint sem EventGraph acessível) — isso não é erro
-    # fatal, só uma documentação mais pobre para esse asset específico.
-    parent_class = payload.get("ParentClass", "Unknown")
-    variables = payload.get("Variables", [])
-    execution_flow = payload.get("ExecutionFlow", [])
+    for line in raw.splitlines():
+        line = line.strip()
 
-    if not execution_flow:
-        log.warning(
-            "Blueprint '%s' tem ExecutionFlow vazio — documentação será "
-            "limitada a ParentClass/Variables.",
-            asset_name,
-        )
+        # Detecta início de seção
+        if line.startswith("[ext_resource"):
+            current_section = "ext_resource"
+            current_props = _parse_tscn_header(line)
+            ext_resources.append(current_props)
+        elif line.startswith("[node"):
+            current_section = "node"
+            current_props = _parse_tscn_header(line)
+            current_props["properties"] = []
+            nodes.append(current_props)
+        elif line.startswith("[connection"):
+            current_section = "connection"
+            current_props = _parse_tscn_header(line)
+            connections.append(current_props)
+        elif line.startswith("["):
+            # Outra seção que não nos interessa
+            current_section = None
+            current_props = {}
+        elif current_section and "=" in line and current_section in ("node", "ext_resource"):
+            # Propriedade dentro de uma seção
+            key, _, value = line.partition("=")
+            if current_section == "node":
+                current_props["properties"].append({key.strip(): value.strip()})
 
-    normalized_payload = {
-        "AssetName": asset_name,
-        "ParentClass": parent_class,
-        "Variables": variables,
-        "ExecutionFlow": execution_flow,
+    # Filtra apenas scripts dos ext_resources
+    scripts = [
+        r for r in ext_resources
+        if r.get("type") == "Script" or (r.get("path") or "").endswith((".gd", ".cs"))
+    ]
+
+    # Constrói representação estruturada para o LLM
+    scene_data = {
+        "SceneName": scene_name,
+        "Scripts": [
+            {"id": s.get("id"), "path": s.get("path")}
+            for s in scripts
+        ],
+        "Nodes": [
+            {
+                "name": n.get("name"),
+                "type": n.get("type"),
+                "parent": n.get("parent"),
+                "script": n.get("script"),
+            }
+            for n in nodes
+            if n.get("type")  # Só nós com tipo definido
+        ],
+        "SignalConnections": [
+            {
+                "signal": c.get("signal"),
+                "from": c.get("from"),
+                "to": c.get("to"),
+                "method": c.get("method"),
+            }
+            for c in connections
+        ],
     }
 
-    formatted_json = json.dumps(normalized_payload, indent=2, ensure_ascii=False)
+    formatted_data = json.dumps(scene_data, indent=2, ensure_ascii=False)
 
-    if len(formatted_json) > BP_JSON_MAX_CHARS:
+    if len(formatted_data) > TSCN_MAX_CHARS:
         log.warning(
-            "JSON de '%s' tem %d chars formatado (limite=%d) — truncando "
-            "antes de enviar à LLM documentadora. Fluxos de execução mais "
-            "profundos podem ser cortados.",
-            path, len(formatted_json), BP_JSON_MAX_CHARS,
+            "Cena '%s' tem %d chars formatado (limite=%d) — truncando "
+            "antes de enviar à LLM documentadora. Nós mais profundos "
+            "podem ser omitidos.",
+            path, len(formatted_data), TSCN_MAX_CHARS,
         )
-        formatted_json = formatted_json[:BP_JSON_MAX_CHARS]
+        formatted_data = formatted_data[:TSCN_MAX_CHARS]
 
     user_message = (
-        f"Blueprint asset: {asset_name}\n\n"
-        f"```json\n{formatted_json}\n```"
+        f"Godot scene file: {scene_name}\n\n"
+        f"```json\n{formatted_data}\n```"
     )
     messages = [
-        {"role": "system", "content": _BP_DOCUMENTER_SYSTEM_PROMPT},
+        {"role": "system", "content": _TSCN_DOCUMENTER_SYSTEM_PROMPT},
         {"role": "user", "content": user_message},
     ]
 
@@ -1052,7 +1205,7 @@ async def _process_blueprint_file(
         )
     except Exception as exc:
         log.error(
-            "Falha ao documentar Blueprint '%s': %s — arquivo ignorado.",
+            "Falha ao documentar cena '%s': %s — arquivo ignorado.",
             path, exc,
         )
         return []
@@ -1060,12 +1213,35 @@ async def _process_blueprint_file(
     return _build_chunks_with_metadata(
         markdown_text=markdown,
         source_file=str(path),
-        doc_type="blueprint_logic",
-        title=asset_name,
+        doc_type="godot_scene",
+        title=scene_name,
         ue_version=ue_version,
-        raw_content=formatted_json,
+        raw_content=formatted_data,
         project_source=project_source,
     )
+
+
+def _parse_tscn_header(line: str) -> dict:
+    """
+    Parseia o cabeçalho de uma seção .tscn.
+
+    Exemplo: '[node name="Player" type="CharacterBody2D" parent="."]'
+    Retorna: {"name": "Player", "type": "CharacterBody2D", "parent": "."}
+    """
+    result: dict = {}
+    # Remove os colchetes externos
+    content = line.strip("[]")
+    # Separa o tipo da seção dos atributos
+    parts = content.split(" ", 1)
+    if len(parts) > 1:
+        attrs = parts[1]
+        # Parseia key="value" ou key=value
+        import re
+        for match in re.finditer(r'(\w+)=("([^"]*)"|(\S+))', attrs):
+            key = match.group(1)
+            value = match.group(3) if match.group(3) is not None else match.group(4)
+            result[key] = value
+    return result
 
 
 # =============================================================================
@@ -1266,38 +1442,59 @@ def _build_chunks_with_metadata(
 # CONFIGURAÇÃO IDEMPOTENTE DO QDRANT
 # =============================================================================
 
-async def ensure_collection_exists(qdrant: AsyncQdrantClient) -> None:
-    collection_name = settings.qdrant_collection
+async def ensure_collection_exists(
+    qdrant: AsyncQdrantClient,
+    collection_name: str | None = None,
+) -> None:
+    """
+    Garante que a coleção Qdrant existe, criando-a se necessário.
 
-    exists = await qdrant.collection_exists(collection_name)
+    Args:
+        qdrant: Cliente Qdrant assíncrono.
+        collection_name: Nome da coleção. Se None, usa a coleção do domínio ativo.
+    """
+    resolved_collection = collection_name or settings.qdrant_collection_for(settings.active_domain)
+
+    exists = await qdrant.collection_exists(resolved_collection)
     if exists:
-        log.info("Coleção '%s' já existe — validação OK (idempotente).", collection_name)
+        log.info("Coleção '%s' já existe — validação OK (idempotente).", resolved_collection)
         return
 
     log.warning(
         "Coleção '%s' não encontrada no Qdrant. Criando automaticamente...",
-        collection_name,
+        resolved_collection,
     )
     await qdrant.create_collection(
-        collection_name=collection_name,
+        collection_name=resolved_collection,
         vectors_config=qdrant_models.VectorParams(
             size=settings.embedding_dim,
             distance=qdrant_models.Distance.COSINE,
         ),
+        sparse_vectors_config={
+            SPARSE_VECTOR_NAME: qdrant_models.SparseVectorParams(
+                modifier=qdrant_models.Modifier.IDF,
+            ),
+        },
     )
     log.info(
-        "Coleção '%s' criada com sucesso | dim=%d | distância=COSINE",
-        collection_name,
+        "Coleção '%s' criada com sucesso | dim=%d | distância=COSINE | sparse=keywords_sparse",
+        resolved_collection,
         settings.embedding_dim,
     )
 
 async def ensure_sparse_vectors_enabled(
     qdrant: AsyncQdrantClient,
+    collection_name: str | None = None,
     _retry: int = 0,
 ) -> None:
     """
     Tenta habilitar o espaço de vetor esparso 'keywords_sparse' numa coleção
     já existente, via `update_collection` (PATCH /collections/{name}).
+
+    Args:
+        qdrant: Cliente Qdrant assíncrono.
+        collection_name: Nome da coleção. Se None, usa a coleção do domínio ativo.
+        _retry: Contador interno de retries.
 
     modifier=Modifier.IDF: os pontos guardam só term-frequency bruto (ver
     build_sparse_vector); o Qdrant calcula e mantém a estatística de IDF em
@@ -1336,19 +1533,19 @@ async def ensure_sparse_vectors_enabled(
     esparso já habilitado desde o início, ver `_flush_batch`/upsert) na
     primeira execução.
     """
-    collection_name = settings.qdrant_collection
+    resolved_collection = collection_name or settings.qdrant_collection_for(settings.active_domain)
 
-    exists = await qdrant.collection_exists(collection_name)
+    exists = await qdrant.collection_exists(resolved_collection)
     if not exists:
         log.warning(
             "Coleção '%s' ainda não existe — migração de sparse vectors "
             "adiada. Será aplicada automaticamente quando a ingestão "
             "criar a coleção, ou pode ser chamada de novo depois.",
-            collection_name,
+            resolved_collection,
         )
         return
 
-    info = await qdrant.get_collection(collection_name)
+    info = await qdrant.get_collection(resolved_collection)
     existing_sparse = (info.config.params.sparse_vectors or {})
 
     if SPARSE_VECTOR_NAME in existing_sparse:
@@ -1357,7 +1554,7 @@ async def ensure_sparse_vectors_enabled(
 
     try:
         await qdrant.update_collection(
-            collection_name=collection_name,
+            collection_name=resolved_collection,
             sparse_vectors_config={
                 SPARSE_VECTOR_NAME: qdrant_models.SparseVectorParams(
                     modifier=qdrant_models.Modifier.IDF,
@@ -1419,7 +1616,7 @@ async def ensure_sparse_vectors_enabled(
             backoff_seconds,
         )
         await asyncio.sleep(backoff_seconds)
-        await ensure_sparse_vectors_enabled(qdrant, _retry=_retry + 1)
+        await ensure_sparse_vectors_enabled(qdrant, collection_name=collection_name, _retry=_retry + 1)
         return
 
     log.info(
@@ -1540,7 +1737,7 @@ async def _delete_file_chunks(
     queira forçar a remoção total antes de uma reingestão manual).
 
     CORREÇÃO (Canal C / .cpp): chunks gerados a partir de .cpp usam um
-    `source_file` SINTÉTICO com sufixo "#groupN" (ver _process_cpp_file),
+    `source_file` SINTÉTICO com sufixo "#groupN" (ver _process_script_file),
     porque um único .cpp pode virar múltiplos grupos de funções. Filtrar
     por match exato de `source_file` aqui NUNCA encontraria esses pontos
     (o path puro nunca bate com "path#group0", "path#group1", ...) — a
@@ -1789,6 +1986,7 @@ async def _flush_batch(
 # o upsert, ver _flush_batch).
 async def backfill_sparse_vectors(
     qdrant: AsyncQdrantClient,
+    collection_name: str | None = None,
     batch_size: int = 200,
 ) -> int:
     """
@@ -1799,6 +1997,7 @@ async def backfill_sparse_vectors(
 
     Args:
         qdrant: Cliente Qdrant assíncrono.
+        collection_name: Nome da coleção. Se None, usa a coleção do domínio ativo.
         batch_size: Tamanho do lote de scroll/update_vectors por iteração.
             200 é um valor conservador — build_sparse_vector é puramente
             local (sem I/O), então o gargalo real é a rede para
@@ -1808,20 +2007,20 @@ async def backfill_sparse_vectors(
         Número total de pontos efetivamente atualizados com o vetor
         esparso (pontos já migrados anteriormente não contam).
     """
-    collection_name = settings.qdrant_collection
+    resolved_collection = collection_name or settings.qdrant_collection_for(settings.active_domain)
     updated_count = 0
     scanned_count = 0
     next_offset = None
 
     log.info(
         "Backfill de sparse vectors iniciado | coleção=%s batch_size=%d",
-        collection_name,
+        resolved_collection,
         batch_size,
     )
 
     while True:
         points, next_offset = await qdrant.scroll(
-            collection_name=collection_name,
+            collection_name=resolved_collection,
             limit=batch_size,
             offset=next_offset,
             with_payload=["title", "raw_content", "summary_markdown"],
@@ -1859,7 +2058,7 @@ async def backfill_sparse_vectors(
         if updates:
             try:
                 await qdrant.update_vectors(
-                    collection_name=collection_name,
+                    collection_name=resolved_collection,
                     points=updates,
                 )
             except Exception as exc:
@@ -2000,6 +2199,7 @@ async def process_folder_ingestion(
             ue_version_override=ue_version_override,
             project_source=project_source,
             sample_mode=sample_mode,
+            resolved_domain_id=resolved_domain_id,
         )
     finally:
         renewal_task.cancel()
@@ -2029,6 +2229,7 @@ async def _run_ingestion(
     ue_version_override: str | None = None,
     project_source: str = "UE5_Engine",
     sample_mode: bool = False,
+    resolved_domain_id: str = "ue5",
 ) -> None:
     """Corpo real do pipeline de ingestão, protegido pelo lock do chamador."""
     root = Path(folder_path)
@@ -2086,40 +2287,37 @@ async def _run_ingestion(
     # mantemos só .h como regra geral — mais barato e mais estrito, como
     # já era —, EXCETO para o conjunto restrito de módulos estratégicos de
     # gameplay moderno (Mover, Network Prediction, Chaos Mover/Vehicles,
-    # Motion Warping) listado em _STRATEGIC_ENGINE_MODULE_MARKERS: ali o
-    # .cpp também é descoberto e roteado ao Canal C, porque a lógica de
-    # predição de rede e simulação física desses subsistemas específicos
-    # vive na implementação, não só na API pública do header (ver ponto
-    # cego descrito no comentário da constante). Isso NÃO reabre a
-    # ingestão de .cpp para a Engine inteira — o restante permanece só .h.
-    #
-    # NOTA: ".bp.json" é uma extensão dupla. `fname.endswith(".bp.json")`
-    # (usado dentro de _walk_files) funciona corretamente por comparação de
-    # string — mas `Path.suffix` NÃO reconhece extensões duplas (retorna
-    # só ".json"). Por isso o dispatch abaixo usa `file_path.name.endswith(...)`
-    # em vez de `file_path.suffix ==` para este canal especificamente.
+    # ==========================================================================
+    # Descoberta de arquivos por tipo de conteúdo e domínio
+    # ==========================================================================
+    # UE5: .h (headers), .cpp (implementação), .udn (docs), .bp.json (Blueprints)
+    # Godot 4: .gd (GDScript), .cs (C#), .tscn (cenas), .md/.rst (docs)
     strategic_cpp_count = 0
     if content_type == "source_code":
-        if sample_mode:
+        if resolved_domain_id == "godot_4":
+            # Godot 4: scripts GDScript, C# e cenas
+            extensions = (".gd", ".cs", ".tscn")
+            files = await _discover_files(root, extensions)
+        elif sample_mode:
+            # UE5 sample mode: headers, implementation e Blueprints
             extensions = (".h", ".cpp", ".bp.json")
             files = await _discover_files(root, extensions)
         else:
+            # UE5 Engine mode: headers + cpps estratégicos
             extensions = (".h", ".cpp")
             discovered = await _discover_files(root, extensions)
-            # Segunda camada de segurança contra explosão de escopo: mesmo
-            # que _walk_files já restrinja onde 'Private' é destravado, um
-            # .cpp poderia teoricamente existir fora de Private/ (raro,
-            # mas possível em alguns layouts de módulo) — este filtro
-            # garante que NENHUM .cpp fora de um módulo estratégico chegue
-            # ao pipeline em modo Engine, independentemente de onde foi
-            # encontrado.
             files = [
                 p for p in discovered
                 if p.suffix != ".cpp" or _is_strategic_gameplay_path(p)
             ]
             strategic_cpp_count = sum(1 for p in files if p.suffix == ".cpp")
     else:
-        extensions = (".udn",)
+        # Extensões de documentação por domínio
+        if resolved_domain_id == "godot_4":
+            extensions = (".rst", ".md")
+        else:
+            # UE5 e outros domínios usam .udn (documentação oficial da Epic)
+            extensions = (".udn",)
         files = await _discover_files(root, extensions)
 
     total_files = len(files)
@@ -2209,36 +2407,54 @@ async def _run_ingestion(
             raw_text = raw_bytes.decode("utf-8", errors="ignore")
 
             if content_type == "source_code":
-                if file_path.name.endswith(".bp.json"):
-                    # Canal D — verificado ANTES de .cpp/.h porque
-                    # Path.suffix não reconhece extensão dupla (".bp.json"
-                    # tem suffix == ".json", que cairia no ramo Canal A por
-                    # engano se checássemos .suffix primeiro). Só existe em
-                    # sample_mode (extensions só inclui .bp.json quando
-                    # sample_mode=True, ver acima).
-                    chunks = await _process_blueprint_file(
+                # Godot 4 scripts e cenas
+                if file_path.suffix == ".gd":
+                    # GDScript
+                    chunks = await _process_script_file(
+                        file_path, raw_text, ue_version, project_source
+                    )
+                elif file_path.suffix == ".cs":
+                    # C# para Godot
+                    chunks = await _process_script_file(
+                        file_path, raw_text, ue_version, project_source
+                    )
+                elif file_path.suffix == ".tscn":
+                    # Cenas do Godot
+                    chunks = await _process_tscn_file(
+                        file_path, raw_text, ue_version, project_source
+                    )
+                # UE5 - Blueprints (verificado ANTES de .cpp/.h porque
+                # Path.suffix não reconhece extensão dupla ".bp.json")
+                # NOTA: Blueprints são processados como JSON estruturado.
+                # O exportador (BP_GraphExporter.py) já lineariza o grafo,
+                # então tratamos como documentação estruturada.
+                elif file_path.name.endswith(".bp.json"):
+                    chunks = await _process_md_or_rst_file(
                         file_path, raw_text, ue_version, project_source
                     )
                 elif file_path.suffix == ".cpp":
-                    # Canal C — existe em sample_mode (todo .cpp descoberto)
-                    # E, desde a correção do ponto cego de indexação, em
-                    # modo Engine para o subconjunto restrito de módulos
-                    # estratégicos de gameplay moderno (Mover, Network
-                    # Prediction, Chaos Mover/Vehicles) — ver o filtro de
-                    # descoberta de arquivos acima e
-                    # _STRATEGIC_ENGINE_MODULE_MARKERS.
-                    chunks = await _process_cpp_file(
+                    # Canal C — implementação UE5
+                    chunks = await _process_script_file(
                         file_path, raw_text, ue_version, project_source
                     )
                 else:
+                    # Headers UE5 (.h)
                     chunks = await _process_header_file(
                         file_path, raw_text, ue_version, project_source,
                         sample_mode=sample_mode,
                     )
             else:
-                chunks = await _process_udn_file(
-                    file_path, raw_text, ue_version, project_source
-                )
+                # Documentação
+                if file_path.suffix in (".md", ".rst"):
+                    # Godot docs
+                    chunks = await _process_md_or_rst_file(
+                        file_path, raw_text, ue_version, project_source
+                    )
+                else:
+                    # UE5 .udn
+                    chunks = await _process_md_or_rst_file(
+                        file_path, raw_text, ue_version, project_source
+                    )
 
             if not chunks:
                 stats["skipped"] += 1

@@ -129,7 +129,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     else:
         log.info("Todas as dependências conectadas. Aplicação pronta ✓")
         log.info("LiteLLM: %s (embeddings + LLM)", settings.litellm_base_url)
-        log.info("Qdrant:  %s (coleção: %s)", settings.qdrant_url, settings.qdrant_collection)
+        log.info("Qdrant:  %s (coleção: %s)", settings.qdrant_url, settings.qdrant_collection_for(settings.active_domain))
         log.info("Redis:   %s:%d", settings.redis_host, settings.redis_port)
         log.info("Embedding model: %s (dim=%d)", settings.embedding_model, settings.embedding_dim)
 

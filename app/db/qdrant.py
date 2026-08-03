@@ -64,13 +64,13 @@ async def init_qdrant() -> AsyncQdrantClient:
 
 async def _validate_collection(client: AsyncQdrantClient) -> None:
     """
-    Verifica se a coleção 'ue5_docs' existe e tem a dimensão de embedding
+    Verifica se a coleção do domínio ativo existe e tem a dimensão de embedding
     esperada (1024 para mxbai-embed-large).
 
     Não lança erro se a coleção não existir — apenas registra um warning,
     pois o ingestor pode ainda não ter sido executado.
     """
-    collection_name = settings.qdrant_collection
+    collection_name = settings.qdrant_collection_for(settings.active_domain)
 
     try:
         collection_info = await client.get_collection(collection_name)
