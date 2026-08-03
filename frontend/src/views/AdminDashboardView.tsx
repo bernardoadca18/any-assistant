@@ -6,7 +6,7 @@
  * estatísticas e visão geral do sistema multi-tenant.
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -128,12 +128,12 @@ export const AdminDashboardView: React.FC = () => {
         });
 
         // Infer system status from health check
-        if (systemHealth) {
+        if (systemHealth && systemHealth.dependencies) {
           setSystemStatus({
-            database: systemHealth.database?.status || 'ok',
-            qdrant: systemHealth.qdrant?.status || 'ok',
-            redis: systemHealth.redis?.status || 'ok',
-            litellm: systemHealth.litellm?.status || 'ok',
+            database: systemHealth.dependencies['database']?.status || 'ok',
+            qdrant: systemHealth.dependencies['qdrant']?.status || 'ok',
+            redis: systemHealth.dependencies['redis']?.status || 'ok',
+            litellm: systemHealth.dependencies['litellm']?.status || 'ok',
           });
         }
       } catch {

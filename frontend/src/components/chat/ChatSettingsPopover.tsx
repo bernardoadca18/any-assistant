@@ -83,7 +83,7 @@ export const ChatSettingsPopover: React.FC<ChatSettingsPopoverProps> = ({ settin
                 <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
                 Parâmetros do chat
               </span>
-              <button type="button" onClick={() => setOpen(false)} className="text-zinc-500 hover:text-zinc-300">
+              <button type="button" onClick={() => setOpen(false)} className="text-zinc-500 hover:text-zinc-300" aria-label="Fechar">
                 <X className="w-3.5 h-3.5" />
               </button>
             </div>

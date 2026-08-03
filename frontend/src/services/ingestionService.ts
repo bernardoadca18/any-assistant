@@ -42,8 +42,7 @@ export async function processFolder(payload: IngestRequest): Promise<IngestAccep
     sample_mode: payload.sample_mode ?? false,
     domain_id: payload.domain_id || 'godot_4',
     status: 'processing',
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
+    started_at: new Date().toISOString(),
     message: response.data.message,
   };
   saveIngestionJobToHistory(job);
@@ -92,8 +91,7 @@ export async function uploadFileMultipart(
     sample_mode: payload.sample_mode ?? false,
     domain_id: payload.domain_id || 'godot_4',
     status: 'processing',
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
+    started_at: new Date().toISOString(),
     message: `File uploaded: ${payload.file.name}`,
   };
   saveIngestionJobToHistory(job);

@@ -71,6 +71,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
             type="button"
             onClick={onClose}
             className="text-zinc-500 hover:text-zinc-300 transition-colors"
+            aria-label="Fechar"
           >
             <X className="w-4 h-4" />
           </button>

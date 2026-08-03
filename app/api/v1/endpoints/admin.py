@@ -252,40 +252,49 @@ async def list_tenants(
     is_active: bool | None = None,
 ) -> TenantListResponse:
     """List all tenants with pagination."""
-    # Build query
-    query = select(Tenant)
-    count_query = select(func.count(Tenant.id))
-
+    # Build base query with filters
+    base_filter = []
     if is_active is not None:
-        query = query.where(Tenant.is_active == is_active)
-        count_query = count_query.where(Tenant.is_active == is_active)
+        base_filter.append(Tenant.is_active == is_active)
 
     # Get total count
+    count_query = select(func.count(Tenant.id))
+    if base_filter:
+        count_query = count_query.where(*base_filter)
     total_result = await db.execute(count_query)
     total = total_result.scalar() or 0
 
-    # Get paginated results
+    # Get paginated tenants with aggregated counts in a single query using subqueries
+    # This eliminates the N+1 query problem
+    collections_subq = (
+        select(func.count(Collection.id))
+        .where(Collection.tenant_id == Tenant.id)
+        .correlate(Tenant)
+        .scalar_subquery()
+    )
+    api_keys_subq = (
+        select(func.count(APIKey.id))
+        .where(APIKey.tenant_id == Tenant.id)
+        .correlate(Tenant)
+        .scalar_subquery()
+    )
+
+    query = (
+        select(Tenant, collections_subq.label("collections_count"), api_keys_subq.label("api_keys_count"))
+    )
+    if base_filter:
+        query = query.where(*base_filter)
     query = query.order_by(Tenant.created_at.desc())
     query = query.offset((page - 1) * page_size).limit(page_size)
 
     result = await db.execute(query)
-    tenants = result.scalars().all()
+    rows = result.all()
 
-    # Get counts for each tenant
     items = []
-    for tenant in tenants:
-        # Count collections
-        coll_count = await db.execute(
-            select(func.count(Collection.id)).where(Collection.tenant_id == tenant.id)
-        )
-        collections_count = coll_count.scalar() or 0
-
-        # Count API keys
-        key_count = await db.execute(
-            select(func.count(APIKey.id)).where(APIKey.tenant_id == tenant.id)
-        )
-        api_keys_count = key_count.scalar() or 0
-
+    for row in rows:
+        tenant = row[0]
+        collections_count = row[1] or 0
+        api_keys_count = row[2] or 0
         items.append(TenantResponse(
             id=tenant.id,
             slug=tenant.slug,
@@ -703,37 +712,42 @@ async def list_collections(
     page_size: int = Query(default=20, ge=1, le=100),
 ) -> CollectionListResponse:
     """List collections with optional filtering."""
-    # Build query
-    query = select(Collection)
-    count_query = select(func.count(Collection.id))
-
+    # Build base filters
+    base_filter = []
     if tenant_id:
-        query = query.where(Collection.tenant_id == tenant_id)
-        count_query = count_query.where(Collection.tenant_id == tenant_id)
-
+        base_filter.append(Collection.tenant_id == tenant_id)
     if domain_id:
-        query = query.where(Collection.domain_id == domain_id)
-        count_query = count_query.where(Collection.domain_id == domain_id)
+        base_filter.append(Collection.domain_id == domain_id)
 
     # Get total count
+    count_query = select(func.count(Collection.id))
+    if base_filter:
+        count_query = count_query.where(*base_filter)
     total_result = await db.execute(count_query)
     total = total_result.scalar() or 0
 
-    # Get paginated results
+    # Get paginated collections with has_custom_config in a single query using EXISTS subquery
+    # This eliminates the N+1 query problem
+    has_config_subq = (
+        select(1)
+        .where(CollectionConfig.collection_id == Collection.id)
+        .correlate(Collection)
+        .exists()
+    )
+
+    query = select(Collection, has_config_subq.label("has_custom_config"))
+    if base_filter:
+        query = query.where(*base_filter)
     query = query.order_by(Collection.created_at.desc())
     query = query.offset((page - 1) * page_size).limit(page_size)
 
     result = await db.execute(query)
-    collections = result.scalars().all()
+    rows = result.all()
 
     items = []
-    for coll in collections:
-        # Check for custom config
-        config_result = await db.execute(
-            select(CollectionConfig).where(CollectionConfig.collection_id == coll.id)
-        )
-        has_config = config_result.scalar_one_or_none() is not None
-
+    for row in rows:
+        coll = row[0]
+        has_config = row[1] if row[1] is not None else False
         items.append(CollectionResponse(
             id=coll.id,
             tenant_id=coll.tenant_id,

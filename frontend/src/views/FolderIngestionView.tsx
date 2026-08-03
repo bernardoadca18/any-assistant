@@ -26,9 +26,22 @@ import type { IngestAcceptedResponse, IngestionContentType, IngestionJobStatus }
 export const FolderIngestionView: React.FC = () => {
   const { activeDomainId, isAuthenticated } = useAppStore();
 
+  // All useState hooks must be declared BEFORE any early returns (React Hooks rules)
   const [folderPath, setFolderPath] = useState('');
+  const [contentType, setContentType] = useState<IngestionContentType>('source_code');
+  const [projectSource, setProjectSource] = useState('');
+  const [ueVersion, setUeVersion] = useState('');
+  const [sampleMode, setSampleMode] = useState(false);
+  const [showSampleTooltip, setShowSampleTooltip] = useState(false);
 
-  // Not authenticated state
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [lastResponse, setLastResponse] = useState<IngestAcceptedResponse | null>(null);
+  const [recentJobs, setRecentJobs] = useState<IngestionJobStatus[]>(() => getIngestionJobHistory());
+
+  const isUE5 = activeDomainId === 'ue5';
+
+  // Not authenticated state - rendered AFTER all hooks are declared
   if (!isAuthenticated) {
     return (
       <div className="flex-1 overflow-y-auto p-6 md:p-8">
@@ -48,18 +61,6 @@ export const FolderIngestionView: React.FC = () => {
       </div>
     );
   }
-  const [contentType, setContentType] = useState<IngestionContentType>('source_code');
-  const [projectSource, setProjectSource] = useState('');
-  const [ueVersion, setUeVersion] = useState('');
-  const [sampleMode, setSampleMode] = useState(false);
-  const [showSampleTooltip, setShowSampleTooltip] = useState(false);
-
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [lastResponse, setLastResponse] = useState<IngestAcceptedResponse | null>(null);
-  const [recentJobs, setRecentJobs] = useState<IngestionJobStatus[]>(() => getIngestionJobHistory());
-
-  const isUE5 = activeDomainId === 'ue5';
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

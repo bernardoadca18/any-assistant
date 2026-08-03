@@ -89,7 +89,7 @@ const CreateTenantModal: React.FC<{
       <div className="bg-[#121214] border border-[#27272A] rounded-xl max-w-md w-full shadow-2xl">
         <div className="flex items-center justify-between px-5 py-4 border-b border-[#27272A]">
           <h2 className="text-sm font-semibold text-zinc-100">Novo Tenant</h2>
-          <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300">
+          <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300" aria-label="Fechar">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -316,7 +316,7 @@ const TenantDetailDrawer: React.FC<{
             <h2 className="text-sm font-semibold text-zinc-100">{tenant.name}</h2>
             <p className="text-[11px] font-mono text-zinc-600">{tenant.slug}</p>
           </div>
-          <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300">
+          <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300" aria-label="Fechar">
             <X className="w-4 h-4" />
           </button>
         </div>
