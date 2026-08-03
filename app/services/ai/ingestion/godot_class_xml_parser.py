@@ -167,6 +167,52 @@ def parse_class_xml(xml_bytes: bytes) -> dict:
             "description": clean_bbcode(const.text or ""),
         })
 
+    # ---------------------------------------------------------------------------
+    # PENDÊNCIA B: Suporte a <constructors>, <operators> e <theme_items>
+    # ---------------------------------------------------------------------------
+    # Essas tags são cruciais para tipos matemáticos (Vector2, Vector3, Color,
+    # Transform2D) e UI (Control). Antes eram ignoradas silenciosamente.
+
+    constructors = []
+    for ctor in root.findall("./constructors/constructor"):
+        name = ctor.get("name", "")  # Geralmente igual ao nome da classe
+        params = [_format_param(p) for p in ctor.findall("param")]
+        constructors.append({
+            "name": name,
+            "csharp_name": snake_to_pascal(name) if name else root.get("name", ""),
+            "params": params,
+            "qualifiers": ctor.get("qualifiers", ""),
+            "deprecation_note": _deprecation_note(ctor),
+            "description": clean_bbcode(ctor.findtext("description") or ""),
+        })
+
+    operators = []
+    for op in root.findall("./operators/operator"):
+        name = op.get("name", "")
+        return_el = op.find("return")
+        params = [_format_param(p) for p in op.findall("param")]
+        operators.append({
+            "name": name,
+            # Operadores C# usam sintaxe específica (ex: operator +)
+            "csharp_name": f"operator {snake_to_pascal(name)}" if name else "operator",
+            "return_type": return_el.get("type") if return_el is not None else "void",
+            "params": params,
+            "deprecation_note": _deprecation_note(op),
+            "description": clean_bbcode(op.findtext("description") or ""),
+        })
+
+    theme_items = []
+    for item in root.findall("./theme_items/theme_item"):
+        name = item.get("name", "")
+        theme_items.append({
+            "name": name,
+            "csharp_name": snake_to_pascal(name),
+            "type": item.get("type", ""),
+            "default": item.get("default", ""),
+            "deprecation_note": _deprecation_note(item),
+            "description": clean_bbcode(item.text or ""),
+        })
+
     return {
         "name": root.get("name", ""),
         "inherits": root.get("inherits", ""),
@@ -178,4 +224,8 @@ def parse_class_xml(xml_bytes: bytes) -> dict:
         "members": members,
         "signals": signals,
         "constants": constants,
+        # PENDÊNCIA B: novos campos
+        "constructors": constructors,
+        "operators": operators,
+        "theme_items": theme_items,
     }

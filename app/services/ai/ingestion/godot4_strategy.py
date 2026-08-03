@@ -50,6 +50,18 @@ write a short, educational Markdown summary (max ~200 words) explaining:
 - Key exported properties (@export) and what they control.
 - Key signals emitted and when.
 - Key public functions and their role in the Scene Tree lifecycle.
+
+C# EQUIVALENCE CONTEXT: When documenting GDScript code, highlight conceptual \
+terms and patterns that facilitate C# interoperability:
+- Mention signals as "events in C#" and show the C# event name pattern \
+  (e.g., signal 'health_changed' → C# event 'HealthChanged').
+- For async patterns, mention the C# equivalent (e.g., 'await' → 'ToSignal' \
+  or 'async/await' in C#).
+- For type hints, mention C# types where relevant (e.g., 'NodePath' \
+  remains 'NodePath' in C#, 'Array' → 'Godot.Collections.Array<T>').
+- Note that GDScript's '@export' maps to '[Export]' attribute in C#, \
+  '@onready' has no direct C# equivalent (use GetNode<T>() in _Ready()).
+
 Do not restate the code line-by-line. Do not invent behavior not implied \
 by the code. Output plain Markdown only, no code fences.
 """
@@ -216,8 +228,11 @@ class Godot4IngestionStrategy:
             return await self._process_csharp(path, raw_content, engine_version)
         if ext == ".rst":
             return await self._process_rst(path, raw_content, engine_version)
-        if ext in (".tscn", ".tres"):
+        # PENDÊNCIA A: Separação de doc_type para .tres vs .tscn
+        if ext == ".tscn":
             return await self._process_scene(path, raw_content, engine_version)
+        if ext == ".tres":
+            return await self._process_resource(path, raw_content, engine_version)
         if ext == ".xml":
             # Escopo restrito a doc/classes/ — não varrer qualquer .xml do
             # repositório (presets de export, manifests Android, etc.) caso
@@ -299,9 +314,19 @@ class Godot4IngestionStrategy:
             )
         return candidates
 
-    # -- .rst ------------------------------------------------------------
+    # -- .rst (Documentation) ----------------------------------------------
 
     async def _process_rst(self, path: Path, raw_content: str, engine_version: str) -> list[ChunkCandidate]:
+        """PENDÊNCIA C: Exclui arquivos em **/classes/** para evitar redundância.
+        A fonte da verdade para classes DEVE ser exclusivamente o canal XML parsed."""
+        # PENDÊNCIA C: Exclusão de diretório classes/ (redundância com XML)
+        path_str = path.as_posix()
+        if "/classes/" in path_str or "\\classes\\" in path_str:
+            log.debug(
+                "Ignorando .rst em classes/ (redundante com XML): %s", path
+            )
+            return []
+
         sanitized = await asyncio.to_thread(GODOT4_PROFILE.sanitize_content, raw_content, ".rst")
         # Sem LLM (mesma decisão do Canal B/.udn da UE5): doc oficial já é
         # prosa humana. summary_markdown == raw_content sanitizado.
@@ -318,9 +343,11 @@ class Godot4IngestionStrategy:
             for title, section in sections
         ]
 
-    # -- .tscn / .tres -----------------------------------------------------
+    # -- .tscn (Scene Structure) -------------------------------------------
 
     async def _process_scene(self, path: Path, raw_content: str, engine_version: str) -> list[ChunkCandidate]:
+        """PENDÊNCIA A: .tscn exclusivamente para scene_structure.
+        Focado na árvore de nós, hierarquia e conexões de sinais."""
         sanitized = await asyncio.to_thread(GODOT4_PROFILE.sanitize_content, raw_content, ".tscn")
         metadata = await asyncio.to_thread(GODOT4_PROFILE.extract_metadata, sanitized, str(path))
 
@@ -346,6 +373,76 @@ class Godot4IngestionStrategy:
                 source_file=str(path),
                 engine_version=engine_version,
                 extra_metadata=metadata,
+            )
+        ]
+
+    # -- .tres (Resource Structure) ----------------------------------------
+    # PENDÊNCIA A: Novo processador dedicado para arquivos de recurso.
+
+    async def _process_resource(self, path: Path, raw_content: str, engine_version: str) -> list[ChunkCandidate]:
+        """.tres exclusivamente para resource_structure.
+        Focado em propriedades de recursos salvos, shaders, temas, sub-recursos."""
+        sanitized = await asyncio.to_thread(GODOT4_PROFILE.sanitize_content, raw_content, ".tscn")  # mesmo formato
+        metadata = await asyncio.to_thread(GODOT4_PROFILE.extract_metadata, sanitized, str(path))
+
+        # Extrair informações específicas de recursos
+        sub_resources = []
+        resource_type = "Unknown"
+        for line in sanitized.splitlines():
+            if line.startswith("[sub_resource "):
+                # Extrair tipo e ID do sub-recurso
+                type_match = re.search(r'type="([^"]+)"', line)
+                id_match = re.search(r'id="([^"]+)"', line)
+                if type_match and id_match:
+                    sub_resources.append({"type": type_match.group(1), "id": id_match.group(1)})
+            elif line.startswith("[gd_resource "):
+                type_match = re.search(r'type="([^"]+)"', line)
+                if type_match:
+                    resource_type = type_match.group(1)
+
+        # Extrair propriedades do recurso principal
+        properties = []
+        in_properties = False
+        for line in sanitized.splitlines():
+            if line.strip() == "[resource]":
+                in_properties = True
+                continue
+            if in_properties and "=" in line and not line.startswith("["):
+                prop_match = re.match(r'^(\w+)\s*=\s*(.+)$', line.strip())
+                if prop_match:
+                    properties.append({"name": prop_match.group(1), "value": prop_match.group(2)})
+
+        sub_resource_lines = "\n".join(
+            f"- {sr['type']} (id: {sr['id']})" for sr in sub_resources
+        )
+        prop_lines = "\n".join(
+            f"- {p['name']}: {p['value'][:100]}{'...' if len(p['value']) > 100 else ''}"
+            for p in properties[:20]  # Limitar a 20 propriedades principais
+        )
+
+        summary = (
+            f"# Resource: {path.name}\n\n"
+            f"**Type:** {resource_type}\n\n"
+            f"## Sub-resources\n{sub_resource_lines or '(none)'}\n\n"
+            f"## Properties\n{prop_lines or '(none parsed)'}"
+        )
+
+        resource_metadata = {
+            **metadata,
+            "resource_type": resource_type,
+            "sub_resource_count": len(sub_resources),
+            "property_count": len(properties),
+        }
+
+        return [
+            ChunkCandidate(
+                title=f"Resource: {path.name}",
+                summary_markdown=summary,
+                raw_content=sanitized[:_MAX_CHUNK_CHARS],
+                doc_type="resource_structure",
+                source_file=str(path),
+                engine_version=engine_version,
+                extra_metadata=resource_metadata,
             )
         ]
 
@@ -440,6 +537,45 @@ class Godot4IngestionStrategy:
             class_name, path, resolved_version, metadata_base, "constants",
             [_constant_text(c) for c in parsed["constants"]],
         ))
+
+        # PENDÊNCIA B: Novas seções para constructors, operators, theme_items
+        def _constructor_text(c: dict) -> str:
+            note = f"\n{c['deprecation_note']}" if c.get("deprecation_note") else ""
+            params_str = ", ".join(c["params"]) if c["params"] else ""
+            return (
+                f"### {c['csharp_name']}({params_str})\n"
+                f"GDScript: `{c['name']}({params_str})`{note}\n\n{c['description']}"
+            )
+
+        def _operator_text(o: dict) -> str:
+            note = f"\n{o['deprecation_note']}" if o.get("deprecation_note") else ""
+            params_str = ", ".join(o["params"]) if o["params"] else ""
+            return (
+                f"### {o['csharp_name']}({params_str}) -> {o['return_type']}\n"
+                f"GDScript operator: `{o['name']}`{note}\n\n{o['description']}"
+            )
+
+        def _theme_item_text(t: dict) -> str:
+            note = f"\n{t['deprecation_note']}" if t.get("deprecation_note") else ""
+            default_tag = f" (default: {t['default']})" if t.get("default") else ""
+            return (
+                f"### {t['csharp_name']} : {t['type']}{default_tag}\n"
+                f"GDScript: `{t['name']}`{note}\n\n{t['description']}"
+            )
+
+        candidates.extend(self._batch_class_section(
+            class_name, path, resolved_version, metadata_base, "constructors",
+            [_constructor_text(c) for c in parsed.get("constructors", [])],
+        ))
+        candidates.extend(self._batch_class_section(
+            class_name, path, resolved_version, metadata_base, "operators",
+            [_operator_text(o) for o in parsed.get("operators", [])],
+        ))
+        candidates.extend(self._batch_class_section(
+            class_name, path, resolved_version, metadata_base, "theme_items",
+            [_theme_item_text(t) for t in parsed.get("theme_items", [])],
+        ))
+
         return candidates
 
     @staticmethod

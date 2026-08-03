@@ -214,7 +214,9 @@ GODOT4_PROFILE = Godot4DomainProfile(
         "gdscript_api": "GDScript Source (.gd)",
         "csharp_api": "Godot C# Source (.cs)",
         "godot_docs_rst": "Official Godot Manual (.rst)",
-        "scene_structure": "Scene/Resource Structure (.tscn/.tres)",
+        # PENDÊNCIA A: Separação de doc_type para .tres vs .tscn
+        "scene_structure": "Scene Structure (.tscn)",
+        "resource_structure": "Resource Structure (.tres)",
         "godot_class_reference": "Official Class Reference (.xml)",
     },
     system_prompt=GODOT4_SYSTEM_PROMPT,
