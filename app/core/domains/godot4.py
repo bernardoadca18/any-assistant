@@ -74,9 +74,15 @@ Return ONLY valid JSON in this structure:
 # Ingestion parsing helpers
 # ---------------------------------------------------------------------------
 
+# RST Sanitization - Comprehensive Sphinx directive handling
 _RST_DIRECTIVE_RE = re.compile(r"^\s*\.\.\s+[\w:-]+::.*$", re.MULTILINE)
-_RST_ROLE_RE = re.compile(r":(?:ref|class|func|method|member|signal|constant|enum|annotation):`([^`]+)`")
-_RST_NOTE_BLOCK_RE = re.compile(r"^\s*\.\.\s+(?:note|warning|tip|deprecated)::\s*$", re.MULTILINE)
+_RST_ROLE_RE = re.compile(r":(?:ref|class|func|method|member|signal|constant|enum|annotation|doc|meth|attr|mod):`([^`]+)`")
+_RST_NOTE_BLOCK_RE = re.compile(r"^\s*\.\.\s+(?:note|warning|tip|deprecated|seealso|versionadded|versionchanged)::\s*$", re.MULTILINE)
+_RST_CODE_BLOCK_RE = re.compile(r"^\s*\.\.\s+code-block::\s*\w*\s*$", re.MULTILINE)
+_RST_TOCTREE_RE = re.compile(r"^\s*\.\.\s+toctree::.*$", re.MULTILINE)
+_RST_IMAGE_RE = re.compile(r"^\s*\.\.\s+(?:image|figure)::.*$", re.MULTILINE)
+_RST_RAW_RE = re.compile(r"^\s*\.\.\s+raw::.*$", re.MULTILINE)
+_RST_HEADER_UNDERLINE_RE = re.compile(r"^([=\-~^\"'`+#])\1+\s*$", re.MULTILINE)
 
 _GD_CLASS_NAME_RE = re.compile(r"^\s*class_name\s+(\w+)", re.MULTILINE)
 _GD_EXTENDS_RE = re.compile(r"^\s*extends\s+([\w.]+)", re.MULTILINE)
@@ -101,12 +107,68 @@ _TSCN_CONNECTION_RE = re.compile(
 def _sanitize_rst(raw_content: str) -> str:
     """Remove diretivas Sphinx/RTD que não carregam valor semântico para o
     embedding (`.. code-block:: gdscript`, `:ref:`, `.. note::`), mantendo o
-    texto legível como Markdown aproximado."""
-    text = _RST_ROLE_RE.sub(r"\1", raw_content)
+    texto legível como Markdown aproximado.
+
+    Handles:
+    - Sphinx roles: :ref:`...`, :class:`...`, :doc:`...`, etc.
+    - Sphinx directives: .. code-block::, .. note::, .. warning::, etc.
+    - RST header underlines (===, ---, ~~~) converted to Markdown style
+    - Toctree, image, and raw directives removed entirely
+    """
+    text = raw_content
+
+    # Step 1: Remove Sphinx roles, keeping only the inner content
+    # :ref:`Some Link` -> Some Link
+    text = _RST_ROLE_RE.sub(r"\1", text)
+
+    # Step 2: Remove specific Sphinx directives that don't contribute semantic value
+    # .. toctree::, .. image::, .. raw::
+    text = _RST_TOCTREE_RE.sub("", text)
+    text = _RST_IMAGE_RE.sub("", text)
+    text = _RST_RAW_RE.sub("", text)
+
+    # Step 3: Handle code-block directives specially
+    # .. code-block:: gdscript -> ```gdscript (converted to markdown)
+    text = _RST_CODE_BLOCK_RE.sub("```", text)
+
+    # Step 4: Remove note/warning/tip/deprecated/seealso blocks
+    # These are structural markers, not semantic content
     text = _RST_NOTE_BLOCK_RE.sub("", text)
+
+    # Step 5: Remove any remaining generic directives
     text = _RST_DIRECTIVE_RE.sub("", text)
-    # Sphinx usa sublinhados de = / - / ~ para headers -> normaliza para "# "
-    return text
+
+    # Step 6: Convert RST header underlines to Markdown style
+    # Lines like "=====" or "-----" under a header line become Markdown headers
+    lines = text.splitlines()
+    result_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Check if next line is an underline
+        if i + 1 < len(lines) and _RST_HEADER_UNDERLINE_RE.match(lines[i + 1]):
+            # Convert to Markdown header based on underline character
+            underline = lines[i + 1].strip()
+            if underline.startswith("="):
+                result_lines.append(f"# {line}")
+            elif underline.startswith("-"):
+                result_lines.append(f"## {line}")
+            elif underline.startswith("~"):
+                result_lines.append(f"### {line}")
+            elif underline.startswith("^"):
+                result_lines.append(f"#### {line}")
+            else:
+                result_lines.append(f"## {line}")  # Default to H2
+            i += 2  # Skip both the header and underline
+        else:
+            result_lines.append(line)
+            i += 1
+
+    # Step 7: Clean up excessive blank lines
+    text = "\n".join(result_lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
 
 
 def _sanitize_gd(raw_content: str) -> str:
@@ -209,10 +271,14 @@ GODOT4_PROFILE = Godot4DomainProfile(
     display_name="Godot Engine 4.x",
     default_session_title="Conversa Godot Engine 4",
     default_collection_name="godot_4_docs_hybrid",
-    supported_extensions=(".gd", ".cs", ".rst", ".tscn", ".tres", ".xml"),
+    # Extensions supported by the Godot 4 ingestion strategy
+    # .h/.cpp are for engine C++ source (Channel 3 - LLM documented)
+    supported_extensions=(".gd", ".cs", ".h", ".cpp", ".rst", ".tscn", ".tres", ".xml"),
     doc_types={
         "gdscript_api": "GDScript Source (.gd)",
         "csharp_api": "Godot C# Source (.cs)",
+        "cpp_engine_api": "Godot Engine C++ Header (.h)",
+        "cpp_engine_bindings": "Godot Engine C++ Bindings (.gen.cpp)",
         "godot_docs_rst": "Official Godot Manual (.rst)",
         # PENDÊNCIA A: Separação de doc_type para .tres vs .tscn
         "scene_structure": "Scene Structure (.tscn)",
@@ -224,6 +290,8 @@ GODOT4_PROFILE = Godot4DomainProfile(
     code_fence_language_map={
         "gdscript_api": "gdscript",
         "csharp_api": "csharp",
+        "cpp_engine_api": "cpp",
+        "cpp_engine_bindings": "cpp",
         "godot_docs_rst": "markdown",
         "scene_structure": "gdscript",  # .tscn não tem highlight próprio na maioria dos renderers
         "godot_class_reference": "csharp",  # ver docstring do módulo/relatório: exemplos [gdscript]
