@@ -17,3 +17,5 @@ coverage/
 *.log
 .env*
 !.env.example
+GUIA_COMPLETO.md
+GUIA_EXECUCAO.md
