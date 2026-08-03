@@ -3,17 +3,21 @@ app/services/ai/ingestion/godot4_strategy.py
 ================================================
 Implementação de IngestionStrategy para o domínio Godot Engine 4.x.
 
-Quatro canais, cada um mapeado para um doc_type do Godot4Profile
+Cinco canais, cada um mapeado para um doc_type do Godot4Profile
 (ver app/core/domains/godot4.py):
 
-    .gd    -> gdscript_api     (parsing por regex + LLM documentadora)
-    .cs    -> csharp_api       (idem, atributos C#)
-    .rst   -> godot_docs_rst   (sanitização Sphinx, sem chamada de LLM —
-                                 mesmo princípio do Canal B/.udn da UE5:
-                                 documentação oficial já é prosa humana,
-                                 não precisa de re-explicação por LLM)
-    .tscn  -> scene_structure  (parsing estrutural puro, sem LLM — a
-                                 hierarquia de nodes já é auto-descritiva)
+    .gd    -> gdscript_api          (parsing por regex + LLM documentadora)
+    .cs    -> csharp_api            (idem, atributos C#; chunking por membro)
+    .rst   -> godot_docs_rst        (sanitização Sphinx, sem chamada de LLM —
+                                      mesmo princípio do Canal B/.udn da UE5:
+                                      documentação oficial já é prosa humana,
+                                      não precisa de re-explicação por LLM)
+    .tscn/.tres -> scene_structure  (parsing estrutural puro, sem LLM — a
+                                      hierarquia de nodes já é auto-descritiva)
+    .xml   -> godot_class_reference (parsing da Class Reference oficial via
+                                      godot_class_xml_parser.py, escopo
+                                      restrito a doc/classes/*.xml — sem LLM,
+                                      doc oficial já é referência estruturada)
 
 Zero Raw Code Embedding (spec seção 5): `summary_markdown` (o que vira
 embedding) é SEMPRE prosa conceitual gerada pela LLM documentadora ou
@@ -26,11 +30,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from app.core.config import settings
 from app.core.domains.godot4 import GODOT4_PROFILE
 from app.services.ai.ingestion.base_strategy import ChunkCandidate
+from app.services.ai.ingestion.godot_class_xml_parser import parse_class_xml
 
 log = logging.getLogger(__name__)
 
@@ -56,18 +62,29 @@ delegates, and which Godot lifecycle overrides (_Ready/_Process/\
 _PhysicsProcess) it implements and why. Output plain Markdown only.
 """
 
+# ---------------------------------------------------------------------------
+# Regex de chunking estrutural (GDScript / C#)
+# ---------------------------------------------------------------------------
+
+_CSHARP_MEMBER_RE = re.compile(
+    r"^\s*(?:public|private|protected|internal)\s+"
+    r"(?:static\s+|override\s+|virtual\s+|async\s+|sealed\s+|abstract\s+|new\s+|partial\s+)*"
+    r"[\w<>\[\],.\?]+\s+\w+\s*\("
+)
+
 
 def _split_gdscript_by_function(content: str) -> list[tuple[str, str]]:
     """Divide um .gd em (header_da_classe, corpo_da_função) por função
-    top-level, preservando a declaração de classe/extends/signals/exports
-    como contexto prefixado em cada grupo — mesmo princípio de
-    ingestion_service._group_cpp_blocks para o Canal C da UE5."""
+    top-level (incluindo `static func`), preservando a declaração de
+    classe/extends/signals/exports como contexto prefixado em cada grupo —
+    mesmo princípio de ingestion_service._group_cpp_blocks para o Canal C
+    da UE5."""
     lines = content.splitlines()
     header_lines: list[str] = []
     func_starts: list[int] = []
 
     for idx, line in enumerate(lines):
-        if re.match(r"^\s*func\s+\w+\s*\(", line):
+        if re.match(r"^\s*(?:static\s+)?func\s+\w+\s*\(", line):
             func_starts.append(idx)
         elif not func_starts and not re.match(r"^\s*#", line):
             header_lines.append(line)
@@ -81,6 +98,77 @@ def _split_gdscript_by_function(content: str) -> list[tuple[str, str]]:
         end = func_starts[i + 1] if i + 1 < len(func_starts) else len(lines)
         groups.append((header, "\n".join(lines[start:end])))
     return groups
+
+
+def _split_csharp_by_member(content: str) -> list[tuple[str, str]]:
+    """Divide um .cs por método/propriedade top-level, preservando
+    usings/campos/[Export]/[Signal] anteriores como header — mesmo
+    princípio de _split_gdscript_by_function. Heurística por regex, não
+    parser completo de C#: suficiente para os padrões idiomáticos de
+    scripts Godot (classe única por arquivo, sem nesting profundo).
+
+    CORREÇÃO (ALTO): antes, _process_csharp não fazia nenhum chunking —
+    o arquivo inteiro virava um único ChunkCandidate truncado em
+    _MAX_CHUNK_CHARS, perdendo silenciosamente todo método além do
+    truncamento. Esta função espelha o comportamento já existente para
+    GDScript."""
+    lines = content.splitlines()
+    header_lines: list[str] = []
+    member_starts: list[int] = []
+    pending_attr_start: int | None = None
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not member_starts and stripped.startswith("[") and pending_attr_start is None:
+            pending_attr_start = idx
+            continue
+        if _CSHARP_MEMBER_RE.match(line):
+            member_starts.append(pending_attr_start if pending_attr_start is not None else idx)
+            pending_attr_start = None
+            continue
+        if not member_starts:
+            header_lines.append(line)
+        pending_attr_start = None
+
+    if not member_starts:
+        return [("\n".join(header_lines), content)]
+
+    header = "\n".join(header_lines).strip()
+    groups: list[tuple[str, str]] = []
+    for i, start in enumerate(member_starts):
+        end = member_starts[i + 1] if i + 1 < len(member_starts) else len(lines)
+        groups.append((header, "\n".join(lines[start:end])))
+    return groups
+
+
+def _split_rst_by_headers(content: str, root_title: str) -> list[tuple[str, str]]:
+    """Split simples por linhas de sublinhado RST (===, ---, ~~~) — mesmo
+    princípio de ingestion_service._hierarchical_markdown_chunker, adaptado
+    para o estilo de header do RST em vez de Markdown '#'."""
+    lines = content.splitlines()
+    sections: list[tuple[str, list[str]]] = []
+    current_title = root_title
+    current_body: list[str] = []
+
+    underline_re = re.compile(r"^[=\-~^\"]{3,}\s*$")
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if i + 1 < len(lines) and underline_re.match(lines[i + 1]) and line.strip():
+            if current_body:
+                sections.append((current_title, current_body))
+            current_title = line.strip()
+            current_body = []
+            i += 2
+            continue
+        current_body.append(line)
+        i += 1
+
+    if current_body:
+        sections.append((current_title, current_body))
+
+    return [(title, "\n".join(body).strip()) for title, body in sections if "\n".join(body).strip()]
 
 
 async def _document_via_llm(system_prompt: str, code_block: str, model: str) -> str:
@@ -130,6 +218,14 @@ class Godot4IngestionStrategy:
             return await self._process_rst(path, raw_content, engine_version)
         if ext in (".tscn", ".tres"):
             return await self._process_scene(path, raw_content, engine_version)
+        if ext == ".xml":
+            # Escopo restrito a doc/classes/ — não varrer qualquer .xml do
+            # repositório (presets de export, manifests Android, etc.) caso
+            # o root aponte para o clone completo do godotengine/godot.
+            if path.parent.name != "classes":
+                log.debug("Godot4IngestionStrategy: .xml fora de doc/classes/, ignorando '%s'.", path)
+                return []
+            return await self._process_class_xml(path, raw_bytes, engine_version)
 
         log.debug("Godot4IngestionStrategy: extensão '%s' sem canal dedicado, ignorando '%s'.", ext, path)
         return []
@@ -175,24 +271,33 @@ class Godot4IngestionStrategy:
         metadata = await asyncio.to_thread(GODOT4_PROFILE.extract_metadata, raw_content, str(path))
         class_name = metadata.get("class_name") or path.stem
 
-        code_block = raw_content[:_MAX_CHUNK_CHARS]
-        try:
-            summary = await _document_via_llm(_CSHARP_DOCUMENTER_SYSTEM_PROMPT, code_block, self._documenter_model)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Godot4/.cs: falha ao documentar '%s' via LLM (%s) — usando fallback textual.", path, exc)
-            summary = f"Godot C# class `{class_name}` — documentação automática indisponível."
+        groups = await asyncio.to_thread(_split_csharp_by_member, raw_content)
+        candidates: list[ChunkCandidate] = []
 
-        return [
-            ChunkCandidate(
-                title=f"{class_name} ({path.name})",
-                summary_markdown=summary,
-                raw_content=code_block,
-                doc_type="csharp_api",
-                source_file=str(path),
-                engine_version=engine_version,
-                extra_metadata=metadata,
+        for header, body in groups:
+            code_block = f"{header}\n\n{body}".strip()
+            if len(code_block) > _MAX_CHUNK_CHARS:
+                code_block = code_block[:_MAX_CHUNK_CHARS]
+            try:
+                summary = await _document_via_llm(
+                    _CSHARP_DOCUMENTER_SYSTEM_PROMPT, code_block, self._documenter_model
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Godot4/.cs: falha ao documentar '%s' via LLM (%s) — usando fallback textual.", path, exc)
+                summary = f"Godot C# class `{class_name}` — documentação automática indisponível."
+
+            candidates.append(
+                ChunkCandidate(
+                    title=f"{class_name} ({path.name})",
+                    summary_markdown=summary,
+                    raw_content=code_block,
+                    doc_type="csharp_api",
+                    source_file=str(path),
+                    engine_version=engine_version,
+                    extra_metadata=metadata,
+                )
             )
-        ]
+        return candidates
 
     # -- .rst ------------------------------------------------------------
 
@@ -244,32 +349,136 @@ class Godot4IngestionStrategy:
             )
         ]
 
+    # -- .xml (Class Reference) -----------------------------------------
 
-def _split_rst_by_headers(content: str, root_title: str) -> list[tuple[str, str]]:
-    """Split simples por linhas de sublinhado RST (===, ---, ~~~) — mesmo
-    princípio de ingestion_service._hierarchical_markdown_chunker, adaptado
-    para o estilo de header do RST em vez de Markdown '#'."""
-    lines = content.splitlines()
-    sections: list[tuple[str, list[str]]] = []
-    current_title = root_title
-    current_body: list[str] = []
+    async def _process_class_xml(
+        self, path: Path, raw_bytes: bytes, engine_version: str
+    ) -> list[ChunkCandidate]:
+        try:
+            parsed = await asyncio.to_thread(parse_class_xml, raw_bytes)
+        except (ET.ParseError, ValueError) as exc:
+            log.debug("Godot4/.xml: '%s' não é uma <class> válida (%s) — ignorando.", path, exc)
+            return []
 
-    underline_re = re.compile(r"^[=\-~^\"]{3,}\s*$")
+        class_name = parsed["name"] or path.stem
+        # engine_version do próprio XML tem prioridade sobre o override
+        # genérico "4.x" — cada arquivo de doc/classes/ carrega a versão
+        # exata do build que o gerou (atributo `version` da tag <class>).
+        resolved_version = parsed.get("xml_engine_version") or engine_version
+        metadata_base = {
+            "class_name": class_name,
+            "inherits": parsed["inherits"],
+            "tutorials": parsed["tutorials"],
+        }
+        candidates: list[ChunkCandidate] = []
 
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if i + 1 < len(lines) and underline_re.match(lines[i + 1]) and line.strip():
-            if current_body:
-                sections.append((current_title, current_body))
-            current_title = line.strip()
-            current_body = []
-            i += 2
-            continue
-        current_body.append(line)
-        i += 1
+        # Overview: brief + description + inherits + tutoriais oficiais
+        overview_parts = [f"# {class_name}" + (f" (inherits {parsed['inherits']})" if parsed["inherits"] else "")]
+        if parsed["brief_description"]:
+            overview_parts.append(parsed["brief_description"])
+        if parsed["description"]:
+            overview_parts.append(parsed["description"])
+        if parsed["tutorials"]:
+            overview_parts.append(
+                "## Tutorials\n" + "\n".join(f"- {t['title'] or t['url']}: {t['url']}" for t in parsed["tutorials"])
+            )
+        overview_text = "\n\n".join(overview_parts).strip()
+        if overview_text:
+            candidates.append(ChunkCandidate(
+                title=f"{class_name} — Overview",
+                summary_markdown=overview_text[:_MAX_CHUNK_CHARS],
+                raw_content=overview_text[:_MAX_CHUNK_CHARS],
+                doc_type="godot_class_reference",
+                source_file=str(path),
+                engine_version=resolved_version,
+                extra_metadata={**metadata_base, "section": "overview"},
+            ))
 
-    if current_body:
-        sections.append((current_title, current_body))
+        def _method_text(m: dict) -> str:
+            qualifier_tag = f" [{m['qualifiers']}]" if m.get("qualifiers") else ""
+            note = f"\n{m['deprecation_note']}" if m.get("deprecation_note") else ""
+            return (
+                f"### {m['csharp_name']}({', '.join(m['params'])}) -> {m['return_type']}{qualifier_tag}\n"
+                f"GDScript: `{m['name']}({', '.join(m['params'])})`{note}\n\n{m['description']}"
+            )
 
-    return [(title, "\n".join(body).strip()) for title, body in sections if "\n".join(body).strip()]
+        def _member_text(m: dict) -> str:
+            note = f"\n{m['deprecation_note']}" if m.get("deprecation_note") else ""
+            return (
+                f"### {m['csharp_name']} : {m['type']} (default: {m['default']})\n"
+                f"GDScript: `{m['name']}`{note}\n\n{m['description']}"
+            )
+
+        def _signal_text(s: dict) -> str:
+            note = f"\n{s['deprecation_note']}" if s.get("deprecation_note") else ""
+            return (
+                f"### {s['csharp_event_name']}({', '.join(s['params'])})\n"
+                f"GDScript signal: `{s['name']}`{note}\n\n{s['description']}"
+            )
+
+        def _constant_text(c: dict) -> str:
+            enum_tag = f" (enum: {c['enum']})" if c.get("enum") else ""
+            note = f"\n{c['deprecation_note']}" if c.get("deprecation_note") else ""
+            return (
+                f"### {c['csharp_name']} = {c['value']}{enum_tag}\n"
+                f"GDScript: `{c['name']}`{note}\n\n{c['description']}"
+            )
+
+        candidates.extend(self._batch_class_section(
+            class_name, path, resolved_version, metadata_base, "methods",
+            [_method_text(m) for m in parsed["methods"]],
+        ))
+        candidates.extend(self._batch_class_section(
+            class_name, path, resolved_version, metadata_base, "members",
+            [_member_text(m) for m in parsed["members"]],
+        ))
+        candidates.extend(self._batch_class_section(
+            class_name, path, resolved_version, metadata_base, "signals",
+            [_signal_text(s) for s in parsed["signals"]],
+        ))
+        candidates.extend(self._batch_class_section(
+            class_name, path, resolved_version, metadata_base, "constants",
+            [_constant_text(c) for c in parsed["constants"]],
+        ))
+        return candidates
+
+    @staticmethod
+    def _batch_class_section(
+        class_name: str, path: Path, engine_version: str, metadata_base: dict,
+        section_name: str, items: list[str],
+    ) -> list[ChunkCandidate]:
+        """Agrupa itens (métodos/membros/signals/constants) em lotes que
+        cabem em _MAX_CHUNK_CHARS, sem quebrar um item no meio — para
+        classes grandes (Node, Control) isso gera N chunks em vez de 1
+        chunk truncado perdendo membros inteiros."""
+        if not items:
+            return []
+        candidates: list[ChunkCandidate] = []
+        buffer: list[str] = []
+        buffer_len = 0
+        batch_idx = 1
+
+        def _flush() -> None:
+            nonlocal buffer, buffer_len, batch_idx
+            if not buffer:
+                return
+            text = "\n\n".join(buffer)
+            candidates.append(ChunkCandidate(
+                title=f"{class_name} — {section_name.capitalize()} ({batch_idx})",
+                summary_markdown=text,
+                raw_content=text,
+                doc_type="godot_class_reference",
+                source_file=str(path),
+                engine_version=engine_version,
+                extra_metadata={**metadata_base, "section": section_name},
+            ))
+            buffer, buffer_len = [], 0
+            batch_idx += 1
+
+        for item in items:
+            if buffer and buffer_len + len(item) > _MAX_CHUNK_CHARS:
+                _flush()
+            buffer.append(item)
+            buffer_len += len(item)
+        _flush()
+        return candidates

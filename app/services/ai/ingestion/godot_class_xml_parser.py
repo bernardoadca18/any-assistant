@@ -14,6 +14,17 @@ vira TreeEnteredEventHandler. Sem essa tradução, uma pergunta feita em
 C# ("como uso GetAngleTo") não teria nenhum match léxico com o texto
 indexado ("get_angle_to"), prejudicando o retrieval para o público-alvo
 principal do domínio (dev que só programa em C#).
+
+Campos adicionais (revisão 2):
+    - default de parâmetros (<param default="...">) -> assinaturas com
+      overloads opcionais ficam completas (ex.: get_node(path, owned=true)).
+    - enum de constantes (<constant enum="...">) -> constantes que em C#
+      viram membros de um enum aninhado (Node.ProcessModeEnum.Disabled)
+      em vez de constante solta.
+    - deprecated/experimental -> evita recomendar API obsoleta como se
+      fosse atual.
+    - xml_engine_version -> extraído do atributo `version` da própria
+      tag <class>, mais confiável que um override externo genérico.
 """
 
 from __future__ import annotations
@@ -29,6 +40,30 @@ def snake_to_pascal(name: str) -> str:
     if not name:
         return name
     return "".join(part.capitalize() for part in name.split("_") if part)
+
+
+def _format_param(p: ET.Element) -> str:
+    """type name [= default] — inclui o valor default quando presente no
+    XML, essencial para overloads com parâmetros opcionais (comum na API
+    de Node/Control/Camera2D)."""
+    base = f"{p.get('type')} {p.get('name')}"
+    default = p.get("default")
+    return f"{base} = {default}" if default is not None else base
+
+
+def _deprecation_note(el: ET.Element) -> str:
+    """Godot marca itens obsoletos/experimentais via atributos
+    'deprecated'/'experimental' no próprio elemento (podem conter uma
+    mensagem de texto ou vir vazios). Sem isso o assistente pode
+    recomendar API obsoleta como se fosse atual."""
+    notes = []
+    if el.get("deprecated") is not None:
+        msg = el.get("deprecated") or "no replacement message provided"
+        notes.append(f"⚠️ DEPRECATED: {msg}")
+    if el.get("experimental") is not None:
+        msg = el.get("experimental") or "API may change"
+        notes.append(f"⚠️ EXPERIMENTAL: {msg}")
+    return " | ".join(notes)
 
 
 # Ordem importa: blocos [gdscript]/[csharp] precisam ser resolvidos ANTES do
@@ -74,6 +109,8 @@ def parse_class_xml(xml_bytes: bytes) -> dict:
     if root.tag != "class":
         raise ValueError(f"XML raiz '{root.tag}' não é uma <class> da Class Reference.")
 
+    xml_engine_version = root.get("version", "")
+
     tutorials = [
         {"title": t.get("title", ""), "url": (t.text or "").strip()}
         for t in root.findall("./tutorials/link")
@@ -83,13 +120,14 @@ def parse_class_xml(xml_bytes: bytes) -> dict:
     for m in root.findall("./methods/method"):
         name = m.get("name", "")
         ret_el = m.find("return")
-        params = [f"{p.get('type')} {p.get('name')}" for p in m.findall("param")]
+        params = [_format_param(p) for p in m.findall("param")]
         methods.append({
             "name": name,
             "csharp_name": snake_to_pascal(name),
             "return_type": ret_el.get("type") if ret_el is not None else "void",
             "params": params,
             "qualifiers": m.get("qualifiers", ""),
+            "deprecation_note": _deprecation_note(m),
             "description": clean_bbcode(m.findtext("description") or ""),
         })
 
@@ -101,17 +139,19 @@ def parse_class_xml(xml_bytes: bytes) -> dict:
             "csharp_name": snake_to_pascal(name),
             "type": mem.get("type", ""),
             "default": mem.get("default", ""),
+            "deprecation_note": _deprecation_note(mem),
             "description": clean_bbcode(mem.text or ""),
         })
 
     signals = []
     for sig in root.findall("./signals/signal"):
         name = sig.get("name", "")
-        params = [f"{p.get('type')} {p.get('name')}" for p in sig.findall("param")]
+        params = [_format_param(p) for p in sig.findall("param")]
         signals.append({
             "name": name,
             "csharp_event_name": f"{snake_to_pascal(name)}EventHandler",
             "params": params,
+            "deprecation_note": _deprecation_note(sig),
             "description": clean_bbcode(sig.findtext("description") or ""),
         })
 
@@ -122,12 +162,15 @@ def parse_class_xml(xml_bytes: bytes) -> dict:
             "name": name,
             "csharp_name": snake_to_pascal(name),
             "value": const.get("value", ""),
+            "enum": const.get("enum", ""),
+            "deprecation_note": _deprecation_note(const),
             "description": clean_bbcode(const.text or ""),
         })
 
     return {
         "name": root.get("name", ""),
         "inherits": root.get("inherits", ""),
+        "xml_engine_version": xml_engine_version,
         "brief_description": clean_bbcode(root.findtext("brief_description") or ""),
         "description": clean_bbcode(root.findtext("description") or ""),
         "tutorials": tutorials,

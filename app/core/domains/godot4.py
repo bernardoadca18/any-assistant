@@ -4,11 +4,17 @@ app/core/domains/godot4.py
 Domain profile para Godot Engine 4.x (GDScript 2.0 + Godot C#/.NET 8) —
 domínio ativo por padrão (settings.active_domain="godot_4").
 
-sanitize_content/extract_metadata cobrem os 4 tipos de arquivo de origem:
-    .gd    -> GDScriptSource   (doc_type: gdscript_api)
+sanitize_content/extract_metadata cobrem os 4 tipos de arquivo de código-
+fonte/cena (.gd, .cs, .rst, .tscn/.tres); a Class Reference oficial (.xml,
+doc_type godot_class_reference) usa parser dedicado em
+app/services/ai/ingestion/godot_class_xml_parser.py, fora deste dispatch:
+
+    .gd    -> GDScriptSource    (doc_type: gdscript_api)
     .cs    -> GodotCSharpSource (doc_type: csharp_api)
-    .rst   -> Sphinx/RTD docs  (doc_type: godot_docs_rst)
-    .tscn  -> Scene/Resource   (doc_type: scene_structure)
+    .rst   -> Sphinx/RTD docs   (doc_type: godot_docs_rst)
+    .tscn  -> Scene/Resource    (doc_type: scene_structure)
+    .xml   -> Class Reference   (doc_type: godot_class_reference — ver
+                                  godot_class_xml_parser.py)
 """
 
 from __future__ import annotations
@@ -203,12 +209,13 @@ GODOT4_PROFILE = Godot4DomainProfile(
     display_name="Godot Engine 4.x",
     default_session_title="Conversa Godot Engine 4",
     default_collection_name="godot_4_docs_hybrid",
-    supported_extensions=(".gd", ".cs", ".rst", ".tscn", ".tres"),
+    supported_extensions=(".gd", ".cs", ".rst", ".tscn", ".tres", ".xml"),
     doc_types={
         "gdscript_api": "GDScript Source (.gd)",
         "csharp_api": "Godot C# Source (.cs)",
         "godot_docs_rst": "Official Godot Manual (.rst)",
         "scene_structure": "Scene/Resource Structure (.tscn/.tres)",
+        "godot_class_reference": "Official Class Reference (.xml)",
     },
     system_prompt=GODOT4_SYSTEM_PROMPT,
     decomposition_prompt=GODOT4_DECOMPOSITION_PROMPT,
@@ -217,6 +224,8 @@ GODOT4_PROFILE = Godot4DomainProfile(
         "csharp_api": "csharp",
         "godot_docs_rst": "markdown",
         "scene_structure": "gdscript",  # .tscn não tem highlight próprio na maioria dos renderers
+        "godot_class_reference": "csharp",  # ver docstring do módulo/relatório: exemplos [gdscript]
+                                              # são descartados no parser, só [csharp] sobrevive no chunk
     },
     default_code_fence_language="gdscript",
     sparse_camel_split_regex=_GODOT4_CAMEL_SPLIT_REGEX,
