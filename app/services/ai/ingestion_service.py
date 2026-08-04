@@ -2019,8 +2019,7 @@ async def _flush_batch(
                 await qdrant.upsert(
                     collection_name=collection_name,
                     points=sub_points,
-                    wait=wait_enabled,
-                    timeout=60.0,  # Timeout explícito para upsert (sobrescreve o do cliente)
+                    wait=wait_enabled
                 )
                 break  # Sucesso — sai do loop de retry
             except (
