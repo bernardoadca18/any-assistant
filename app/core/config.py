@@ -338,6 +338,14 @@ class Settings(BaseSettings):
             "automaticamente um padrão 'X.Y' do caminho da pasta ingerida."
         ),
     )
+    ingestion_default_godot_version: str = Field(
+        default="4.7.1-stable",
+        description=(
+            "Versão Godot usada como fallback quando não é possível extrair "
+            "automaticamente um padrão 'X.Y' do caminho da pasta ingerida. "
+            "Formato completo inclui sufixo stable/rc (ex: '4.7.1-stable')."
+        ),
+    )
     ingestion_lock_timeout_seconds: int = Field(
         default=3600,
         ge=60,

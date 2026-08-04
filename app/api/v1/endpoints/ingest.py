@@ -95,13 +95,16 @@ async def process_folder(
             ),
         )
 
+    # Prioriza engine_version, mas mantém compatibilidade com ue_version legado
+    version_override = payload.engine_version or payload.ue_version
+
     background_tasks.add_task(
         process_folder_ingestion,
         folder_path=str(folder),
         content_type=payload.content_type,
         qdrant=qdrant,
         redis=redis,
-        ue_version_override=payload.ue_version,
+        engine_version_override=version_override,
         project_source=payload.project_source,
         sample_mode=payload.sample_mode,
         domain_id=payload.domain_id,

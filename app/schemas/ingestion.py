@@ -18,9 +18,15 @@ from pydantic import BaseModel, Field
 class IngestRequest(BaseModel):
     folder_path: str
     content_type: Literal["source_code", "documentation"]
-    ue_version: str | None = None  # NOTA: nome legado — ver PATCH_NOTES.md (vira "engine_version")
+    ue_version: str | None = None  # DEPRECATED: use engine_version
     project_source: str
     sample_mode: bool = False
+
+    # Campo genérico para versão da engine (Godot ou UE5)
+    engine_version: str | None = Field(
+        default=None,
+        description="Versão da engine (ex: '4.7.1-stable' para Godot, '5.8' para UE5). Se omitido, usa o default do domínio.",
+    )
 
     # NOVO — multi-domain. Se None, process_folder_ingestion() cai para
     # settings.active_domain (ver ingest.py e roadmap de ingestion_service.py

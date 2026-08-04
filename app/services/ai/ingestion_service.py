@@ -883,10 +883,11 @@ async def _process_script_file(
                 source_file=group_source_file,
                 doc_type=doc_type,
                 title=title,
-                ue_version=ue_version,
+                engine_version=ue_version,
                 raw_content=group_text,
                 project_source=project_source,
                 source_file_root=str(path),
+                domain_id="ue5",  # Canal A/C são UE5
             )
         )
 
@@ -952,9 +953,10 @@ async def _process_header_file(
         source_file=str(path),
         doc_type="cpp_header_api",
         title=title,
-        ue_version=ue_version,
+        engine_version=ue_version,
         raw_content=cleaned,
         project_source=project_source,
+        domain_id="ue5",  # Canal A é UE5 C++ headers
     )
 
 
@@ -1003,7 +1005,7 @@ def _sanitize_md_or_rst(content: str, extension: str) -> tuple[str, str]:
 
 
 async def _process_md_or_rst_file(
-    path: Path, raw: str, ue_version: str, project_source: str
+    path: Path, raw: str, engine_version: str, project_source: str
 ) -> list[dict]:
     """
     Processa um arquivo de documentação Markdown (.md) ou RST (.rst) do Godot.
@@ -1018,9 +1020,10 @@ async def _process_md_or_rst_file(
         source_file=str(path),
         doc_type="godot_documentation",
         title=title or path.stem,
-        ue_version=ue_version,
-        raw_content=clean_text,
+        engine_version=engine_version,
+        raw_content=raw,  # CORREÇÃO: conteúdo bruto original, não sanitizado
         project_source=project_source,
+        domain_id="godot_4",  # Godot 4 docs
     )
 
 
@@ -1094,7 +1097,7 @@ def _extract_tscn_scene_name(path: Path) -> str:
 
 
 async def _process_tscn_file(
-    path: Path, raw: str, ue_version: str, project_source: str
+    path: Path, raw: str, engine_version: str, project_source: str
 ) -> list[dict]:
     """
     Processa um arquivo de cena do Godot (.tscn):
@@ -1215,9 +1218,10 @@ async def _process_tscn_file(
         source_file=str(path),
         doc_type="godot_scene",
         title=scene_name,
-        ue_version=ue_version,
+        engine_version=engine_version,
         raw_content=formatted_data,
         project_source=project_source,
+        domain_id="godot_4",  # Godot 4 scene files
     )
 
 
@@ -1387,21 +1391,71 @@ def _extract_ue_version(path_str: str) -> str:
     return match.group(1) if match else settings.ingestion_default_ue_version
 
 
+def _extract_engine_version(path_str: str, domain_id: str = "ue5") -> tuple[str, str]:
+    """
+    Extrai a versão da engine do caminho do arquivo e retorna (versão, nome_do_campo).
+
+    Args:
+        path_str: Caminho do arquivo sendo processado
+        domain_id: Identificador do domínio ("ue5" ou "godot_4")
+
+    Returns:
+        Tuple (version, version_field_name):
+            - Para UE5: ("5.8", "ue_version")
+            - Para Godot 4: ("4.7.1-stable", "godot_version")
+    """
+    if domain_id == "godot_4":
+        # Godot 4 não tem padrão de versão no caminho - usa o default configurado
+        return settings.ingestion_default_godot_version, "godot_version"
+    else:
+        # UE5: tenta extrair do caminho, senão usa default
+        match = _UE_VERSION_RE.search(path_str)
+        version = match.group(1) if match else settings.ingestion_default_ue_version
+        return version, "ue_version"
+
+
 def _build_chunks_with_metadata(
     markdown_text: str,
     source_file: str,
     doc_type: str,
     title: str,
-    ue_version: str,
+    engine_version: str,
     raw_content: str,
     project_source: str,
     source_file_root: str | None = None,
+    domain_id: str = "ue5",
 ) -> list[dict]:
+    """
+    Constrói chunks com metadados enriquecidos para upsert no Qdrant.
+
+    Args:
+        domain_id: Identificador do domínio ("ue5" ou "godot_4").
+            Determina qual campo de versão será usado no payload:
+            - "ue5" → "ue_version"
+            - "godot_4" → "godot_version"
+        engine_version: Versão da engine (UE5 ou Godot).
+        raw_content: Conteúdo bruto completo do arquivo fonte.
+            CORREÇÃO: raw_content é preservado em TODOS os chunks para
+            garantir que o RAG tenha acesso ao contexto completo durante
+            a geração. Anteriormente era NULL para chunk_id > 0, o que
+            comprometia a recuperação.
+    """
     sections = _hierarchical_markdown_chunker(markdown_text, title)
     sections = _enforce_max_chunk_size(sections, settings.ingestion_max_chunk_chars)
 
+    # Determina o nome do campo de versão baseado no domínio
+    version_field = "godot_version" if domain_id == "godot_4" else "ue_version"
+
     chunks: list[dict] = []
     for chunk_id, section_text in enumerate(sections):
+        if not raw_content or not raw_content.strip():
+            log.warning(
+                "raw_content vazio ou ausente para chunk %d de '%s' — "
+                "isso pode comprometer a qualidade do RAG.",
+                chunk_id,
+                source_file,
+            )
+
         chunks.append(
             {
                 "summary_markdown": section_text,
@@ -1416,18 +1470,12 @@ def _build_chunks_with_metadata(
                 "doc_type": doc_type,
                 "title": title,
                 "chunk_id": chunk_id,
-                "ue_version": ue_version,
-                # CORREÇÃO (custo/payload): raw_content é o mesmo conteúdo
-                # integral do arquivo-fonte para TODOS os chunks gerados a
-                # partir dele. Gravá-lo em cada chunk faz uma busca que
-                # recupera N chunks do mesmo arquivo carregar N cópias
-                # idênticas no prompt do rag_service.py (custo de tokens sem
-                # ganho de informação), além de inflar o payload no Qdrant.
-                # Guardamos o valor completo só no chunk_id==0; o
-                # rag_service.py deve, ao montar a "Referência Direta", cair
-                # de volta no raw_content do chunk_id==0 daquele
-                # source_file_root quando o chunk recuperado tiver None.
-                "raw_content": raw_content if chunk_id == 0 else None,
+                version_field: engine_version,
+                # CORREÇÃO (RAG quality): raw_content agora é preservado em TODOS os chunks.
+                # Anteriormente era NULL para chunk_id > 0, o que quebrava a recuperação
+                # de contexto completo durante a geração. O RAG precisa do conteúdo bruto
+                # para fornecer referências precisas ao LLM.
+                "raw_content": raw_content,
                 # Rótulo de proveniência — NUNCA entra no texto embedado.
                 # Permite segmentar via query_filter no Qdrant no futuro
                 # (ex: "só Engine", "só samples", "excluir Lyra") sem
@@ -2101,7 +2149,7 @@ async def process_folder_ingestion(
     content_type: str,
     qdrant: AsyncQdrantClient,
     redis: Redis,
-    ue_version_override: str | None = None,
+    engine_version_override: str | None = None,
     project_source: str = "UE5_Engine",
     sample_mode: bool = False,
     domain_id: str | None = None,
@@ -2196,7 +2244,7 @@ async def process_folder_ingestion(
             qdrant=qdrant,
             redis=redis,
             collection_name=collection_name,
-            ue_version_override=ue_version_override,
+            engine_version_override=engine_version_override,
             project_source=project_source,
             sample_mode=sample_mode,
             resolved_domain_id=resolved_domain_id,
@@ -2226,7 +2274,7 @@ async def _run_ingestion(
     qdrant: AsyncQdrantClient,
     redis: Redis,
     collection_name: str,
-    ue_version_override: str | None = None,
+    engine_version_override: str | None = None,
     project_source: str = "UE5_Engine",
     sample_mode: bool = False,
     resolved_domain_id: str = "ue5",
@@ -2277,7 +2325,11 @@ async def _run_ingestion(
 
     manifest_cache = await _load_manifest_cache(redis, manifest_key)
     failures_cache = await _load_failures_cache(redis, failures_key)
-    ue_version = ue_version_override or _extract_ue_version(str(root))
+
+    # Extrai versão da engine baseada no domínio ativo
+    engine_version, _ = _extract_engine_version(str(root), resolved_domain_id)
+    if engine_version_override:
+        engine_version = engine_version_override
 
     # CORREÇÃO (Canal C + Canal D): em sample_mode, também descobrimos .cpp
     # (implementação C++ real, Canal C) e .bp.json (Blueprints exportados
@@ -2411,17 +2463,17 @@ async def _run_ingestion(
                 if file_path.suffix == ".gd":
                     # GDScript
                     chunks = await _process_script_file(
-                        file_path, raw_text, ue_version, project_source
+                        file_path, raw_text, engine_version, project_source
                     )
                 elif file_path.suffix == ".cs":
                     # C# para Godot
                     chunks = await _process_script_file(
-                        file_path, raw_text, ue_version, project_source
+                        file_path, raw_text, engine_version, project_source
                     )
                 elif file_path.suffix == ".tscn":
                     # Cenas do Godot
                     chunks = await _process_tscn_file(
-                        file_path, raw_text, ue_version, project_source
+                        file_path, raw_text, engine_version, project_source
                     )
                 # UE5 - Blueprints (verificado ANTES de .cpp/.h porque
                 # Path.suffix não reconhece extensão dupla ".bp.json")
@@ -2430,17 +2482,17 @@ async def _run_ingestion(
                 # então tratamos como documentação estruturada.
                 elif file_path.name.endswith(".bp.json"):
                     chunks = await _process_md_or_rst_file(
-                        file_path, raw_text, ue_version, project_source
+                        file_path, raw_text, engine_version, project_source
                     )
                 elif file_path.suffix == ".cpp":
                     # Canal C — implementação UE5
                     chunks = await _process_script_file(
-                        file_path, raw_text, ue_version, project_source
+                        file_path, raw_text, engine_version, project_source
                     )
                 else:
                     # Headers UE5 (.h)
                     chunks = await _process_header_file(
-                        file_path, raw_text, ue_version, project_source,
+                        file_path, raw_text, engine_version, project_source,
                         sample_mode=sample_mode,
                     )
             else:
@@ -2448,12 +2500,12 @@ async def _run_ingestion(
                 if file_path.suffix in (".md", ".rst"):
                     # Godot docs
                     chunks = await _process_md_or_rst_file(
-                        file_path, raw_text, ue_version, project_source
+                        file_path, raw_text, engine_version, project_source
                     )
                 else:
                     # UE5 .udn
                     chunks = await _process_md_or_rst_file(
-                        file_path, raw_text, ue_version, project_source
+                        file_path, raw_text, engine_version, project_source
                     )
 
             if not chunks:
