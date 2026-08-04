@@ -390,6 +390,25 @@ class Settings(BaseSettings):
             "transitório (HTTP 429/500/502/503/504 ou timeout)."
         ),
     )
+    qdrant_upsert_max_retries: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description=(
+            "Número máximo de tentativas para upsert no Qdrant em caso de "
+            "erros de conexão/transitórios (httpx.ReadError, httpcore.ReadError, "
+            "ResponseHandlingException). Cada tentativa usa backoff exponencial."
+        ),
+    )
+    qdrant_upsert_wait: bool = Field(
+        default=True,
+        description=(
+            "Se True, aguarda a confirmação de indexação em disco do Qdrant "
+            "para cada lote (wait=True no upsert). Se False, envia de forma "
+            "assíncrona sem esperar a confirmação, reduzindo latência mas "
+            "com menor garantia de consistência imediata."
+        ),
+    )
 
 
 @lru_cache(maxsize=1)

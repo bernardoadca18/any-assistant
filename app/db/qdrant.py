@@ -43,7 +43,7 @@ async def init_qdrant() -> AsyncQdrantClient:
     client = AsyncQdrantClient(
         host=settings.qdrant_host,
         port=settings.qdrant_port,
-        timeout=10.0,
+        timeout=60.0,  # Aumentado para evitar timeout em payloads pesados (upsert de arquivos grandes)
     )
 
     # Verifica conectividade

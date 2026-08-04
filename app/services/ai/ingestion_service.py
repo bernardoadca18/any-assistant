@@ -94,9 +94,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+import httpcore
+import httpx
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qdrant_models
-from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client.http.exceptions import UnexpectedResponse, ResponseHandlingException
 from redis.asyncio import Redis
 from redis.asyncio.lock import Lock
 
@@ -1988,18 +1990,61 @@ async def _flush_batch(
 
     if not points:
         log.warning("Lote descartado: todos os %d embeddings falharam.", len(batch))
-        return {}
+        return {}, embedding_failures
 
-    try:
-        await qdrant.upsert(collection_name=collection_name, points=points, wait=True)
-    except Exception as exc:
-        log.error(
-            "Falha no upsert do lote (%d pontos) na coleção '%s': %s",
-            len(points),
-            collection_name,
-            exc,
-        )
-        return {}
+    # Retry com backoff exponencial para erros de conexão/transitórios
+    max_retries = settings.qdrant_upsert_max_retries
+    wait_enabled = settings.qdrant_upsert_wait
+    last_exc: Exception | None = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            await qdrant.upsert(
+                collection_name=collection_name,
+                points=points,
+                wait=wait_enabled,
+            )
+            break  # Sucesso — sai do loop de retry
+        except (
+            httpx.ReadError,
+            httpcore.ReadError,
+            ResponseHandlingException,
+            UnexpectedResponse,
+        ) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                backoff = 2 ** attempt  # 2, 4, 8 segundos...
+                log.warning(
+                    "Tentativa %d/%d de upsert falhou (%s) — retry em %ds | "
+                    "coleção=%s pontos=%d",
+                    attempt,
+                    max_retries,
+                    type(exc).__name__,
+                    backoff,
+                    collection_name,
+                    len(points),
+                )
+                await asyncio.sleep(backoff)
+            else:
+                log.error(
+                    "Todas as %d tentativas de upsert falharam | coleção=%s pontos=%d: %s",
+                    max_retries,
+                    collection_name,
+                    len(points),
+                    exc,
+                    exc_info=True,
+                )
+                return {}, embedding_failures
+        except Exception as exc:
+            # Erros não recuperáveis — loga e falha imediatamente
+            log.error(
+                "Falha no upsert do lote (%d pontos) na coleção '%s': %s",
+                len(points),
+                collection_name,
+                exc,
+                exc_info=True,
+            )
+            return {}, embedding_failures
 
     if embedding_failures > 0:
         log.warning(
