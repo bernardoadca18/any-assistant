@@ -94,7 +94,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 1G
 
   # ---------------------------------------------------------------------------
   # QDRANT HEALTHCHECK — container sidecar usando alpine (tem wget nativo)
