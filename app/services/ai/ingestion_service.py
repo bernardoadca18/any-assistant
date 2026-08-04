@@ -103,12 +103,82 @@ from redis.asyncio import Redis
 from redis.asyncio.lock import Lock
 
 from app.core.config import settings
+from app.core.domains.registry import domain_registry
 from app.db.redis import ingestion_failures_key, ingestion_lock_key, ingestion_manifest_key
 from app.services.ai.embedding_service import embed_text
+from app.services.ai.ingestion.base_strategy import ChunkCandidate
+from app.services.ai.ingestion.godot4_strategy import Godot4IngestionStrategy
 from app.services.ai.rag_service import call_litellm
 from app.services.ai.sparse_vector_service import SPARSE_VECTOR_NAME, build_sparse_vector
 
 log = logging.getLogger(__name__)
+
+# =============================================================================
+# CORREÇÃO (pipeline duplo — auditoria RAG): unificação com a strategy nova
+# =============================================================================
+# app/services/ai/ingestion/godot4_strategy.py + base_strategy.py implementam
+# um IngestionStrategy completo e domain-aware para Godot 4 (doc_types
+# corretos por extensão, canal de Class Reference via XML, sanitização e
+# extração de metadados delegadas a GODOT4_PROFILE) — mas até esta correção
+# ele nunca era importado ou chamado por este módulo. O pipeline "real" era
+# um dispatch legado hardcoded por extensão, herdado do canal original de
+# UE5 e parcialmente adaptado para Godot com bugs (ver Correções 1-3 desta
+# auditoria: domain_id/doc_type hardcoded e leitura de payload assimétrica).
+#
+# A partir daqui, `domain_id == "godot_4"` é roteado INTEIRAMENTE para
+# Godot4IngestionStrategy — ela decide o doc_type, sanitização e parsing por
+# extensão (inclusive .xml/.tres/.h/.gen.cpp, que o pipeline legado nunca
+# descobria). O dispatch legado abaixo (_process_script_file/_process_
+# tscn_file/_process_md_or_rst_file) passa a servir EXCLUSIVAMENTE UE5 —
+# elimina a divergência de nomenclatura de doc_type e a necessidade de
+# propagar domain_id manualmente para o canal Godot (a strategy já é
+# domain-locked por construção).
+_GODOT4_STRATEGY = Godot4IngestionStrategy()
+
+
+def _chunk_candidates_to_payload_dicts(
+    candidates: list[ChunkCandidate],
+    project_source: str,
+) -> list[dict]:
+    """
+    Converte a saída de um IngestionStrategy (ChunkCandidate — ver
+    base_strategy.py) para o dict de payload que `_flush_batch` e o resto
+    do pipeline genérico de embedding/checkpoint/upsert já esperam. Este é
+    o ponto de integração entre a strategy nova (parsing por domínio) e a
+    orquestração genérica existente (batching, retry, backoff, manifesto de
+    checkpoint no Redis) — exatamente o ponto que o docstring de
+    base_strategy.py descrevia como pendente.
+
+    chunk_id é atribuído sequencialmente por arquivo (0..N-1), na ordem em
+    que a strategy produziu os candidatos. Diferente do pipeline legado
+    (que usava sufixo sintético "#groupN" em source_file para os Canais A/C
+    de UE5), aqui todos os candidatos de um mesmo arquivo compartilham o
+    MESMO `source_file` — a combinação (source_file, chunk_id) já garante
+    um point_id determinístico único (ver uuid5 em _flush_batch), sem
+    precisar de sufixo.
+    """
+    result: list[dict] = []
+    for chunk_id, candidate in enumerate(candidates):
+        result.append(
+            {
+                "summary_markdown": candidate.summary_markdown,
+                "source_file": candidate.source_file,
+                "source_file_root": candidate.source_file,
+                "doc_type": candidate.doc_type,
+                "title": candidate.title,
+                "chunk_id": chunk_id,
+                # Strategy é domain-locked para "godot_4" — a chave de
+                # versão correta nunca precisa ser decidida em runtime aqui.
+                "godot_version": candidate.engine_version,
+                "raw_content": candidate.raw_content,
+                "project_source": project_source,
+                # Metadados estruturais específicos do domínio (class_name,
+                # signals, nodes, tutoriais oficiais etc.) — nunca embedados,
+                # disponíveis como payload extra para filtros futuros.
+                "extra_metadata": candidate.extra_metadata,
+            }
+        )
+    return result
 
 
 # =============================================================================
@@ -600,7 +670,10 @@ def _split_gdscript_into_functions(content: str) -> list[tuple[str, str]]:
     if matches:
         leading = content[: matches[0].start()].strip()
         if leading:
-            blocks.insert(0, ("código de topo do arquivo", leading))
+            # CORREÇÃO: título contextual em vez de string fixa genérica
+            # Extrai o nome do arquivo do contexto (assumindo que será passado via closure ou contexto)
+            # Por ora, usamos um placeholder que será substituído pelo chamador
+            blocks.insert(0, ("__TOP_LEVEL__", leading))
 
     return blocks
 
@@ -651,7 +724,9 @@ def _split_csharp_into_functions(content: str) -> list[tuple[str, str]]:
     if matches:
         leading = content[: matches[0].start()].strip()
         if leading:
-            blocks.insert(0, ("código de topo do arquivo", leading))
+            # CORREÇÃO: título contextual em vez de string fixa genérica
+            # Placeholder que será substituído pelo chamador com contexto do arquivo
+            blocks.insert(0, ("__TOP_LEVEL__", leading))
 
     return blocks
 
@@ -804,7 +879,8 @@ async def _load_header_context(cpp_path: Path) -> str:
 
 
 async def _process_script_file(
-    path: Path, raw: str, ue_version: str, project_source: str
+    path: Path, raw: str, engine_version: str, project_source: str,
+    domain_id: str = "ue5",
 ) -> list[dict]:
     """
     Processa um arquivo GDScript (.gd) ou C# (.cs) em modo sample:
@@ -849,7 +925,14 @@ async def _process_script_file(
             )
             group_text = group_text[:max_chars]
 
-        title = names[0] if names else path.stem
+        # CORREÇÃO: substitui o placeholder "__TOP_LEVEL__" por título contextual
+        # baseado no nome do arquivo e diretório pai
+        if names and names[0] == "__TOP_LEVEL__":
+            # Fallback contextual: nome do arquivo + escopo de nível superior
+            parent_dir = path.parent.name if path.parent.name else "root"
+            title = f"{path.stem} - Top Level Scope"
+        else:
+            title = names[0] if names else path.stem
 
         user_message = (
             f"Script file: {path.name}\n"
@@ -885,11 +968,17 @@ async def _process_script_file(
                 source_file=group_source_file,
                 doc_type=doc_type,
                 title=title,
-                engine_version=ue_version,
+                engine_version=engine_version,
                 raw_content=group_text,
                 project_source=project_source,
                 source_file_root=str(path),
-                domain_id="ue5",  # Canal A/C são UE5
+                domain_id=domain_id,
+                # CORREÇÃO (divergência ue_version/godot_version): domain_id
+                # agora vem do chamador em vez de hardcoded "ue5" — esta
+                # função processa .gd/.cs tanto de UE5 (.cpp reaproveitado
+                # no Canal C) quanto de Godot 4, e cada domínio precisa da
+                # chave de versão correta no payload (ue_version vs
+                # godot_version). Ver relatório de auditoria RAG.
             )
         )
 
@@ -897,7 +986,8 @@ async def _process_script_file(
 
 
 async def _process_header_file(
-    path: Path, raw: str, ue_version: str, project_source: str, sample_mode: bool = False
+    path: Path, raw: str, engine_version: str, project_source: str, sample_mode: bool = False,
+    domain_id: str = "ue5",
 ) -> list[dict]:
     # CORREÇÃO (ponto cego de indexação — ver _STRATEGIC_ENGINE_MODULE_MARKERS):
     # em modo Engine, headers de módulos estratégicos de gameplay moderno
@@ -955,10 +1045,12 @@ async def _process_header_file(
         source_file=str(path),
         doc_type="cpp_header_api",
         title=title,
-        engine_version=ue_version,
+        engine_version=engine_version,
         raw_content=cleaned,
         project_source=project_source,
-        domain_id="ue5",  # Canal A é UE5 C++ headers
+        domain_id=domain_id,
+        # CORREÇÃO: domain_id agora vem do chamador (ver _process_script_file
+        # acima para o mesmo padrão de correção).
     )
 
 
@@ -1007,10 +1099,23 @@ def _sanitize_md_or_rst(content: str, extension: str) -> tuple[str, str]:
 
 
 async def _process_md_or_rst_file(
-    path: Path, raw: str, engine_version: str, project_source: str
+    path: Path, raw: str, engine_version: str, project_source: str,
+    domain_id: str = "godot_4", doc_type: str = "godot_documentation",
 ) -> list[dict]:
     """
-    Processa um arquivo de documentação Markdown (.md) ou RST (.rst) do Godot.
+    Processa um arquivo de documentação Markdown (.md) ou RST (.rst).
+
+    CORREÇÃO (divergência de payload): esta função é reaproveitada por TRÊS
+    canais diferentes de DOIS domínios — docs oficiais do Godot (.md/.rst),
+    docs oficiais da UE5 (.udn) e Blueprints exportados como JSON (.bp.json,
+    que tecnicamente não é Markdown/RST, mas usa este canal por não precisar
+    de chamada de LLM). Antes, `doc_type` e `domain_id` eram hardcoded para
+    os valores do Godot, então .udn e .bp.json (ambos UE5) eram gravados no
+    Qdrant como se fossem documentação Godot — chave de versão errada
+    (godot_version em vez de ue_version) E doc_type enganoso. Os defaults
+    abaixo preservam o comportamento atual para o canal Godot (chamador não
+    precisa mudar nada); os outros dois call sites em `_run_ingestion`
+    passam os valores corretos explicitamente.
     """
     clean_text, title = _sanitize_md_or_rst(raw, path.suffix.lower())
     if not clean_text:
@@ -1020,12 +1125,12 @@ async def _process_md_or_rst_file(
     return _build_chunks_with_metadata(
         markdown_text=clean_text,
         source_file=str(path),
-        doc_type="godot_documentation",
+        doc_type=doc_type,
         title=title or path.stem,
         engine_version=engine_version,
         raw_content=raw,  # CORREÇÃO: conteúdo bruto original, não sanitizado
         project_source=project_source,
-        domain_id="godot_4",  # Godot 4 docs
+        domain_id=domain_id,
     )
 
 
@@ -1919,9 +2024,20 @@ async def _flush_batch(
     qdrant: AsyncQdrantClient,
     collection_name: str,
     batch: list[dict],
+    domain_id: str = "ue5",
 ) -> tuple[dict[str, int], int]:
     """
     Processa um lote de chunks, gera embeddings e insere no Qdrant.
+
+    CORREÇÃO (canal esparso sem regex por domínio): `build_sparse_vector`
+    era chamado sem `camel_split_regex`, caindo sempre no fallback legado
+    (heurística de prefixo UE5: A/U/F/E — ver sparse_vector_service.py).
+    Isso silenciosamente tokenizava identificadores Godot (@export,
+    snake_case, CharacterBody3D) com a regra errada, degradando o recall
+    do canal esparso/BM25 para todo o domínio Godot desde a ingestão — o
+    lado da busca (rag_service._hybrid_search) já resolvia a regex certa
+    por domínio, então a assimetria só existia neste lado. `domain_id`
+    resolve `BaseDomainProfile.sparse_camel_split_regex` do mesmo jeito.
 
     Returns:
         tuple[dict[str, int], int]: (per_file_counts, embedding_failures)
@@ -1930,6 +2046,8 @@ async def _flush_batch(
     """
     if not batch:
         return {}, 0
+
+    camel_split_regex = domain_registry.get(domain_id).sparse_camel_split_regex
 
     semaphore = asyncio.Semaphore(settings.ingestion_embedding_concurrency)
     embedding_failures = 0
@@ -2123,6 +2241,7 @@ async def backfill_sparse_vectors(
     qdrant: AsyncQdrantClient,
     collection_name: str | None = None,
     batch_size: int = 200,
+    domain_id: str | None = None,
 ) -> int:
     """
     Percorre TODOS os pontos já existentes na coleção (via `scroll`) e
@@ -2137,12 +2256,25 @@ async def backfill_sparse_vectors(
             200 é um valor conservador — build_sparse_vector é puramente
             local (sem I/O), então o gargalo real é a rede para
             scroll/update_vectors, não a geração do vetor em si.
+        domain_id: Domínio dono da coleção (resolve a regex de tokenização
+            correta via `BaseDomainProfile.sparse_camel_split_regex` — ver
+            CORREÇÃO abaixo). Se None, usa `settings.active_domain`. Cada
+            coleção pertence a exatamente um domínio (ver
+            `settings.qdrant_collection_for`), então isso é seguro mesmo
+            quando `collection_name` é passado explicitamente.
+
+    CORREÇÃO (mesma classe de bug de _flush_batch): antes chamava
+    `build_sparse_vector` sem `camel_split_regex`, caindo sempre no
+    fallback legado (heurística de prefixo UE5). Pontos Godot legados
+    passavam pelo backfill com a tokenização errada.
 
     Returns:
         Número total de pontos efetivamente atualizados com o vetor
         esparso (pontos já migrados anteriormente não contam).
     """
-    resolved_collection = collection_name or settings.qdrant_collection_for(settings.active_domain)
+    resolved_domain_id = domain_id or settings.active_domain
+    resolved_collection = collection_name or settings.qdrant_collection_for(resolved_domain_id)
+    camel_split_regex = domain_registry.get(resolved_domain_id).sparse_camel_split_regex
     updated_count = 0
     scanned_count = 0
     next_offset = None
@@ -2182,7 +2314,7 @@ async def backfill_sparse_vectors(
                     payload.get("summary_markdown") or "",
                 )
             )
-            sparse_vector = build_sparse_vector(sparse_text)
+            sparse_vector = build_sparse_vector(sparse_text, camel_split_regex=camel_split_regex)
             updates.append(
                 qdrant_models.PointVectors(
                     id=point.id,
@@ -2430,12 +2562,16 @@ async def _run_ingestion(
     # Descoberta de arquivos por tipo de conteúdo e domínio
     # ==========================================================================
     # UE5: .h (headers), .cpp (implementação), .udn (docs), .bp.json (Blueprints)
-    # Godot 4: .gd (GDScript), .cs (C#), .tscn (cenas), .md/.rst (docs)
+    # Godot 4: .gd/.cs/.tscn/.tres/.h/.cpp (código-fonte, via Godot4IngestionStrategy)
+    #          .rst/.xml/.md (documentação — .xml é a Class Reference oficial)
     strategic_cpp_count = 0
     if content_type == "source_code":
         if resolved_domain_id == "godot_4":
-            # Godot 4: scripts GDScript, C# e cenas
-            extensions = (".gd", ".cs", ".tscn")
+            # CORREÇÃO (pipeline duplo): antes só descobria .gd/.cs/.tscn —
+            # .tres (recursos) e .h/.cpp (engine C++ nativo do Godot, Canal
+            # 3 da strategy) nunca eram sequer encontrados. Godot4IngestionStrategy
+            # decide a relevância/parsing de cada um internamente.
+            extensions = (".gd", ".cs", ".tscn", ".tres", ".h", ".cpp")
             files = await _discover_files(root, extensions)
         elif sample_mode:
             # UE5 sample mode: headers, implementation e Blueprints
@@ -2453,7 +2589,10 @@ async def _run_ingestion(
     else:
         # Extensões de documentação por domínio
         if resolved_domain_id == "godot_4":
-            extensions = (".rst", ".md")
+            # CORREÇÃO (pipeline duplo): .xml (Class Reference oficial) nunca
+            # era descoberto — o parser dedicado (godot_class_xml_parser.py)
+            # existia mas estava completamente desconectado da ingestão real.
+            extensions = (".rst", ".xml", ".md")
         else:
             # UE5 e outros domínios usam .udn (documentação oficial da Epic)
             extensions = (".udn",)
@@ -2546,55 +2685,48 @@ async def _run_ingestion(
         try:
             raw_text = raw_bytes.decode("utf-8", errors="ignore")
 
-            if content_type == "source_code":
-                # Godot 4 scripts e cenas
-                if file_path.suffix == ".gd":
-                    # GDScript
-                    chunks = await _process_script_file(
-                        file_path, raw_text, engine_version, project_source
-                    )
-                elif file_path.suffix == ".cs":
-                    # C# para Godot
-                    chunks = await _process_script_file(
-                        file_path, raw_text, engine_version, project_source
-                    )
-                elif file_path.suffix == ".tscn":
-                    # Cenas do Godot
-                    chunks = await _process_tscn_file(
-                        file_path, raw_text, engine_version, project_source
-                    )
+            # CORREÇÃO (pipeline duplo — auditoria RAG, Correção 4): Godot 4
+            # agora é roteado inteiramente para Godot4IngestionStrategy, que
+            # decide doc_type/parsing por extensão internamente (inclusive
+            # .xml/.tres/.h/.gen.cpp, que o dispatch legado abaixo nunca
+            # cobriu para este domínio). O dispatch legado por extensão
+            # (content_type source_code/documentation) passa a servir
+            # exclusivamente UE5.
+            if resolved_domain_id == "godot_4":
+                candidates = await _GODOT4_STRATEGY.process_file(
+                    file_path, engine_version_override=engine_version,
+                )
+                chunks = _chunk_candidates_to_payload_dicts(candidates, project_source)
+            elif content_type == "source_code":
                 # UE5 - Blueprints (verificado ANTES de .cpp/.h porque
                 # Path.suffix não reconhece extensão dupla ".bp.json")
                 # NOTA: Blueprints são processados como JSON estruturado.
                 # O exportador (BP_GraphExporter.py) já lineariza o grafo,
                 # então tratamos como documentação estruturada.
-                elif file_path.name.endswith(".bp.json"):
+                if file_path.name.endswith(".bp.json"):
                     chunks = await _process_md_or_rst_file(
-                        file_path, raw_text, engine_version, project_source
+                        file_path, raw_text, engine_version, project_source,
+                        domain_id="ue5", doc_type="ue5_blueprint_graph",
                     )
                 elif file_path.suffix == ".cpp":
                     # Canal C — implementação UE5
                     chunks = await _process_script_file(
-                        file_path, raw_text, engine_version, project_source
+                        file_path, raw_text, engine_version, project_source,
+                        domain_id="ue5",
                     )
                 else:
                     # Headers UE5 (.h)
                     chunks = await _process_header_file(
                         file_path, raw_text, engine_version, project_source,
                         sample_mode=sample_mode,
+                        domain_id="ue5",
                     )
             else:
-                # Documentação
-                if file_path.suffix in (".md", ".rst"):
-                    # Godot docs
-                    chunks = await _process_md_or_rst_file(
-                        file_path, raw_text, engine_version, project_source
-                    )
-                else:
-                    # UE5 .udn
-                    chunks = await _process_md_or_rst_file(
-                        file_path, raw_text, engine_version, project_source
-                    )
+                # UE5 .udn
+                chunks = await _process_md_or_rst_file(
+                    file_path, raw_text, engine_version, project_source,
+                    domain_id="ue5", doc_type="ue5_documentation",
+                )
 
             if not chunks:
                 stats["skipped"] += 1
@@ -2639,7 +2771,9 @@ async def _run_ingestion(
             # Flush condicionado ao buffer > batch_size (atomicidade do commit)
             while len(pending) >= batch_size:
                 batch, pending = pending[:batch_size], pending[batch_size:]
-                per_file_counts, embed_fails = await _flush_batch(qdrant, collection_name, batch)
+                per_file_counts, embed_fails = await _flush_batch(
+                    qdrant, collection_name, batch, domain_id=resolved_domain_id,
+                )
                 stats["chunks_indexed"] += sum(per_file_counts.values())
                 stats["embedding_failures"] += embed_fails
                 await _commit_confirmed_files(
@@ -2661,7 +2795,9 @@ async def _run_ingestion(
             len(pending),
             len(set(c["source_file_root"] for c in pending)),
         )
-        per_file_counts, embed_fails = await _flush_batch(qdrant, collection_name, pending)
+        per_file_counts, embed_fails = await _flush_batch(
+            qdrant, collection_name, pending, domain_id=resolved_domain_id,
+        )
         stats["chunks_indexed"] += sum(per_file_counts.values())
         stats["embedding_failures"] += embed_fails
         await _commit_confirmed_files(

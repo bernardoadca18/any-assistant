@@ -249,3 +249,4 @@ services:
 
       - /home/bernardo/godot_sources/godot_engine_4:/data/godot_engine_root:ro
       - /home/bernardo/godot_sources/godot_docs_4:/data/godot_docs_root:ro
+      - /home/bernardo/godot_sources/godot_demo_projects:/data/sample_projects:ro

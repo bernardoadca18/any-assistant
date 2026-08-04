@@ -87,7 +87,10 @@ _GODOT_CPP_CLASS_RE = re.compile(
 )
 _GODOT_CPP_GDCLASS_RE = re.compile(r"GDCLASS\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)")
 _GODOT_CPP_GDVIRTUAL_RE = re.compile(r"GDVIRTUAL[0-9]?[A-Z]*\s*\(\s*(\w+)")
-_GODOT_CPP_BIND_METHOD_RE = re.compile(r"ClassDB::bind_method\s*\(\s*(?:D_METHOD\s*\(\s*\"([^\"]+)\"")
+_GODOT_CPP_BIND_METHOD_RE = re.compile(
+    r"ClassDB::bind_method\s*\(\s*"
+    r"(?:D_METHOD\s*\(\s*\"([^\"]+)\"[^)]*\)\s*,|\"([^\"]+)\"\s*,)"
+)
 _GODOT_CPP_BIND_ENUM_RE = re.compile(r"BIND_ENUM_CONSTANT\s*\(\s*(\w+)\s*\)")
 _GODOT_CPP_BIND_BITFIELD_RE = re.compile(r"BIND_BITFIELD_FLAG\s*\(\s*(\w+)\s*\)")
 _GODOT_CPP_PROPERTY_RE = re.compile(

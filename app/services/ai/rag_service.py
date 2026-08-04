@@ -486,6 +486,27 @@ def _build_project_source_filter(
     )
 
 
+def _engine_version_payload_key(domain_id: str) -> str:
+    """
+    Resolve qual chave do payload do Qdrant carrega a versão da engine para
+    o domínio ativo.
+
+    CORREÇÃO (CRÍTICO — leitura hardcoded de 'ue_version'): os dois pontos
+    que constroem RetrievedChunk a partir do payload (ver
+    `retrieve_chunks_for_query` e `retrieve_chunks`) liam sempre
+    `payload.get("ue_version", "")`, independentemente do domínio. Chunks
+    Godot corretamente gravados com a chave "godot_version" (ver
+    ingestion_service._build_chunks_with_metadata) voltavam SEMPRE com
+    versão vazia — mesmo depois de corrigida a ingestão, o retrieval
+    continuaria não expondo essa informação. Espelha exatamente a mesma
+    regra usada na escrita, para as duas pontas do pipeline nunca
+    divergirem de novo: se um domínio novo for registrado no futuro com uma
+    convenção de campo de versão diferente, ambos os lados precisam ser
+    atualizados juntos.
+    """
+    return "godot_version" if domain_id == "godot_4" else "ue_version"
+
+
 # ---------------------------------------------------------------------------
 # FASE 2.1 — Busca Expandida no Qdrant
 # ---------------------------------------------------------------------------
@@ -660,6 +681,8 @@ async def retrieve_chunks_for_query(
         log.error("Falha na busca vetorial (Qdrant): %s", exc)
         return []
 
+    version_field = _engine_version_payload_key(domain_id)
+
     chunks: list[RetrievedChunk] = []
     for hit in results:
         payload = hit.payload or {}
@@ -672,7 +695,10 @@ async def retrieve_chunks_for_query(
                     description=payload.get("description", ""),
                     source_file=payload.get("source_file", ""),
                     chunk_id=payload.get("chunk_id", 0),
-                    ue_version=payload.get("ue_version", ""),
+                    # CORREÇÃO: lia sempre "ue_version" — chunks Godot
+                    # (gravados com "godot_version") sempre voltavam vazios.
+                    # Ver _engine_version_payload_key.
+                    ue_version=payload.get(version_field, ""),
                     doc_type=payload.get("doc_type", ""),
                     # CORREÇÃO (Correção 1): project_source agora é extraído
                     # do payload — antes era descartado silenciosamente, e o
@@ -971,6 +997,8 @@ async def retrieve_chunks(
         log.error("Erro ao buscar no Qdrant (fallback naive): %s", exc)
         raise RuntimeError(f"Falha na busca vetorial: {exc}") from exc
 
+    version_field = _engine_version_payload_key(domain_id)
+
     chunks: list[RetrievedChunk] = []
     for hit in results:
         payload = hit.payload or {}
@@ -983,7 +1011,9 @@ async def retrieve_chunks(
                     description=payload.get("description", ""),
                     source_file=payload.get("source_file", ""),
                     chunk_id=payload.get("chunk_id", 0),
-                    ue_version=payload.get("ue_version", ""),
+                    # CORREÇÃO: mesma correção do caminho híbrido acima —
+                    # ver _engine_version_payload_key.
+                    ue_version=payload.get(version_field, ""),
                     doc_type=payload.get("doc_type", ""),
                     # CORREÇÃO (Correção 1): project_source agora é extraído
                     # do payload também no caminho naive.
@@ -2021,4 +2051,3 @@ async def run_rag_pipeline_stream(
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
     }
- 
