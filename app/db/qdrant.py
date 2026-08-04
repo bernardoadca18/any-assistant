@@ -43,7 +43,9 @@ async def init_qdrant() -> AsyncQdrantClient:
     client = AsyncQdrantClient(
         host=settings.qdrant_host,
         port=settings.qdrant_port,
-        timeout=60.0,  # Aumentado para evitar timeout em payloads pesados (upsert de arquivos grandes)
+        grpc_port=settings.qdrant_grpc_port,  # 6334
+        prefer_grpc=True,
+        timeout=60.0,
     )
 
     # Verifica conectividade
@@ -55,9 +57,7 @@ async def init_qdrant() -> AsyncQdrantClient:
             f"Não foi possível conectar ao Qdrant em {settings.qdrant_url}: {exc}"
         ) from exc
 
-    # Valida que a coleção existe e tem a dimensão correta
     await _validate_collection(client)
-
     _qdrant_client = client
     return client
 
