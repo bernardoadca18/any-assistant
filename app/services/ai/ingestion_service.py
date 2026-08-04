@@ -1917,11 +1917,20 @@ async def _flush_batch(
     qdrant: AsyncQdrantClient,
     collection_name: str,
     batch: list[dict],
-) -> dict[str, int]:
+) -> tuple[dict[str, int], int]:
+    """
+    Processa um lote de chunks, gera embeddings e insere no Qdrant.
+
+    Returns:
+        tuple[dict[str, int], int]: (per_file_counts, embedding_failures)
+            - per_file_counts: mapeia source_file_root -> contagem de chunks inseridos
+            - embedding_failures: número de chunks que falharam no embedding
+    """
     if not batch:
-        return {}
+        return {}, 0
 
     semaphore = asyncio.Semaphore(settings.ingestion_embedding_concurrency)
+    embedding_failures = 0
 
     async def _embed_one(chunk: dict) -> tuple[dict, list[float] | None]:
         async with semaphore:
@@ -1942,6 +1951,7 @@ async def _flush_batch(
     points: list[qdrant_models.PointStruct] = []
     for chunk, vector in results:
         if vector is None:
+            embedding_failures += 1
             continue
         point_id = str(
             uuid.uuid5(uuid.NAMESPACE_URL, f"{chunk['source_file']}::{chunk['chunk_id']}")
@@ -1991,11 +2001,19 @@ async def _flush_batch(
         )
         return {}
 
-    log.info(
-        "Batch inserido com sucesso | %d pontos | coleção=%s",
-        len(points),
-        collection_name,
-    )
+    if embedding_failures > 0:
+        log.warning(
+            "Batch inserido com falhas de embedding | %d pontos OK | %d falhas | coleção=%s",
+            len(points),
+            embedding_failures,
+            collection_name,
+        )
+    else:
+        log.info(
+            "Batch inserido com sucesso | %d pontos | coleção=%s",
+            len(points),
+            collection_name,
+        )
 
     # CORREÇÃO (Canal C / .cpp): agrupamos por source_file_root, não por
     # source_file. Chunks de .cpp têm source_file sintético por grupo
@@ -2012,7 +2030,7 @@ async def _flush_batch(
         source_file_root = point.payload["source_file_root"]
         per_file_counts[source_file_root] = per_file_counts.get(source_file_root, 0) + 1
 
-    return per_file_counts
+    return per_file_counts, embedding_failures
 
 
 # =============================================================================
@@ -2394,6 +2412,7 @@ async def _run_ingestion(
         "errors": 0,
         "quarantined": 0,
         "chunks_indexed": 0,
+        "embedding_failures": 0,
         "partial_failures": 0,
     }
 
@@ -2551,8 +2570,9 @@ async def _run_ingestion(
             # Flush condicionado ao buffer > batch_size (atomicidade do commit)
             while len(pending) >= batch_size:
                 batch, pending = pending[:batch_size], pending[batch_size:]
-                per_file_counts = await _flush_batch(qdrant, collection_name, batch)
+                per_file_counts, embed_fails = await _flush_batch(qdrant, collection_name, batch)
                 stats["chunks_indexed"] += sum(per_file_counts.values())
+                stats["embedding_failures"] += embed_fails
                 await _commit_confirmed_files(
                     redis, qdrant, collection_name, manifest_key, tracking, per_file_counts,
                     failures_key=failures_key, failures_cache=failures_cache,
@@ -2565,16 +2585,26 @@ async def _run_ingestion(
             log.error("Erro processando '%s' — ignorando: %s", file_path, exc, exc_info=True)
             continue
 
-    # Flush de resíduos finais
+    # Flush de resíduos finais — garante que TODO chunk pendente seja processado
     if pending:
-        per_file_counts = await _flush_batch(qdrant, collection_name, pending)
+        log.info(
+            "Flush final de resíduos | chunks_pendentes=%d arquivos_envolvidos=%d",
+            len(pending),
+            len(set(c["source_file_root"] for c in pending)),
+        )
+        per_file_counts, embed_fails = await _flush_batch(qdrant, collection_name, pending)
         stats["chunks_indexed"] += sum(per_file_counts.values())
+        stats["embedding_failures"] += embed_fails
         await _commit_confirmed_files(
             redis, qdrant, collection_name, manifest_key, tracking, per_file_counts,
             failures_key=failures_key, failures_cache=failures_cache,
         )
+        # Limpa o buffer após flush bem-sucedido
+        pending.clear()
 
     # Identificação de falhas parciais (chunks perdidos no embedding/upsert limitaram commit)
+    # NOTA: arquivos que permanecem em tracking após o flush final têm persistência parcial
+    # real — seus chunks não foram confirmados devido a falhas de embedding ou upsert.
     for source_file, tracker in tracking.items():
         stats["partial_failures"] += 1
         log.warning(
