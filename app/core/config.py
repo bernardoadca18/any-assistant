@@ -391,7 +391,7 @@ class Settings(BaseSettings):
         ),
     )
     qdrant_upsert_max_retries: int = Field(
-        default=3,
+        default=5,
         ge=1,
         le=10,
         description=(
@@ -401,12 +401,12 @@ class Settings(BaseSettings):
         ),
     )
     qdrant_upsert_wait: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Se True, aguarda a confirmação de indexação em disco do Qdrant "
             "para cada lote (wait=True no upsert). Se False, envia de forma "
-            "assíncrona sem esperar a confirmação, reduzindo latência mas "
-            "com menor garantia de consistência imediata."
+            "assíncrona sem esperar a confirmação (apenas WAL), reduzindo "
+            "latência e evitando timeouts de leitura em lotes grandes."
         ),
     )
 

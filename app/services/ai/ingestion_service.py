@@ -1995,56 +1995,81 @@ async def _flush_batch(
     # Retry com backoff exponencial para erros de conexão/transitórios
     max_retries = settings.qdrant_upsert_max_retries
     wait_enabled = settings.qdrant_upsert_wait
+    batch_size = settings.ingestion_batch_size
     last_exc: Exception | None = None
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            await qdrant.upsert(
-                collection_name=collection_name,
-                points=points,
-                wait=wait_enabled,
-            )
-            break  # Sucesso — sai do loop de retry
-        except (
-            httpx.ReadError,
-            httpcore.ReadError,
-            ResponseHandlingException,
-            UnexpectedResponse,
-        ) as exc:
-            last_exc = exc
-            if attempt < max_retries:
-                backoff = 2 ** attempt  # 2, 4, 8 segundos...
-                log.warning(
-                    "Tentativa %d/%d de upsert falhou (%s) — retry em %ds | "
-                    "coleção=%s pontos=%d",
-                    attempt,
-                    max_retries,
-                    type(exc).__name__,
-                    backoff,
-                    collection_name,
-                    len(points),
+    # Sub-batching: divide lotes grandes para evitar timeouts HTTP
+    sub_batches: list[list[qdrant_models.PointStruct]] = []
+    if len(points) > batch_size:
+        for i in range(0, len(points), batch_size):
+            sub_batches.append(points[i:i + batch_size])
+        log.info(
+            "Sub-batching ativado | %d pontos divididos em %d sub-lotes | coleção=%s",
+            len(points),
+            len(sub_batches),
+            collection_name,
+        )
+    else:
+        sub_batches = [points]
+
+    # Processa cada sub-lote sequencialmente
+    for sub_batch_idx, sub_points in enumerate(sub_batches):
+        for attempt in range(1, max_retries + 1):
+            try:
+                await qdrant.upsert(
+                    collection_name=collection_name,
+                    points=sub_points,
+                    wait=wait_enabled,
+                    timeout=60.0,  # Timeout explícito para upsert (sobrescreve o do cliente)
                 )
-                await asyncio.sleep(backoff)
-            else:
+                break  # Sucesso — sai do loop de retry
+            except (
+                httpx.ReadError,
+                httpx.ReadTimeout,
+                httpcore.ReadError,
+                httpcore.ReadTimeout,
+                ResponseHandlingException,
+                UnexpectedResponse,
+            ) as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    backoff = 2 ** attempt  # 2, 4, 8 segundos...
+                    log.warning(
+                        "Tentativa %d/%d de upsert falhou (%s) — retry em %ds | "
+                        "coleção=%s sub-lote=%d/%d pontos=%d",
+                        attempt,
+                        max_retries,
+                        type(exc).__name__,
+                        backoff,
+                        collection_name,
+                        sub_batch_idx + 1,
+                        len(sub_batches),
+                        len(sub_points),
+                    )
+                    await asyncio.sleep(backoff)
+                else:
+                    log.error(
+                        "Todas as %d tentativas de upsert falharam | coleção=%s "
+                        "sub-lote=%d/%d pontos=%d: %s",
+                        max_retries,
+                        collection_name,
+                        sub_batch_idx + 1,
+                        len(sub_batches),
+                        len(sub_points),
+                        exc,
+                        exc_info=True,
+                    )
+                    return {}, embedding_failures
+            except Exception as exc:
+                # Erros não recuperáveis — loga e falha imediatamente
                 log.error(
-                    "Todas as %d tentativas de upsert falharam | coleção=%s pontos=%d: %s",
-                    max_retries,
+                    "Falha no upsert do sub-lote (%d pontos) na coleção '%s': %s",
+                    len(sub_points),
                     collection_name,
-                    len(points),
                     exc,
                     exc_info=True,
                 )
                 return {}, embedding_failures
-        except Exception as exc:
-            # Erros não recuperáveis — loga e falha imediatamente
-            log.error(
-                "Falha no upsert do lote (%d pontos) na coleção '%s': %s",
-                len(points),
-                collection_name,
-                exc,
-                exc_info=True,
-            )
-            return {}, embedding_failures
 
     if embedding_failures > 0:
         log.warning(
