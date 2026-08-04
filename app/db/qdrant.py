@@ -16,7 +16,8 @@ from typing import AsyncGenerator
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qdrant_models
 from qdrant_client.http.exceptions import UnexpectedResponse
-
+from grpc.aio import AioRpcError
+from grpc import StatusCode
 from app.core.config import settings
 
 log = logging.getLogger(__name__)
@@ -102,6 +103,16 @@ async def _validate_collection(client: AsyncQdrantClient) -> None:
             log.warning(
                 "Coleção '%s' não encontrada no Qdrant. "
                 "Execute o ue5_rag_ingestor.py antes de fazer queries RAG.",
+                collection_name,
+            )
+        else:
+            raise
+    except AioRpcError as exc:
+        # Caminho gRPC (prefer_grpc=True) — "not found" chega como
+        # AioRpcError com StatusCode.NOT_FOUND, não como UnexpectedResponse.
+        if exc.code() == StatusCode.NOT_FOUND:
+            log.warning(
+                "Coleção '%s' não encontrada no Qdrant (gRPC). Execute a ingestão antes de fazer queries RAG.",
                 collection_name,
             )
         else:

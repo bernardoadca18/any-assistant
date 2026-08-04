@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     # --- Qdrant --------------------------------------------------------------
     qdrant_host: str = "qdrant"
     qdrant_port: int = 6333
+    qdrant_grpc_port: int = 6334
 
     # CORREÇÃO (CRÍTICO — namespace único impedia multi-domain): este campo
     # era uma string fixa ("ue5_docs_hybrid"), usada diretamente em TODA
