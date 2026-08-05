@@ -245,8 +245,8 @@ services:
     volumes:
       - /mnt/c/Program Files/Epic Games/UE_5.8/Engine:/data/ue5_engine_root:ro
       - /mnt/c/Users/Bernardo.DESKTOP-G7D68S2/Downloads/Ingest_projects:/data/projects_source:ro
-      - /mnt/c/Users/Bernardo.DESKTOP-G7D68S2/Documents/Unreal Projects:/data/sample_projects:ro
+      - /mnt/c/Users/Bernardo.DESKTOP-G7D68S2/Documents/Unreal Projects:/data/ue5_sample_projects:ro
 
       - /home/bernardo/godot_sources/godot_engine_4:/data/godot_engine_root:ro
       - /home/bernardo/godot_sources/godot_docs_4:/data/godot_docs_root:ro
-      - /home/bernardo/godot_sources/godot_demo_projects:/data/sample_projects:ro
+      - /home/bernardo/godot_sources/godot_demo_projects:/data/godot_demo_projects:ro
