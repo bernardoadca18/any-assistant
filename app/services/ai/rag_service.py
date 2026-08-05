@@ -69,18 +69,70 @@ from app.services.ai.embedding_service import embed_text
 from app.services.ai.prompt_factory import PromptFactory
 from app.services.ai.session_service import build_messages_for_llm, save_turn
 from app.services.ai.sparse_vector_service import SPARSE_VECTOR_NAME, build_sparse_vector
+from app.services.tenant_config_service import ResolvedCollectionConfig
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Constantes de configuração do pipeline avançado
-# Valores padrão — sobrescritos pelas settings em runtime quando relevante.
+# INTEGRAÇÃO MULTI-TENANT (ResolvedCollectionConfig) — LEIA ANTES DE MEXER
+# ---------------------------------------------------------------------------
+# CONTEXTO: até esta correção, `tenant_config_service.py` existia como um
+# serviço completo (resolução em 3 camadas: override de coleção → default de
+# tenant → default de sistema, com cache L1 processo + L2 Redis + L3 Postgres)
+# mas NUNCA era chamado por este módulo — toda leitura de configuração vinha
+# direto de `settings` (processo inteiro, idêntico para todos os tenants).
+# Ou seja: um tenant podia ter `reranker_enabled=False` ou um
+# `system_prompt_override` customizado gravado no Postgres via
+# CollectionConfig e isso não tinha NENHUM efeito em nenhuma requisição real.
+#
+# ESTRATÉGIA DE INTEGRAÇÃO ESCOLHIDA (parâmetro opcional, não big-bang):
+#   Cada função do pipeline que hoje lê `settings.rag_*` passa a aceitar um
+#   parâmetro adicional `resolved_config: ResolvedCollectionConfig | None`.
+#     - Se `resolved_config` for fornecido (tenant resolvido com sucesso no
+#       endpoint — ver chat.py), os parâmetros de RAG vêm de
+#       `resolved_config.rag` (ResolvedRAGConfig), respeitando os overrides
+#       de tenant/coleção gravados no Postgres.
+#     - Se `resolved_config` for None (nenhum tenant_id na requisição, ou
+#       resolução falhou, ou é uma chamada legada/de teste sem essa camada),
+#       o comportamento é EXATAMENTE o mesmo de antes desta mudança: leitura
+#       direta de `settings.rag_*` — o processo inteiro compartilha a mesma
+#       config, como sempre funcionou.
+#   Essa escolha foi deliberada: como o app ainda está em desenvolvimento e
+#   a prioridade imediata é o domínio Godot 4 funcionando perfeitamente,
+#   o parâmetro é OPCIONAL em toda a cadeia — nenhuma chamada existente
+#   quebra, e o pipeline nunca fica bloqueado esperando por infraestrutura
+#   de tenant (Postgres/Redis) que pode ainda não estar populada em dev.
+#
+# ONDE A RESOLUÇÃO ACONTECE: não aqui. `resolved_config` é resolvido UMA
+# ÚNICA VEZ no endpoint (`app/api/v1/endpoints/chat.py`), via
+# `TenantConfigService.resolve_collection_config(...)` ou
+# `resolve_default_collection_for_domain(...)`, e propagado para
+# `run_rag_pipeline`/`run_rag_pipeline_stream` já resolvido — este módulo
+# nunca deve importar `AsyncSession`/tocar o Postgres diretamente, para não
+# duplicar a lógica de cache/fallback que já vive em tenant_config_service.py.
+#
+# PENDÊNCIA CONHECIDA (documentada, não bloqueante): `ChatRequest` ainda não
+# tem um campo `tenant_id` estável neste snapshot do schema (não foi
+# incluído nos arquivos fornecidos para esta auditoria) — `chat.py` resolve
+# isso hoje via `getattr(request, "tenant_id", None)`, no mesmo espírito do
+# `getattr(request, "domain_id", None)` já usado neste arquivo. Quando o
+# schema for atualizado para tornar `tenant_id` um campo real (ver relatório
+# de auditoria — seção "schema ChatRequest"), o `getattr` pode ser trocado
+# por acesso direto sem nenhuma outra mudança necessária aqui.
 # ---------------------------------------------------------------------------
 
-# Limite expandido de chunks por query (referência interna; usa settings em runtime)
+# ---------------------------------------------------------------------------
+# Constantes de configuração do pipeline avançado
+# Valores padrão — sobrescritos por settings.rag_* (comportamento legado,
+# sem tenant resolvido) OU por resolved_config.rag.* (comportamento novo,
+# com tenant resolvido) em runtime quando relevante. Ver bloco acima.
+# ---------------------------------------------------------------------------
+
+# Limite expandido de chunks por query (fallback final se nem settings nem
+# resolved_config trouxerem um valor — não deveria ocorrer em produção)
 _RETRIEVAL_LIMIT_PER_QUERY: int = 15
 
-# Modelo de decomposição padrão (pode ser sobrescrito via settings)
+# Modelo de decomposição padrão (fallback final — ver acima)
 _DECOMPOSITION_MODEL: str = "gemini-3.5-flash-lite"
 
 # Fallback: se o modelo de decomposição principal falhar (HTTP 4xx/5xx,
@@ -91,14 +143,99 @@ _DECOMPOSITION_MODEL: str = "gemini-3.5-flash-lite"
 # modelo genuinamente diferente (outro provider/tier no LiteLLM) para
 # fornecer redundância de verdade. Ajuste este valor para o modelo de
 # fallback real disponível no seu LiteLLM (ex.: outro provider hospedado).
+#
+# NOTA MULTI-TENANT: este fallback é intencionalmente global (não vem de
+# resolved_config) — é uma rede de segurança de infraestrutura, não uma
+# preferência de tenant. Um tenant pode escolher seu decomposition_model
+# principal via ResolvedRAGConfig.decomposition_model, mas o fallback de
+# emergência quando TUDO falha continua sendo o mesmo para todo o sistema.
 _DECOMPOSITION_MODEL_FALLBACK: str = "qwen-local"
 
 # Timeout dedicado para a chamada de decomposição (deve ser rápida)
 _DECOMPOSITION_TIMEOUT: float = 12.0
 
 # FlashRank: modelo Cross-Encoder embutido (baixa latência, sem GPU)
-# Sobrescrito em runtime por settings.rag_reranker_model
+# Fallback final — ver resolved_config.rag.reranker_model / settings.rag_reranker_model
 _FLASHRANK_MODEL: str = "ms-marco-MiniLM-L-12-v2"
+
+
+def _rag_setting(resolved_config: ResolvedCollectionConfig | None, field_name: str, settings_attr: str, default: Any) -> Any:
+    """
+    Helper central de resolução de configuração de RAG — PONTO ÚNICO onde a
+    prioridade "resolved_config.rag.<field> > settings.<attr> > default" é
+    aplicada, para as ~12 leituras de parâmetro de RAG espalhadas por este
+    módulo. Extrair isso evitou repetir o mesmo `if resolved_config: ... else
+    getattr(settings, ...)` doze vezes com chance de divergir sutilmente
+    entre um ponto e outro.
+
+    Prioridade (maior para menor):
+        1. resolved_config.rag.<field_name>   — override de tenant/coleção
+           (Postgres, via TenantConfigService), SE resolved_config foi
+           passado (ou seja, SE um tenant foi resolvido no endpoint).
+        2. settings.<settings_attr>            — comportamento legado
+           (processo inteiro, sem tenant), usado quando resolved_config é
+           None. Este é o caminho que TODA requisição usava antes desta
+           integração, e continua sendo o caminho usado por qualquer
+           chamador que não resolva tenant (testes, scripts internos,
+           requisições sem tenant_id).
+        3. default                             — rede de segurança final,
+           só acionada se nem settings tiver o atributo (ex.: settings
+           desatualizado em um ambiente de dev que ainda não tem a env var).
+
+    NOTA IMPORTANTE: `ResolvedRAGConfig` (ver tenant_config_service.py) é um
+    dataclass FROZEN com todos os campos obrigatórios e não-None — ou seja,
+    se `resolved_config` não é None, `resolved_config.rag.<field_name>`
+    SEMPRE existe e nunca é None (TenantConfigService já aplicou seus
+    próprios fallbacks para settings ao construir o objeto). Por isso este
+    helper usa `getattr` (não `.get`) no resolved_config — um AttributeError
+    aqui indicaria um bug real de nome de campo, não uma ausência esperada.
+    """
+    if resolved_config is not None:
+        return getattr(resolved_config.rag, field_name)
+    return getattr(settings, settings_attr, default)
+
+
+def _resolve_qdrant_collection_name(domain_id: str, resolved_config: ResolvedCollectionConfig | None) -> str:
+    """
+    Resolve o nome da coleção Qdrant a consultar — PONTO ÚNICO usado por
+    TODOS os call sites deste módulo que antes chamavam
+    `settings.qdrant_collection_for(domain_id)` diretamente (busca híbrida,
+    busca densa pura, fallback naive, backfill de raw_content).
+
+    POR QUE ISSO IMPORTA PARA MULTI-TENANCY (mais do que os outros
+    parâmetros de RAG): `settings.qdrant_collection_for(domain_id)` resolve
+    para UMA coleção fixa por domínio, IGUAL para todo o processo — ou seja,
+    dois tenants diferentes rodando o mesmo domain_id="godot_4" cairiam,
+    sem esta correção, na MESMA coleção Qdrant. Isso não é só uma questão
+    de configuração ignorada (como os parâmetros resolvidos via
+    `_rag_setting`) — é um vazamento real de isolamento de dados entre
+    tenants: o tenant B veria (ou poderia contaminar via reranking/RRF) os
+    chunks ingeridos pelo tenant A. `ResolvedCollectionConfig.
+    qdrant_collection_name` (ver tenant_config_service.py, campo populado a
+    partir de `Collection.qdrant_collection_name` no Postgres) é o nome
+    real e isolado por tenant/coleção — é o que deve ser usado sempre que
+    um tenant foi resolvido.
+
+    Prioridade:
+        1. resolved_config.qdrant_collection_name — tenant resolvido, nome
+           real da coleção isolada daquele tenant no Postgres.
+        2. settings.qdrant_collection_for(domain_id) — comportamento
+           legado (sem tenant resolvido), idêntico ao pré-integração. Em
+           desenvolvimento single-tenant (prioridade atual: Godot 4
+           funcionando), este é o caminho que continua sendo exercitado.
+
+    Args:
+        domain_id: Domínio ativo, usado apenas no caminho de fallback
+            (settings.qdrant_collection_for exige domain_id).
+        resolved_config: Configuração de tenant/coleção já resolvida, ou
+            None se nenhum tenant foi resolvido para esta requisição.
+
+    Returns:
+        Nome da coleção Qdrant a ser consultada nesta requisição.
+    """
+    if resolved_config is not None:
+        return resolved_config.qdrant_collection_name
+    return settings.qdrant_collection_for(domain_id)
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +299,20 @@ async def init_decomposition_client() -> httpx.AsyncClient:
     """
     Cria o client HTTP compartilhado para chamadas de decomposição/tradução
     de query ao LiteLLM. Deve ser chamado no lifespan startup do FastAPI.
+
+    MULTI-TENANT — EXCEÇÃO INTENCIONAL: `decomp_timeout` continua lendo
+    apenas de `settings.rag_decomposition_timeout` (não de `_rag_setting`/
+    `resolved_config`), mesmo `ResolvedRAGConfig.decomposition_timeout`
+    existindo como campo configurável por tenant. Isso é proposital, não
+    um ponto esquecido: esta função roda UMA VEZ no lifespan startup do
+    FastAPI, antes de qualquer requisição existir — não há tenant, não há
+    `resolved_config` possível neste momento, só um client HTTP compartilhado
+    sendo construído para o processo inteiro. Um timeout por tenant
+    exigiria um client HTTP por tenant (ou por config de timeout distinta),
+    o que é uma mudança de arquitetura bem maior do que esta integração se
+    propôs a fazer — fica registrado aqui como possível trabalho futuro se
+    algum tenant precisar de um timeout de decomposição sensivelmente
+    diferente do padrão do sistema.
     """
     global _decomposition_client
     decomp_timeout = getattr(settings, "rag_decomposition_timeout", _DECOMPOSITION_TIMEOUT)
@@ -196,7 +347,11 @@ def _get_decomposition_client() -> httpx.AsyncClient:
 # FASE 1 — Query Decomposition
 # ---------------------------------------------------------------------------
 
-async def decompose_query(user_question: str, domain_id: str) -> DecomposedQuery:
+async def decompose_query(
+    user_question: str,
+    domain_id: str,
+    resolved_config: ResolvedCollectionConfig | None = None,
+) -> DecomposedQuery:
     """
     Traduz a query do usuário para inglês técnico e a decompõe em sub-queries
     técnicas para busca vetorial.
@@ -226,8 +381,41 @@ async def decompose_query(user_question: str, domain_id: str) -> DecomposedQuery
     alto no log) para nunca deixar a requisição sem resposta — mas isso
     deve ser tratado como incidente operacional, não como caminho normal.
 
+    INTEGRAÇÃO MULTI-TENANT (ver bloco de comentário no topo do módulo):
+    `resolved_config`, quando fornecido, sobrescreve DOIS parâmetros
+    independentes desta função — vale registrar a distinção, pois eles vêm
+    de fontes diferentes dentro do mesmo objeto:
+
+        1. `decomposition_prompt`: normalmente resolvido via
+           `PromptFactory.get_prompts(domain_id).decomposition_prompt`, que
+           lê SEMPRE do BaseDomainProfile (godot4.py/ue5.py) — não tem
+           conceito de override por tenant. `ResolvedCollectionConfig.
+           decomposition_prompt` (ver tenant_config_service.py,
+           `_build_resolved_config`) hoje é documentado como "always from
+           domain profile" também — ou seja, NESTA VERSÃO os dois caminhos
+           produzem o mesmo valor. A troca para `resolved_config.
+           decomposition_prompt` já deixa o código pronto para o dia em que
+           `tenant_config_service.py` ganhar um `decomposition_prompt_override`
+           por coleção (hoje só `system_prompt_override` existe) — nesse
+           momento, este ponto já vai captar o override automaticamente,
+           sem precisar de nenhuma mudança adicional aqui.
+        2. `decomp_model`: vem de `resolved_config.rag.decomposition_model`
+           (ResolvedRAGConfig) — ESTE sim já é configurável por
+           tenant/coleção hoje (ex.: um tenant pode preferir um modelo de
+           decomposição mais barato ou mais caro que o default do sistema).
+
+    Quando `resolved_config` é None (nenhum tenant resolvido — ver
+    `chat.py`), o comportamento é idêntico ao pré-integração: `domain_id`
+    resolve o prompt via PromptFactory, e `settings.rag_decomposition_model`
+    resolve o modelo.
+
     Args:
         user_question: Pergunta original do usuário.
+        domain_id: Domínio ativo (usado para resolver o prompt via
+            PromptFactory quando resolved_config não está disponível).
+        resolved_config: Configuração de tenant/coleção já resolvida pelo
+            endpoint (ver chat.py), ou None se nenhum tenant foi resolvido
+            para esta requisição — nesse caso cai para settings/domain_id.
 
     Returns:
         DecomposedQuery com translated_query (nunca vazia — só contém texto
@@ -236,9 +424,22 @@ async def decompose_query(user_question: str, domain_id: str) -> DecomposedQuery
         (identificadores técnicos exatos para o canal esparso da busca
         híbrida — pode ser vazia).
     """
-    # Lê configurações em runtime para permitir override sem recompilação
-    decomp_model = getattr(settings, "rag_decomposition_model", _DECOMPOSITION_MODEL)
-    decomposition_prompt = PromptFactory.get_prompts(domain_id).decomposition_prompt
+    # Lê configurações em runtime para permitir override sem recompilação.
+    # Prioridade: resolved_config (tenant/coleção) > settings (global) >
+    # constante local — ver _rag_setting() e o bloco de comentário no topo
+    # do módulo para a justificativa completa desta cadeia de fallback.
+    decomp_model = _rag_setting(resolved_config, "decomposition_model", "rag_decomposition_model", _DECOMPOSITION_MODEL)
+
+    # decomposition_prompt: resolved_config.decomposition_prompt já teria o
+    # mesmo valor de PromptFactory.get_prompts(domain_id).decomposition_prompt
+    # nesta versão do tenant_config_service (ver docstring acima) — usamos
+    # resolved_config quando disponível para já deixar este ponto correto
+    # no dia em que um override por coleção for adicionado ao serviço.
+    decomposition_prompt = (
+        resolved_config.decomposition_prompt
+        if resolved_config is not None
+        else PromptFactory.get_prompts(domain_id).decomposition_prompt
+    )
 
     payload = {
         "model": decomp_model,
@@ -311,7 +512,11 @@ async def decompose_query(user_question: str, domain_id: str) -> DecomposedQuery
         if sq_stripped and sq_stripped.lower() != translated_query.lower():
             deduped_sub_queries.append(sq_stripped)
 
-    max_keywords = getattr(settings, "rag_decomposition_max_keywords", 6)
+    # MULTI-TENANT: decomposition_max_keywords também é configurável por
+    # tenant/coleção (ex.: um tenant Godot pode querer mais keywords_exact
+    # que um tenant UE5, dada a densidade de identificadores prefixados
+    # com @ como @export/@onready) — ver _rag_setting().
+    max_keywords = _rag_setting(resolved_config, "decomposition_max_keywords", "rag_decomposition_max_keywords", 6)
     clean_keywords = [kw.strip() for kw in keywords_exact if isinstance(kw, str) and kw.strip()]
     clean_keywords = clean_keywords[:max_keywords]
 
@@ -518,6 +723,7 @@ async def _hybrid_search(
     limit: int,
     query_filter: qdrant_models.Filter | None,
     domain_id: str,
+    resolved_config: ResolvedCollectionConfig | None = None,
 ) -> list[qdrant_models.ScoredPoint]:
     """
     Busca híbrida (Dense + Sparse/BM25-like) fundida via Reciprocal Rank
@@ -546,6 +752,18 @@ async def _hybrid_search(
     (`BaseDomainProfile.sparse_camel_split_regex`) — sem isso, keywords
     Godot (@export, snake_case) seriam tokenizadas com a heurística de
     prefixo UE5 (A/U/F/E), degradando o recall do canal esparso.
+
+    INTEGRAÇÃO MULTI-TENANT (ver _resolve_qdrant_collection_name): quando
+    `resolved_config` é fornecido, a coleção usada é
+    `resolved_config.qdrant_collection_name` (isolada por tenant/coleção no
+    Postgres) em vez de `settings.qdrant_collection_for(domain_id)` (fixa
+    por domínio, compartilhada por todo o processo). Sem esta troca, dois
+    tenants no mesmo domain_id="godot_4" fariam RRF na MESMA coleção Qdrant
+    — um vazamento de isolamento de dados entre tenants, não apenas uma
+    config ignorada. domain_id continua sendo necessário aqui de qualquer
+    forma, pois resolve a regex de tokenização do canal esparso
+    (sparse_camel_split_regex), que é uma propriedade do DOMÍNIO
+    (convenção de nomenclatura da linguagem), não do tenant.
     """
     profile = domain_registry.get(domain_id)
     sparse_vector = build_sparse_vector(keywords_text, camel_split_regex=profile.sparse_camel_split_regex)
@@ -566,7 +784,7 @@ async def _hybrid_search(
     ]
 
     response = await qdrant.query_points(
-        collection_name=settings.qdrant_collection_for(domain_id),
+        collection_name=_resolve_qdrant_collection_name(domain_id, resolved_config),
         prefetch=prefetch,
         query=qdrant_models.FusionQuery(fusion=qdrant_models.Fusion.RRF),
         limit=limit,
@@ -583,27 +801,30 @@ async def retrieve_chunks_for_query(
     domain_id: str,
     project_source_filter: str | None = None,
     keywords_exact: list[str] | None = None,
+    resolved_config: ResolvedCollectionConfig | None = None,
 ) -> list[RetrievedChunk]:
     """
     Executa uma única busca no Qdrant com limite expandido.
 
     CORREÇÃO (CRÍTICO — coleção hardcoded): `domain_id` foi adicionado e é
     obrigatório (sem default) de propósito — este é o ponto que resolve
-    `settings.qdrant_collection_for(domain_id)` tanto no caminho híbrido
-    (`_hybrid_search`) quanto no fallback denso puro abaixo. Tornar opcional
-    aqui reintroduziria silenciosamente o acoplamento single-tenant que
-    motivou toda a refatoração multi-domain.
+    a coleção Qdrant tanto no caminho híbrido (`_hybrid_search`) quanto no
+    fallback denso puro abaixo (ver `_resolve_qdrant_collection_name`).
+    Tornar opcional aqui reintroduziria silenciosamente o acoplamento
+    single-tenant que motivou toda a refatoração multi-domain.
 
     BUSCA HÍBRIDA (Dense + Sparse via RRF): quando `keywords_exact` traz ao
-    menos um identificador utilizável E `settings.rag_hybrid_search_enabled`
-    está ligado (kill-switch), a busca combina o vetor denso com um vetor
-    esparso BM25-like construído a partir dos identificadores exatos (ver
-    `_hybrid_search`), fundindo os dois rankings via Reciprocal Rank Fusion
-    direto no Qdrant. Sem keywords utilizáveis (ou com o kill-switch
-    desligado, ou se a busca híbrida falhar — ex: coleção legada ainda sem
-    o espaço esparso migrado), cai transparentemente para a busca densa
-    pura de sempre — o comportamento é idêntico ao pré-hybrid para quem não
-    passa `keywords_exact`.
+    menos um identificador utilizável E o kill-switch de busca híbrida
+    (`resolved_config.rag.hybrid_search_enabled` se um tenant foi resolvido,
+    senão `settings.rag_hybrid_search_enabled` — ver `_rag_setting`) está
+    ligado, a busca combina o vetor denso com um vetor esparso BM25-like
+    construído a partir dos identificadores exatos (ver `_hybrid_search`),
+    fundindo os dois rankings via Reciprocal Rank Fusion direto no Qdrant.
+    Sem keywords utilizáveis (ou com o kill-switch desligado, ou se a busca
+    híbrida falhar — ex: coleção legada ainda sem o espaço esparso
+    migrado), cai transparentemente para a busca densa pura de sempre — o
+    comportamento é idêntico ao pré-hybrid para quem não passa
+    `keywords_exact`.
 
     Não aplica score_threshold aqui — o reranker vai cuidar da qualidade.
     Threshold é aplicado apenas se o reranker não estiver disponível.
@@ -616,6 +837,18 @@ async def retrieve_chunks_for_query(
     reduz o recall efetivo, já que o `limit` do Qdrant conta candidatos
     antes do filtro).
 
+    INTEGRAÇÃO MULTI-TENANT: `resolved_config`, quando fornecido, afeta
+    esta função em DOIS pontos independentes — vale a distinção:
+        1. Qual COLEÇÃO é consultada (isolamento de dados entre tenants —
+           ver `_resolve_qdrant_collection_name`, propagado tanto para
+           `_hybrid_search` quanto para os dois `qdrant.search` diretos
+           abaixo).
+        2. Se o CANAL ESPARSO está ligado (preferência de tenant, não
+           isolamento de dados — ver `_rag_setting`).
+    Quando `resolved_config` é None, ambos os comportamentos são idênticos
+    ao pré-integração (coleção fixa por domínio via settings, kill-switch
+    global via settings).
+
     Args:
         qdrant: Cliente Qdrant assíncrono.
         query_vector: Vetor de embedding da query.
@@ -626,14 +859,18 @@ async def retrieve_chunks_for_query(
         keywords_exact: Identificadores técnicos exatos extraídos pelo
             decompositor (ver DecomposedQuery.keywords_exact). Quando
             presentes, ativam o canal esparso da busca híbrida.
+        resolved_config: Configuração de tenant/coleção já resolvida pelo
+            endpoint, ou None se nenhum tenant foi resolvido (comportamento
+            legado — settings global, sem isolamento por tenant).
 
     Returns:
         Lista de RetrievedChunk, possivelmente vazia se Qdrant falhar.
     """
     query_filter = _build_project_source_filter(project_source_filter)
 
-    hybrid_enabled = getattr(settings, "rag_hybrid_search_enabled", True)
+    hybrid_enabled = _rag_setting(resolved_config, "hybrid_search_enabled", "rag_hybrid_search_enabled", True)
     usable_keywords = [kw.strip() for kw in (keywords_exact or []) if kw and kw.strip()]
+    collection_name = _resolve_qdrant_collection_name(domain_id, resolved_config)
 
     try:
         if hybrid_enabled and usable_keywords:
@@ -645,6 +882,7 @@ async def retrieve_chunks_for_query(
                     limit=limit,
                     query_filter=query_filter,
                     domain_id=domain_id,
+                    resolved_config=resolved_config,
                 )
                 log.debug(
                     "Busca híbrida (RRF) OK | domain=%s | %d keywords_exact | %d resultados",
@@ -659,7 +897,7 @@ async def retrieve_chunks_for_query(
                     hybrid_exc,
                 )
                 results = await qdrant.search(
-                    collection_name=settings.qdrant_collection_for(domain_id),
+                    collection_name=collection_name,
                     query_vector=query_vector,
                     limit=limit,
                     with_payload=True,
@@ -667,7 +905,7 @@ async def retrieve_chunks_for_query(
                 )
         else:
             results = await qdrant.search(
-                collection_name=settings.qdrant_collection_for(domain_id),
+                collection_name=collection_name,
                 query_vector=query_vector,
                 limit=limit,
                 with_payload=True,
@@ -761,7 +999,7 @@ def _deduplicate_chunks(chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Singleton do Ranker (FlashRank)
+# Cache do Ranker (FlashRank) — POR MODELO, não mais um singleton único
 # ---------------------------------------------------------------------------
 # CORREÇÃO (ALTO — bloqueio de event loop): rerank_with_flashrank criava um
 # `Ranker(...)` novo A CADA REQUISIÇÃO, dentro de uma função síncrona chamada
@@ -772,55 +1010,103 @@ def _deduplicate_chunks(chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
 # que fosse grátis, a inferência do Cross-Encoder é CPU-bound e síncrona: para
 # N usuários concorrentes, cada rerank bloqueava o loop inteiro pelo tempo de
 # execução, serializando todas as outras requisições HTTP do FastAPI nesse
-# intervalo. Agora o Ranker é construído uma única vez (fora do event loop,
-# via to_thread) e reaproveitado; a inferência também roda em thread separada.
-_ranker_instance: Any = None
+# intervalo. O Ranker é construído uma única vez POR MODELO (fora do event
+# loop, via to_thread) e reaproveitado; a inferência também roda em thread
+# separada.
+#
+# MULTI-TENANT (ALTO — motivo da mudança de singleton único para cache por
+# modelo): `ResolvedRAGConfig.reranker_model` é configurável por
+# tenant/coleção — um tenant pode escolher um cross-encoder diferente do
+# default do sistema. Com um único `_ranker_instance` global (implementação
+# original), o PRIMEIRO tenant a disparar uma requisição no processo
+# "vencia": seu `reranker_model` inicializava a instância global, e todo
+# tenant seguinte (mesmo pedindo um modelo diferente via
+# ResolvedRAGConfig.reranker_model) silenciosamente reutilizava o modelo do
+# primeiro tenant — sem erro, sem log, só uma reordenação de chunks feita
+# pelo cross-encoder "errado" para aquele tenant. Trocado para um dict
+# `{model_name: Ranker}` — cada modelo distinto usado por QUALQUER tenant é
+# carregado e cacheado uma única vez (mesmo custo de memória por modelo de
+# antes), e cada requisição usa o Ranker correto para o `reranker_model`
+# que foi resolvido para ela.
+#
+# LIMITAÇÃO CONHECIDA (não resolvida aqui, documentando para o futuro):
+# `cache_dir` (diretório de cache em disco dos pesos ONNX) continua sendo
+# lido de settings/resolved_config.rag.reranker_cache_dir POR CHAMADA, mas
+# a CHAVE do dict de cache é só `model_name` — se dois tenants configurarem
+# o MESMO `reranker_model` mas `reranker_cache_dir` DIFERENTES (cenário
+# improvável, mas possível dado que o campo existe por coleção), o segundo
+# tenant reaproveita silenciosamente a instância já carregada com o
+# cache_dir do primeiro. Na prática isso quase nunca importa (cache_dir é
+# tipicamente uma preocupação de infraestrutura/deploy, não de tenant), mas
+# fica registrado: se isso vier a importar, a chave do cache precisaria ser
+# `(model_name, cache_dir)` em vez de só `model_name`.
+_ranker_instances: dict[str, Any] = {}
 _ranker_init_lock = asyncio.Lock()
 
 
-async def _get_ranker() -> Any:
-    """Retorna o Ranker cacheado, construindo-o (em thread) na 1ª chamada."""
-    global _ranker_instance
-    if _ranker_instance is not None:
-        return _ranker_instance
+async def _get_ranker(resolved_config: ResolvedCollectionConfig | None = None) -> Any:
+    """
+    Retorna o Ranker cacheado para o `reranker_model` resolvido (tenant ou
+    settings global — ver `_rag_setting`), construindo-o em thread na 1ª vez
+    que aquele modelo específico é solicitado por qualquer tenant.
+
+    Args:
+        resolved_config: Configuração de tenant/coleção já resolvida, ou
+            None se nenhum tenant foi resolvido — nesse caso o modelo vem
+            de `settings.rag_reranker_model` (comportamento legado).
+    """
+    reranker_model = _rag_setting(resolved_config, "reranker_model", "rag_reranker_model", _FLASHRANK_MODEL)
+
+    # Fast path: modelo já carregado por uma chamada anterior (de qualquer
+    # tenant) — não precisa do lock para o caso comum.
+    cached = _ranker_instances.get(reranker_model)
+    if cached is not None:
+        return cached
 
     async with _ranker_init_lock:
         # Re-checa dentro do lock: outra corrotina pode ter inicializado
-        # enquanto esperávamos o lock.
-        if _ranker_instance is None:
-            try:
-                from flashrank import Ranker  # importação lazy — graceful degradation
-            except ImportError:
-                log.warning(
-                    "FlashRank não está instalado. Instale com: pip install flashrank. "
-                    "Usando ordem original do Qdrant como fallback."
-                )
-                return None
+        # ESTE MESMO modelo enquanto esperávamos o lock.
+        if reranker_model in _ranker_instances:
+            return _ranker_instances[reranker_model]
 
-            reranker_model = getattr(settings, "rag_reranker_model", _FLASHRANK_MODEL)
-            cache_dir = getattr(settings, "rag_reranker_cache_dir", "/tmp/flashrank_cache")
-            try:
-                _ranker_instance = await asyncio.to_thread(
-                    Ranker, model_name=reranker_model, cache_dir=cache_dir
-                )
-                log.info(
-                    "FlashRank Ranker inicializado e cacheado | model=%s",
-                    reranker_model,
-                )
-            except Exception as exc:
-                log.warning(
-                    "Falha ao inicializar o FlashRank Ranker: %s. "
-                    "Reranking ficará desabilitado (fallback: ordem original).",
-                    exc,
-                )
-                return None
+        try:
+            from flashrank import Ranker  # importação lazy — graceful degradation
+        except ImportError:
+            log.warning(
+                "FlashRank não está instalado. Instale com: pip install flashrank. "
+                "Usando ordem original do Qdrant como fallback."
+            )
+            return None
 
-    return _ranker_instance
+        cache_dir = _rag_setting(resolved_config, "reranker_cache_dir", "rag_reranker_cache_dir", "/tmp/flashrank_cache")
+        try:
+            ranker_instance = await asyncio.to_thread(
+                Ranker, model_name=reranker_model, cache_dir=cache_dir
+            )
+            _ranker_instances[reranker_model] = ranker_instance
+            log.info(
+                "FlashRank Ranker inicializado e cacheado | model=%s | "
+                "total de modelos cacheados no processo=%d",
+                reranker_model,
+                len(_ranker_instances),
+            )
+        except Exception as exc:
+            log.warning(
+                "Falha ao inicializar o FlashRank Ranker (model=%s): %s. "
+                "Reranking ficará desabilitado (fallback: ordem original) "
+                "para requisições que usem este modelo.",
+                reranker_model,
+                exc,
+            )
+            return None
+
+    return _ranker_instances[reranker_model]
 
 
 async def rerank_with_flashrank(
     chunks: list[RetrievedChunk],
     query_text_en: str,
+    resolved_config: ResolvedCollectionConfig | None = None,
 ) -> list[RetrievedChunk]:
     """
     Reordena os chunks usando um Cross-Encoder leve via FlashRank.
@@ -842,16 +1128,38 @@ async def rerank_with_flashrank(
     _run_advanced_retrieval, que antes chamava esta função com a pergunta
     original em PT-BR por engano.
 
-    O Ranker é cacheado como singleton (ver _get_ranker) e a inferência roda
+    O Ranker é cacheado por modelo (ver _get_ranker) e a inferência roda
     em thread separada (asyncio.to_thread) para nunca bloquear o event loop.
 
     Em caso de falha (biblioteca não instalada, modelo não disponível, etc.),
     retorna os chunks na ordem original do Qdrant como fallback.
 
+    MULTI-TENANT — DOIS pontos afetados por `resolved_config` aqui, e vale
+    distingui-los:
+        1. KILL-SWITCH (`resolved_config.rag.reranker_enabled`): esta é a
+           integração NOVA nesta correção — antes desta mudança, o campo
+           `ResolvedRAGConfig.reranker_enabled` existia no schema mas
+           NENHUM ponto do pipeline o lia; o reranking sempre rodava
+           (exceto se o FlashRank falhasse ao inicializar). Um tenant que
+           quisesse desabilitar o reranking (ex.: para reduzir latência,
+           aceitando qualidade um pouco menor) não tinha como. Agora, se
+           `resolved_config.rag.reranker_enabled` é False, esta função
+           retorna os chunks na ordem original do Qdrant SEM sequer tentar
+           carregar/usar o Ranker — mesmo comportamento de quando o
+           FlashRank falha ao inicializar, mas por escolha explícita do
+           tenant, não por erro.
+        2. QUAL MODELO (`resolved_config.rag.reranker_model`, via
+           `_get_ranker`): já discutido em `_get_ranker` — agora cacheado
+           por modelo, não mais um singleton único, para não vazar a
+           escolha do primeiro tenant do processo para os demais.
+
     Args:
         chunks: Lista deduplicada de chunks para reranking.
         query_text_en: Texto em INGLÊS usado como âncora do reranking
             (tipicamente a translated_query de decompose_query()).
+        resolved_config: Configuração de tenant/coleção já resolvida, ou
+            None se nenhum tenant foi resolvido (comportamento legado:
+            reranking sempre tentado, modelo vem de settings).
 
     Returns:
         Lista reordenada pelo score do Cross-Encoder (mais relevante primeiro).
@@ -859,7 +1167,17 @@ async def rerank_with_flashrank(
     if not chunks:
         return chunks
 
-    ranker = await _get_ranker()
+    reranker_enabled = _rag_setting(resolved_config, "reranker_enabled", "rag_reranker_enabled", True)
+    if not reranker_enabled:
+        log.debug(
+            "Reranking desabilitado via configuração (tenant/coleção ou "
+            "settings.rag_reranker_enabled=False) — mantendo ordem original "
+            "do Qdrant para %d chunks.",
+            len(chunks),
+        )
+        return chunks
+
+    ranker = await _get_ranker(resolved_config)
     if ranker is None:
         return chunks
 
@@ -952,20 +1270,29 @@ async def retrieve_chunks(
     top_k: int,
     domain_id: str,
     project_source_filter: str | None = None,
+    resolved_config: ResolvedCollectionConfig | None = None,
 ) -> list[RetrievedChunk]:
     """
     Busca naive original: busca direta no Qdrant com top_k fixo e score_threshold.
     Mantida como fallback para o caso do pipeline avançado falhar completamente.
 
     CORREÇÃO (CRÍTICO — coleção hardcoded): `domain_id` obrigatório, usado
-    para resolver `settings.qdrant_collection_for(domain_id)` — sem isso o
-    fallback naive continuaria batendo sempre na coleção UE5 mesmo quando o
-    pipeline avançado (já corrigido) estivesse operando em outro domínio.
+    para resolver a coleção Qdrant (ver `_resolve_qdrant_collection_name`)
+    — sem isso o fallback naive continuaria batendo sempre na coleção UE5
+    mesmo quando o pipeline avançado (já corrigido) estivesse operando em
+    outro domínio.
 
     CORREÇÃO (project_source ignorado): assim como em retrieve_chunks_for_query,
     aplica `query_filter` quando `project_source_filter` é informado — o
     fallback naive não deve reintroduzir procedências que o chamador pediu
     para excluir.
+
+    MULTI-TENANT: `resolved_config`, quando fornecido, também afeta este
+    caminho de fallback — o naive RAG existe justamente para responder
+    mesmo quando o pipeline avançado falhou catastroficamente, então ele
+    PRECISA continuar respeitando isolamento de tenant (coleção correta) e
+    `score_threshold` do tenant, não só o pipeline feliz. Ver
+    `_resolve_qdrant_collection_name` e `_rag_setting`.
 
     Args:
         qdrant: Cliente Qdrant assíncrono.
@@ -973,6 +1300,8 @@ async def retrieve_chunks(
         top_k: Número de resultados desejados.
         project_source_filter: Se informado, restringe a busca a pontos com
             esse valor exato no campo `project_source` do payload.
+        resolved_config: Configuração de tenant/coleção já resolvida, ou
+            None se nenhum tenant foi resolvido (comportamento legado).
 
     Returns:
         Lista de RetrievedChunk.
@@ -981,13 +1310,14 @@ async def retrieve_chunks(
         RuntimeError: se a busca no Qdrant falhar.
     """
     query_filter = _build_project_source_filter(project_source_filter)
+    score_threshold = _rag_setting(resolved_config, "score_threshold", "rag_score_threshold", 0.6)
     try:
         results = await qdrant.search(
-            collection_name=settings.qdrant_collection_for(domain_id),
+            collection_name=_resolve_qdrant_collection_name(domain_id, resolved_config),
             query_vector=query_vector,
             limit=top_k,
             with_payload=True,
-            score_threshold=settings.rag_score_threshold,
+            score_threshold=score_threshold,
             query_filter=query_filter,
         )
         log.debug("Recebidos %d resultados do Qdrant.", len(results))
@@ -1030,7 +1360,7 @@ async def retrieve_chunks(
         "Retrieval naive: %d/%d chunks acima do threshold (%.2f)",
         len(chunks),
         top_k,
-        settings.rag_score_threshold,
+        score_threshold,
     )
     return chunks
 
@@ -1058,7 +1388,10 @@ async def retrieve_chunks(
 # _process_cpp_file. O chunk 0 "certo" para o fallback é sempre o do MESMO
 # source_file do chunk que está com raw_content ausente.
 async def _backfill_raw_content(
-    qdrant: AsyncQdrantClient, chunks: list[RetrievedChunk], domain_id: str
+    qdrant: AsyncQdrantClient,
+    chunks: list[RetrievedChunk],
+    domain_id: str,
+    resolved_config: ResolvedCollectionConfig | None = None,
 ) -> list[RetrievedChunk]:
     """
     Preenche `raw_content` ausente (chunks com chunk_id != 0) buscando o
@@ -1073,10 +1406,21 @@ async def _backfill_raw_content(
 
     CORREÇÃO (CRÍTICO — coleção hardcoded): `domain_id` obrigatório — o
     `qdrant.retrieve` por point_id precisa mirar a MESMA coleção de onde os
-    chunks vieram (`settings.qdrant_collection_for(domain_id)`); buscar na
+    chunks vieram (ver `_resolve_qdrant_collection_name`); buscar na
     coleção errada retornaria 404/vazio silenciosamente para todo domínio
     diferente de UE5, e o backfill nunca preencheria nada sem nenhum erro
     visível no log.
+
+    MULTI-TENANT (mesmo motivo do resto do pipeline): sem `resolved_config`
+    propagado até aqui, o backfill de um tenant B consultaria a coleção
+    fixa por domínio (settings) em vez da coleção isolada do tenant B —
+    na melhor hipótese um 404 silencioso (backfill vira no-op, chunks ficam
+    sem "Referência Direta" mas a resposta não quebra), na pior hipótese
+    (nomes de point_id colidindo entre coleções distintas — improvável dado
+    o uuid5 determinístico por source_file, mas não impossível) um backfill
+    com conteúdo de outro tenant. Propagar `resolved_config` até aqui
+    fecha esse último ponto do pipeline de retrieval que ainda dependia de
+    `settings.qdrant_collection_for`.
     """
     missing_sources = {
         chunk.source_file
@@ -1095,7 +1439,7 @@ async def _backfill_raw_content(
 
     try:
         points = await qdrant.retrieve(
-            collection_name=settings.qdrant_collection_for(domain_id),
+            collection_name=_resolve_qdrant_collection_name(domain_id, resolved_config),
             ids=point_ids,
             with_payload=["source_file", "raw_content"],
         )
@@ -1231,13 +1575,27 @@ def _format_context(chunks: list, domain_id: str) -> str:
     return "\n\n".join(parts)
 
 
-def _build_augmented_message(user_question: str, context: str) -> str:
+def _build_augmented_message(user_question: str, context: str, domain_id: str) -> str:
     """
     Monta a mensagem do usuário com o contexto RAG injetado.
     O contexto é apresentado antes da pergunta para maximizar a atenção do LLM.
+
+    CORREÇÃO (ALTO — label hardcoded para UE5): o cabeçalho da seção de
+    contexto era sempre "## Contexto da Documentação UE5", independente do
+    domain_id resolvido para a requisição — o único ponto deste módulo que
+    não seguia o padrão já aplicado em PromptFactory (system_prompt,
+    decomposition_prompt, code_fence) e em domain_registry (coleção Qdrant,
+    regex de tokenização). Toda requisição Godot 4 injetava esse texto
+    literal no prompt do LLM, o que (a) rotulava incorretamente o contexto
+    e (b) podia enviesar o modelo em direção a terminologia/APIs de UE5 ao
+    responder perguntas sobre Godot — indo diretamente contra a REGRA 4 do
+    GODOT4_SYSTEM_PROMPT ("use accurate Godot 4 terminology"). Agora resolve
+    `display_name` do profile ativo via domain_registry, mesmo padrão usado
+    no restante do arquivo.
     """
+    profile = domain_registry.get(domain_id)
     return (
-        f"## Contexto da Documentação UE5\n\n"
+        f"## Contexto da Documentação — {profile.display_name}\n\n"
         f"{context}\n\n"
         f"---\n\n"
         f"## Pergunta\n\n"
@@ -1416,6 +1774,7 @@ async def _run_advanced_retrieval(
     top_k: int,
     domain_id: str,
     project_source_filter: str | None = None,
+    resolved_config: ResolvedCollectionConfig | None = None,
 ) -> list[RetrievedChunk]:
     """
     Executa as fases de Decomposição + Busca Expandida + Deduplicação + Reranking.
@@ -1429,6 +1788,15 @@ async def _run_advanced_retrieval(
         - Os embeddings das sub-queries rodam em paralelo entre si após
           a decomposição retornar.
 
+    MULTI-TENANT: `resolved_config`, quando fornecido, é o objeto que
+    carrega TODOS os overrides de tenant/coleção resolvidos pelo endpoint
+    (ver chat.py) — esta função é a orquestradora principal e apenas
+    REPASSA `resolved_config` para cada fase (decompose_query,
+    _embed_and_retrieve → retrieve_chunks_for_query, rerank_with_flashrank)
+    e o usa diretamente para os dois parâmetros que pertencem a este nível
+    de orquestração (retrieval_limit, min_score). Nenhuma lógica de
+    resolução de config vive aqui — só propagação.
+
     Args:
         user_question: Pergunta original do usuário.
         qdrant: Cliente Qdrant assíncrono.
@@ -1436,16 +1804,20 @@ async def _run_advanced_retrieval(
         project_source_filter: Se informado, restringe TODAS as buscas
             (tradução + sub-queries) a essa procedência — propagado desde
             ChatRequest.project_source_filter (Correção 1).
+        resolved_config: Configuração de tenant/coleção já resolvida pelo
+            endpoint, ou None se nenhum tenant foi resolvido para esta
+            requisição — nesse caso todo o pipeline usa settings global
+            (comportamento idêntico ao pré-integração multi-tenant).
 
     Returns:
         Lista de RetrievedChunk reranqueados, limitada ao top_k e filtrada
-        pelo piso de qualidade pós-reranking (ver settings.rag_rerank_min_score).
+        pelo piso de qualidade pós-reranking (rag_rerank_min_score, via
+        resolved_config ou settings — ver _rag_setting).
         Pode estar vazia se o Qdrant não retornar resultados.
     """
-    # Lê o limite de busca expandida das settings (override sem recompilação)
-    retrieval_limit = getattr(
-        settings, "rag_retrieval_limit_per_query", _RETRIEVAL_LIMIT_PER_QUERY
-    )
+    # Lê o limite de busca expandida — tenant/coleção > settings > constante
+    # local (ver _rag_setting).
+    retrieval_limit = _rag_setting(resolved_config, "retrieval_limit_per_query", "rag_retrieval_limit_per_query", _RETRIEVAL_LIMIT_PER_QUERY)
 
     # === FASE 1 — Decomposição/Tradução ===
     # CORREÇÃO CRÍTICA: anteriormente esta fase disparava embed_text(user_question)
@@ -1461,7 +1833,7 @@ async def _run_advanced_retrieval(
     # de embedding, mas eliminamos a busca cross-lingual garantida em toda requisição.
     log.info("Advanced RAG: traduzindo e decompondo a query...")
 
-    decomposed = await decompose_query(user_question, domain_id=domain_id)
+    decomposed = await decompose_query(user_question, domain_id=domain_id, resolved_config=resolved_config)
     translated_query = decomposed.translated_query
     sub_queries = decomposed.sub_queries
     keywords_exact = decomposed.keywords_exact
@@ -1479,6 +1851,8 @@ async def _run_advanced_retrieval(
     # As mesmas keywords_exact (extraídas uma vez para a pergunta inteira)
     # são propagadas a TODAS as buscas paralelas — ativam o canal esparso
     # da busca híbrida em cada uma (ver retrieve_chunks_for_query).
+    # `resolved_config` também é propagado idêntico a todas — a config de
+    # tenant/coleção não muda entre sub-queries da MESMA requisição.
     retrieval_tasks: list[asyncio.Task] = [
         asyncio.create_task(
             _embed_and_retrieve(
@@ -1488,6 +1862,7 @@ async def _run_advanced_retrieval(
                 domain_id=domain_id,
                 project_source_filter=project_source_filter,
                 keywords_exact=keywords_exact,
+                resolved_config=resolved_config,
             )
         )
     ]
@@ -1502,6 +1877,7 @@ async def _run_advanced_retrieval(
                     domain_id=domain_id,
                     project_source_filter=project_source_filter,
                     keywords_exact=keywords_exact,
+                    resolved_config=resolved_config,
                 )
             )
         )
@@ -1559,7 +1935,11 @@ async def _run_advanced_retrieval(
     # próximo de zero e não reflete relevância real, e a reordenação que o
     # Cross-Encoder aplica também perde valor. Usar `translated_query` (já
     # disponível neste escopo, calculado na Fase 1 acima) resolve o mismatch.
-    reranked = await rerank_with_flashrank(unique_chunks, translated_query)
+    #
+    # `resolved_config` propagado aqui também: decide se o reranking roda
+    # (reranker_enabled) e com qual modelo (reranker_model) — ver
+    # rerank_with_flashrank.
+    reranked = await rerank_with_flashrank(unique_chunks, translated_query, resolved_config=resolved_config)
 
     # === FASE 2.4 — Piso de Qualidade Pós-Reranking (Correção 2) ===
     # CORREÇÃO (ALTO — ausência de piso de qualidade pós-reranking): antes,
@@ -1568,11 +1948,20 @@ async def _run_advanced_retrieval(
     # retrieval expandido trouxesse só ruído (nenhum chunk genuinamente
     # relevante para a pergunta), o pipeline injetava esse ruído no prompt
     # do LLM do mesmo jeito, só porque havia "espaço" no top_k. Agora
-    # aplicamos um piso de qualidade (settings.rag_rerank_min_score) ANTES
-    # de recortar por top_k — reranked já vem ordenado do maior para o
-    # menor score (ver rerank_with_flashrank), então filtrar preserva a
-    # ordem dos sobreviventes.
-    min_score = getattr(settings, "rag_rerank_min_score", 0.0)
+    # aplicamos um piso de qualidade ANTES de recortar por top_k —
+    # reranked já vem ordenado do maior para o menor score (ver
+    # rerank_with_flashrank), então filtrar preserva a ordem dos
+    # sobreviventes.
+    #
+    # MULTI-TENANT: min_score agora vem de resolved_config.rag.rerank_min_score
+    # quando um tenant foi resolvido — ver docstring de RAGConfig.rerank_min_score
+    # em app/schemas/tenant.py sobre a diferença de escala entre esse valor
+    # (score do cross-encoder do FlashRank) e score_threshold (cosine
+    # similarity, usado só no fallback naive) — um tenant configurando este
+    # campo copiando a intuição de score_threshold pode, sem querer, zerar
+    # todos os chunks pós-reranking (mitigado abaixo pelo fallback "mantém
+    # o melhor candidato mesmo sem atingir o piso").
+    min_score = _rag_setting(resolved_config, "rerank_min_score", "rag_rerank_min_score", 0.0)
     if min_score is None:
         min_score = 0.0
 
@@ -1589,7 +1978,7 @@ async def _run_advanced_retrieval(
         # com algo concreto na mão.
         log.warning(
             "Nenhum chunk atingiu o piso de qualidade pós-reranking "
-            "(rag_rerank_min_score=%.4f, melhor score=%.4f). Mantendo "
+            "(rerank_min_score=%.4f, melhor score=%.4f). Mantendo "
             "apenas o chunk de maior score para não deixar o prompt sem "
             "contexto algum.",
             min_score,
@@ -1618,6 +2007,7 @@ async def _embed_and_retrieve(
     domain_id: str,
     project_source_filter: str | None = None,
     keywords_exact: list[str] | None = None,
+    resolved_config: ResolvedCollectionConfig | None = None,
 ) -> list[RetrievedChunk]:
     """
     Função helper: gera embedding de uma query e busca no Qdrant.
@@ -1627,6 +2017,13 @@ async def _embed_and_retrieve(
     (não propaga a exceção — falhas individuais de sub-queries não devem
     derrubar o pipeline inteiro).
 
+    NOTA: `embed_text(query)` continua sem receber `resolved_config` — a
+    dimensão/modelo de embedding (`ResolvedEmbeddingConfig`) é resolvida
+    separadamente e NÃO foi integrada nesta correção (ver relatório —
+    escopo desta rodada foi limitado a `ResolvedRAGConfig` e ao nome da
+    coleção Qdrant, não a `ResolvedEmbeddingConfig`). Ver seção "O que
+    fica pendente" do relatório para o motivo dessa fronteira de escopo.
+
     Args:
         query: Texto da sub-query.
         qdrant: Cliente Qdrant assíncrono.
@@ -1635,6 +2032,9 @@ async def _embed_and_retrieve(
             restringe a busca por procedência quando informado (Correção 1).
         keywords_exact: Repassado para retrieve_chunks_for_query — ativa o
             canal esparso da busca híbrida quando presente.
+        resolved_config: Configuração de tenant/coleção já resolvida,
+            repassada para retrieve_chunks_for_query (coleção Qdrant
+            correta + kill-switch de busca híbrida).
 
     Returns:
         Lista de RetrievedChunk, ou lista vazia em caso de falha.
@@ -1648,6 +2048,7 @@ async def _embed_and_retrieve(
             domain_id=domain_id,
             project_source_filter=project_source_filter,
             keywords_exact=keywords_exact,
+            resolved_config=resolved_config,
         )
     except Exception as exc:
         log.warning("Falha ao processar sub-query '%s': %s", query[:60], exc)
@@ -1662,6 +2063,7 @@ async def run_rag_pipeline(
     request: ChatRequest,
     qdrant: AsyncQdrantClient,
     redis: Redis,
+    resolved_config: ResolvedCollectionConfig | None = None,
 ) -> ChatResponse:
     """
     Executa o Advanced RAG Pipeline completo para uma requisição de chat.
@@ -1681,10 +2083,43 @@ async def run_rag_pipeline(
         transparente para o RAG ingênuo original (embedding direto + busca simples).
         O usuário nunca vê um HTTP 500 por falha do pipeline avançado.
 
+    INTEGRAÇÃO MULTI-TENANT — LEIA COM ATENÇÃO (ver também o bloco de
+    comentário no topo do módulo, logo após os imports):
+
+    `resolved_config` é o ÚNICO ponto de entrada da config de tenant/coleção
+    neste módulo inteiro. Esta função NUNCA resolve tenant sozinha — não
+    importa `AsyncSession`, não importa `TenantConfigService`, não toca o
+    Postgres. Por design: `rag_service.py` deve continuar puro em relação a
+    infraestrutura de tenant, para (a) não duplicar a lógica de cache
+    (L1 processo + L2 Redis) que já vive em `tenant_config_service.py` e
+    (b) manter esta função testável sem precisar de uma sessão de DB mockada
+    toda vez que se quer testar só a lógica de retrieval/reranking.
+
+    QUEM RESOLVE `resolved_config`, ENTÃO? O endpoint
+    (`app/api/v1/endpoints/chat.py`), ANTES de chamar esta função — via
+    `TenantConfigService.resolve_collection_config(db, tenant_id,
+    collection_name)` (usa `ChatRequest.collection_name`, se houver) ou
+    `resolve_default_collection_for_domain(db, tenant_id, domain_id)`
+    (quando só o domínio é conhecido). Ver a implementação atualizada de
+    `chat.py` para o padrão exato — a ideia central é: resolver 1x no
+    início do handler, propagar já resolvido para cá.
+
+    QUANDO `resolved_config` VEM COMO None (o caso comum em desenvolvimento
+    single-tenant, com foco em Godot 4 — PRIORIDADE ATUAL): TODO parâmetro
+    de RAG cai para `settings.rag_*` (global, idêntico ao comportamento
+    pré-integração) via `_rag_setting`, e a coleção Qdrant cai para
+    `settings.qdrant_collection_for(domain_id)` via
+    `_resolve_qdrant_collection_name`. Ou seja: rodar sem `resolved_config`
+    é um modo de operação totalmente suportado e é o caminho que este app,
+    hoje, deve exercitar continuamente — não um caminho degradado.
+
     Args:
         request: Dados validados da requisição (ChatRequest).
         qdrant: Cliente Qdrant injetado via Depends.
         redis: Cliente Redis injetado via Depends.
+        resolved_config: Configuração de tenant/coleção já resolvida pelo
+            endpoint (ver acima), ou None se nenhum tenant foi resolvido
+            para esta requisição (settings global — comportamento legado).
 
     Returns:
         ChatResponse com resposta, chunks usados e tokens consumidos.
@@ -1696,11 +2131,24 @@ async def run_rag_pipeline(
     # ser adicionado ao schema ChatRequest (ver PATCH_NOTES.md) — até lá,
     # `getattr` com fallback para `settings.active_domain` mantém este
     # arquivo funcional mesmo antes da migração do schema.
-    domain_id = getattr(request, "domain_id", None) or settings.active_domain
+    #
+    # MULTI-TENANT: quando `resolved_config` está disponível, ele já traz
+    # `domain_id` correto (resolvido a partir da Collection no Postgres —
+    # ver ResolvedCollectionConfig.domain_id em tenant_config_service.py),
+    # e é PREFERIDO sobre `request.domain_id`/`settings.active_domain`: é a
+    # fonte da verdade de qual domínio pertence à coleção do tenant, mais
+    # confiável que um domain_id solto vindo do client. Se `resolved_config`
+    # for None, o comportamento é idêntico ao pré-integração.
+    domain_id = (
+        resolved_config.domain_id
+        if resolved_config is not None
+        else (getattr(request, "domain_id", None) or settings.active_domain)
+    )
 
     log.info(
-        "Advanced RAG pipeline | domain=%s session=%s model=%s top_k=%d",
+        "Advanced RAG pipeline | domain=%s tenant=%s session=%s model=%s top_k=%d",
         domain_id,
+        resolved_config.tenant_slug if resolved_config is not None else "(nenhum — settings global)",
         request.session_id,
         request.model,
         request.top_k,
@@ -1713,6 +2161,18 @@ async def run_rag_pipeline(
     # request.top_k para qualquer valor (min(x, 8) <= x, logo max(x, algo <= x)
     # == x) — o floor de 8 nunca era aplicado na prática. Se o cliente pedisse
     # top_k=1 ou 2, o Advanced RAG rodava com esse valor raquítico mesmo.
+    #
+    # NOTA MULTI-TENANT: `request.top_k` continua sendo a fonte usada aqui
+    # (preferência explícita do CLIENTE nesta requisição específica), não
+    # `resolved_config.rag.top_k` (default do TENANT). Isso é intencional —
+    # `ResolvedRAGConfig.top_k` é o valor a usar quando o client NÃO
+    # especificar um top_k explícito. Como `ChatRequest.top_k` hoje não é
+    # Optional (é obrigatório com default fixo no schema, pelo que se pode
+    # inferir do uso em chat.py), não há como distinguir "cliente pediu
+    # exatamente este valor" de "cliente não informou, ficou no default do
+    # schema" neste snapshot — ver PENDÊNCIA no relatório sobre tornar
+    # `ChatRequest.top_k` Optional para permitir essa distinção e então
+    # preencher o default a partir de `resolved_config.rag.top_k` aqui.
     effective_top_k = max(request.top_k, 8)
 
     # Correção 1: propaga o filtro de procedência (Engine nativa vs projeto
@@ -1734,6 +2194,7 @@ async def run_rag_pipeline(
             top_k=effective_top_k,
             domain_id=domain_id,
             project_source_filter=project_source_filter,
+            resolved_config=resolved_config,
         )
 
     except Exception as exc:
@@ -1770,6 +2231,7 @@ async def run_rag_pipeline(
                 effective_top_k,
                 domain_id=domain_id,
                 project_source_filter=project_source_filter,
+                resolved_config=resolved_config,
             )
         except RuntimeError as naive_exc:
             log.error("Naive RAG fallback também falhou: %s", naive_exc)
@@ -1792,16 +2254,28 @@ async def run_rag_pipeline(
         # antes de montar o contexto — ver _backfill_raw_content. Não
         # bloqueante: se falhar, os chunks seguem sem a seção B) como já
         # acontecia antes desta correção.
-        chunks = await _backfill_raw_content(qdrant, chunks, domain_id=domain_id)
+        chunks = await _backfill_raw_content(qdrant, chunks, domain_id=domain_id, resolved_config=resolved_config)
 
     # =========================================================================
     # AUGMENTAÇÃO + GERAÇÃO
     # =========================================================================
 
     context = _format_context(chunks, domain_id=domain_id)
-    augmented_user_message = _build_augmented_message(request.message, context)
+    augmented_user_message = _build_augmented_message(request.message, context, domain_id=domain_id)
 
-    system_prompt = PromptFactory.get_prompts(domain_id).system_prompt
+    # MULTI-TENANT: `resolved_config.system_prompt` já contempla a cadeia de
+    # fallback "override de coleção (CollectionConfig.system_prompt_override)
+    # > default do domínio (BaseDomainProfile.system_prompt)" — ver
+    # `TenantConfigService._build_resolved_config`. Isso é estritamente mais
+    # correto que `PromptFactory.get_prompts(domain_id).system_prompt`, que
+    # SEMPRE ignora qualquer override de tenant, mesmo que um exista
+    # cadastrado no Postgres. Quando `resolved_config` é None, o
+    # comportamento cai para PromptFactory — idêntico ao pré-integração.
+    system_prompt = (
+        resolved_config.system_prompt
+        if resolved_config is not None
+        else PromptFactory.get_prompts(domain_id).system_prompt
+    )
 
     messages = await build_messages_for_llm(
         redis=redis,
@@ -1926,6 +2400,7 @@ async def run_rag_pipeline_stream(
     request: ChatRequest,
     qdrant: AsyncQdrantClient,
     redis: Redis,
+    resolved_config: ResolvedCollectionConfig | None = None,
 ):
     """
     Versão streaming de run_rag_pipeline(). Mesma Fase 1 (decomposição) +
@@ -1943,14 +2418,37 @@ async def run_rag_pipeline_stream(
     o retrieval já deu certo — nesse caso levanta RuntimeError normalmente
     (igual run_rag_pipeline), e quem trata isso é o endpoint (persiste como
     mensagem de erro e emite {"type": "error", ...} via SSE).
+
+    INTEGRAÇÃO MULTI-TENANT: espelha EXATAMENTE a mesma integração de
+    `run_rag_pipeline` — ver a docstring completa lá para a explicação de
+    por que `resolved_config` é resolvido pelo endpoint (não aqui), o que
+    acontece quando é None, e por que `resolved_config.domain_id` tem
+    prioridade sobre `request.domain_id` quando disponível. Esta função é
+    deliberadamente mantida em paralelo estrutural com a versão síncrona —
+    qualquer mudança na integração multi-tenant de uma deve ser replicada
+    na outra.
+
+    Args:
+        request: Dados validados da requisição (ChatRequest).
+        qdrant: Cliente Qdrant injetado via Depends.
+        redis: Cliente Redis injetado via Depends.
+        resolved_config: Configuração de tenant/coleção já resolvida pelo
+            endpoint, ou None se nenhum tenant foi resolvido (settings
+            global — comportamento legado, ver run_rag_pipeline).
     """
     # CORREÇÃO (CRÍTICO — domain_id ausente): mesma resolução usada em
-    # run_rag_pipeline — ver comentário lá para o motivo do getattr/fallback.
-    domain_id = getattr(request, "domain_id", None) or settings.active_domain
+    # run_rag_pipeline — ver comentário lá para o motivo do getattr/fallback
+    # e para por que resolved_config.domain_id tem prioridade quando existe.
+    domain_id = (
+        resolved_config.domain_id
+        if resolved_config is not None
+        else (getattr(request, "domain_id", None) or settings.active_domain)
+    )
 
     log.info(
-        "Advanced RAG pipeline (stream) | domain=%s session=%s model=%s top_k=%d",
+        "Advanced RAG pipeline (stream) | domain=%s tenant=%s session=%s model=%s top_k=%d",
         domain_id,
+        resolved_config.tenant_slug if resolved_config is not None else "(nenhum — settings global)",
         request.session_id,
         request.model,
         request.top_k,
@@ -1972,6 +2470,7 @@ async def run_rag_pipeline_stream(
             top_k=effective_top_k,
             domain_id=domain_id,
             project_source_filter=project_source_filter,
+            resolved_config=resolved_config,
         )
     except Exception as exc:
         log.warning(
@@ -1988,6 +2487,7 @@ async def run_rag_pipeline_stream(
                 effective_top_k,
                 domain_id=domain_id,
                 project_source_filter=project_source_filter,
+                resolved_config=resolved_config,
             )
         except RuntimeError as naive_exc:
             log.error("Naive RAG fallback (stream) também falhou: %s", naive_exc)
@@ -1996,7 +2496,7 @@ async def run_rag_pipeline_stream(
     log.info("Retrieval (stream) concluído | pipeline=%s chunks=%d", pipeline_used, len(chunks))
  
     if chunks:
-        chunks = await _backfill_raw_content(qdrant, chunks, domain_id=domain_id)
+        chunks = await _backfill_raw_content(qdrant, chunks, domain_id=domain_id, resolved_config=resolved_config)
  
     yield {"type": "sources", "retrieved_chunks": chunks}
  
@@ -2004,9 +2504,15 @@ async def run_rag_pipeline_stream(
     # FASE 3 — geração via streaming
     # -------------------------------------------------------------------
     context = _format_context(chunks, domain_id=domain_id)
-    augmented_user_message = _build_augmented_message(request.message, context)
+    augmented_user_message = _build_augmented_message(request.message, context, domain_id=domain_id)
  
-    system_prompt = PromptFactory.get_prompts(domain_id).system_prompt
+    # MULTI-TENANT: mesma lógica de run_rag_pipeline — resolved_config.system_prompt
+    # já contempla override de coleção > default do domínio; ver lá para detalhes.
+    system_prompt = (
+        resolved_config.system_prompt
+        if resolved_config is not None
+        else PromptFactory.get_prompts(domain_id).system_prompt
+    )
 
     messages = await build_messages_for_llm(
         redis=redis,
