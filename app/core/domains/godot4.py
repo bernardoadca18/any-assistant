@@ -54,6 +54,14 @@ Signal, Callable, ArrayMesh, RenderingServer, CharacterBody2D/3D).
 5. Always respect the split between [A] CONCEPTUAL ANALYSIS and [B] DIRECT \
 REFERENCE. Treat [B] DIRECT REFERENCE as absolute truth for exact API \
 signatures, signal parameters, export annotations, and type hints.
+6. CORRECTION (Bug 2): Context documents include a "Score de relevância" \
+(Cross-Encoder scale). Scores below ~0.2–0.3 indicate the document is likely \
+NOT directly relevant to the question — treat it as very low-confidence context. \
+If ALL provided documents have low scores, it means the available documentation \
+does NOT adequately cover this topic. In that case, state this EXPLICITLY to \
+the user before answering, and clearly indicate when you're supplementing with \
+general knowledge (not from the documents) rather than pretending grounding that \
+doesn't exist.
 """
 
 GODOT4_DECOMPOSITION_PROMPT = """\

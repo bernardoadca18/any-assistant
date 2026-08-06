@@ -273,19 +273,31 @@ class Settings(BaseSettings):
         description="Diretório para cache dos modelos FlashRank (ONNX).",
     )
     rag_rerank_min_score: float = Field(
-        default=0.0,
+        default=0.2,
         description=(
             "Piso de qualidade aplicado à lista já reordenada pelo FlashRank "
             "(rag_service.py::_run_advanced_retrieval). Chunks com score de "
             "Cross-Encoder abaixo deste valor são descartados antes de ir "
             "para o prompt do LLM, mesmo que estejam dentro do top_k — evita "
             "injetar ruído quando o retrieval expandido não traz nada "
-            "realmente relevante. O default 0.0 é seguro (equivale a nenhum "
-            "filtro, já que o score do Cross-Encoder do FlashRank não é "
-            "negativo na prática) — ajuste para um valor positivo (ex: 0.1) "
-            "para de fato descartar candidatos fracos. Sempre mantém ao "
+            "realmente relevante. CALIBRAÇÃO EMPÍRICA: 0.2 foi determinado a partir "
+            "de ~12 testes manuais cobrindo perguntas de alta cobertura (scores 0.41-0.998) "
+            "e perguntas de ruído (scores 0.026-0.19), mostrando clara separação entre "
+            "contexto legítimo e irrelevante. Valor é PONTO DE PARTIDA, não definitivo — "
+            "deve ser reavaliado com mais dados de uso real. Sempre mantém ao "
             "menos 1 chunk (o de maior score) mesmo se todos caírem abaixo "
             "do threshold, para não quebrar o prompt do RAG."
+        ),
+    )
+    rag_max_output_tokens: int = Field(
+        default=4096,
+        description=(
+            "CORREÇÃO (Bug 1): Limite máximo de tokens na resposta gerada pelo LLM. "
+            "Calibrado empiricamente a partir de ~12 testes manuais: perguntas de API pontual "
+            "funcionam bem com 2048, mas perguntas de guia/arquitetura frequentemente ultrapassam "
+            "esse limite e raramente passam de ~3500-4000 tokens. Valor é PONTO DE PARTIDA, "
+            "não definitivo — pode ser sobrescrito por tenant/coleção via ResolvedRAGConfig. "
+            "Visibilidade de truncamento disponível via finish_reason no ChatResponse."
         ),
     )
 

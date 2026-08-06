@@ -236,14 +236,24 @@ async def chat(
     # mensagem do usuário ANTES de gerar a resposta — assim, mesmo que a
     # geração falhe, a pergunta do usuário não se perde.
     session = await session_service.get_or_create_session(
-        db,
-        request.session_id,
+        db=db,
+        session_id=request.session_id,
+        tenant_id=request.tenant_id,
+        domain_id=request.domain_id,
         default_model=request.model,
         default_top_k=request.top_k,
         project_source_filter=request.project_source_filter,
     )
     await session_service.touch_session_title_if_needed(db, session, request.message)
-    await session_service.append_user_message(db, session.id, request.message, request.model_dump())
+    
+    await session_service.append_user_message(
+        db=db,
+        session_id=session.id,
+        content=request.message,
+        domain_id=request.domain_id,
+        request_payload=request.model_dump(mode="json"),
+    )
+    
     await db.commit()
 
     # MULTI-TENANT: resolvido UMA ÚNICA VEZ aqui, antes de decidir entre
@@ -318,13 +328,14 @@ async def _sync_chat_response(
         db,
         session_id,
         content=result.answer,
+        domain_id=request.domain_id,  # <-- Faltava este parâmetro
         status="success",
         error_detail=None,
         model_used=result.model_used,
         prompt_tokens=result.prompt_tokens,
         completion_tokens=result.completion_tokens,
         retrieved_chunks=result.retrieved_chunks,
-        request_payload=request.model_dump(),
+        request_payload=request.model_dump(mode="json"),
     )
     await db.commit()
 
@@ -380,6 +391,7 @@ async def _stream_chat_response(
                 final_model_used = event.get("model_used", final_model_used)
                 final_prompt_tokens = event.get("prompt_tokens")
                 final_completion_tokens = event.get("completion_tokens")
+                final_finish_reason = event.get("finish_reason")
                 yield _sse(
                     {
                         "type": "done",
@@ -387,6 +399,7 @@ async def _stream_chat_response(
                         "model_used": final_model_used,
                         "prompt_tokens": final_prompt_tokens,
                         "completion_tokens": final_completion_tokens,
+                        "finish_reason": final_finish_reason,
                         "created_at": _utcnow_iso(),
                     }
                 )
@@ -397,13 +410,14 @@ async def _stream_chat_response(
             db,
             session_id,
             content=full_answer,
+            domain_id=request.domain_id,
             status="success",
             error_detail=None,
             model_used=final_model_used,
             prompt_tokens=final_prompt_tokens,
             completion_tokens=final_completion_tokens,
             retrieved_chunks=final_chunks,
-            request_payload=request.model_dump(),
+            request_payload=request.model_dump(mode="json"),
         )
         await db.commit()
 

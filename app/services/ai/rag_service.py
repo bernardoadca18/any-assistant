@@ -1731,11 +1731,17 @@ async def call_litellm(
             de retry) ou resposta malformada.
     """
     client = _get_litellm_client()
+
+    # CORREÇÃO (Bug 1): max_tokens agora é configurável via cascata:
+    # resolved_config.rag.max_output_tokens > settings.rag_max_output_tokens > default 4096
+    # Calibrado empiricamente a partir de ~12 testes manuais (ver config.py para detalhes).
+    max_tokens = _rag_setting(resolved_config, "max_output_tokens", "rag_max_output_tokens", 4096)
+
     payload = {
         "model": model,
         "messages": messages,
         "temperature": 0.2,       # baixo para respostas factuais/técnicas
-        "max_tokens": 2048,
+        "max_tokens": max_tokens,
     }
 
     try:
@@ -1760,8 +1766,11 @@ async def call_litellm(
             f"Resposta do LiteLLM em formato inesperado: {data}"
         ) from exc
 
+    # CORREÇÃO (Bug 1): Extrair finish_reason para detectar truncamento
+    finish_reason = data["choices"][0].get("finish_reason") if data.get("choices") else None
+
     usage = data.get("usage", {})
-    return answer, usage.get("prompt_tokens"), usage.get("completion_tokens")
+    return answer, usage.get("prompt_tokens"), usage.get("completion_tokens"), finish_reason
 
 
 # ---------------------------------------------------------------------------
@@ -2285,9 +2294,10 @@ async def run_rag_pipeline(
     )
 
     try:
-        answer, prompt_tokens, completion_tokens = await call_litellm(
+        answer, prompt_tokens, completion_tokens, finish_reason = await call_litellm(
             messages=messages,
             model=request.model,
+            resolved_config=resolved_config,
         )
     except RuntimeError as exc:
         log.error("Falha ao chamar LiteLLM: %s", exc)
@@ -2322,12 +2332,14 @@ async def run_rag_pipeline(
         retrieved_chunks=chunks,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        finish_reason=finish_reason,
     )
     
 
 async def call_litellm_stream(
     messages: list[dict],
     model: str,
+    resolved_config: "ResolvedCollectionConfig | None" = None,
 ):
     """
     Chama o LiteLLM em modo streaming (SSE, formato OpenAI-compatible) e
@@ -2346,11 +2358,17 @@ async def call_litellm_stream(
             já começou a chegar, para não duplicar tokens já emitidos).
     """
     client = _get_litellm_client()
+
+    # CORREÇÃO (Bug 1): max_tokens agora é configurável via cascata:
+    # resolved_config.rag.max_output_tokens > settings.rag_max_output_tokens > default 4096
+    # Calibrado empiricamente a partir de ~12 testes manuais (ver config.py para detalhes).
+    max_tokens = _rag_setting(resolved_config, "max_output_tokens", "rag_max_output_tokens", 4096)
+
     payload = {
         "model": model,
         "messages": messages,
         "temperature": 0.2,
-        "max_tokens": 2048,
+        "max_tokens": max_tokens,
         "stream": True,
         "stream_options": {"include_usage": True},  # OpenAI-compatible; ignorado se o backend não suportar
     }
@@ -2360,30 +2378,35 @@ async def call_litellm_stream(
             response.raise_for_status()
  
             usage: dict = {}
+            finish_reason: str | None = None
             async for line in response.aiter_lines():
                 if not line or not line.startswith("data:"):
                     continue
                 data_str = line.removeprefix("data:").strip()
                 if data_str == "[DONE]":
                     break
- 
+
                 try:
                     chunk = _json.loads(data_str)
                 except _json.JSONDecodeError:
                     log.warning("Chunk SSE não-JSON ignorado do LiteLLM: %r", data_str[:200])
                     continue
- 
+
                 choices = chunk.get("choices") or []
                 if choices:
                     delta = choices[0].get("delta", {})
                     content = delta.get("content")
                     if content:
                         yield content
- 
+                    # CORREÇÃO (Bug 1): Extrair finish_reason do último chunk
+                    if choices[0].get("finish_reason"):
+                        finish_reason = choices[0].get("finish_reason")
+
                 if chunk.get("usage"):
                     usage = chunk["usage"]
- 
+
             call_litellm_stream.last_usage = usage  # type: ignore[attr-defined]
+            call_litellm_stream.last_finish_reason = finish_reason  # type: ignore[attr-defined]
  
     except httpx.HTTPStatusError as exc:
         raise RuntimeError(
@@ -2522,12 +2545,13 @@ async def run_rag_pipeline_stream(
     )
  
     full_answer_parts: list[str] = []
-    async for token in call_litellm_stream(messages=messages, model=request.model):
+    async for token in call_litellm_stream(messages=messages, model=request.model, resolved_config=resolved_config):
         full_answer_parts.append(token)
         yield {"type": "token", "content": token}
- 
+
     full_answer = "".join(full_answer_parts)
     usage = getattr(call_litellm_stream, "last_usage", {}) or {}
+    finish_reason = getattr(call_litellm_stream, "last_finish_reason", None)
  
     # -------------------------------------------------------------------
     # PERSISTÊNCIA — mesmo save_turn do caminho síncrono (Redis, contexto
@@ -2556,4 +2580,5 @@ async def run_rag_pipeline_stream(
         "model_used": request.model,
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
+        "finish_reason": finish_reason,
     }

@@ -149,7 +149,10 @@ CREATE TABLE IF NOT EXISTS rag_configs (
     reranker_enabled            BOOLEAN NOT NULL DEFAULT TRUE,
     reranker_model              VARCHAR(128) NOT NULL DEFAULT 'ms-marco-MiniLM-L-12-v2',
     reranker_cache_dir          VARCHAR(256) NOT NULL DEFAULT '/tmp/flashrank_cache',
-    rerank_min_score            REAL NOT NULL DEFAULT 0.0,
+    rerank_min_score            REAL NOT NULL DEFAULT 0.2,  -- CORREÇÃO (Bug 2): Calibrado empiricamente a partir de ~12 testes. Ver rag_service.py para detalhes.
+
+    -- LLM Generation Limits
+    max_output_tokens           INTEGER NOT NULL DEFAULT 4096,  -- CORREÇÃO (Bug 1): Limite de tokens na resposta. Calibrado empiricamente (respostas de guia frequentemente ultrapassam 2048 mas raramente passam de ~3500-4000).
 
     -- Custom system prompt override (NULL = use domain default)
     system_prompt               TEXT,

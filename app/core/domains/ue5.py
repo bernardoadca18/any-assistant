@@ -38,7 +38,15 @@ POR QUE algo é usado, mas trate a Referência Direta como a fonte \
 soberana e absoluta sempre que houver qualquer divergência sobre \
 assinaturas exatas de função, tipos de dado, nomes de propriedades \
 (UPROPERTY/UFUNCTION) ou parâmetros — nunca corrija ou substitua o que \
-está na Referência Direta com base na Análise Semântica.\
+está na Referência Direta com base na Análise Semântica.
+9. CORREÇÃO (Bug 2): Os documentos de contexto trazem um "Score de relevância" \
+(escala do Cross-Encoder). Scores abaixo de ~0.2–0.3 indicam que o documento \
+provavelmente NÃO é diretamente relevante para a pergunta — trate-o como \
+contexto de baixíssima confiança. Se TODOS os documentos fornecidos tiverem \
+score baixo, isso significa que a documentação disponível NÃO cobre este tópico \
+adequadamente. Nesse caso, diga isso EXPLICITAMENTE ao usuário antes de responder, \
+e deixe claro quando estiver complementando com conhecimento geral (não vindo dos \
+documentos) em vez de fingir grounding que não existe.\
 """
 
 _DECOMPOSITION_SYSTEM_PROMPT = """\

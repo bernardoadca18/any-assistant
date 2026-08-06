@@ -75,6 +75,7 @@ class ResolvedRAGConfig:
     reranker_model: str
     reranker_cache_dir: str
     rerank_min_score: float
+    max_output_tokens: int
 
 
 @dataclass(frozen=True)
@@ -483,6 +484,7 @@ class TenantConfigService:
                 reranker_model=settings.rag_reranker_model,
                 reranker_cache_dir=settings.rag_reranker_cache_dir,
                 rerank_min_score=settings.rag_rerank_min_score,
+                max_output_tokens=settings.rag_max_output_tokens,
             )
 
         return ResolvedRAGConfig(
@@ -498,6 +500,7 @@ class TenantConfigService:
             reranker_model=config.reranker_model,
             reranker_cache_dir=config.reranker_cache_dir,
             rerank_min_score=config.rerank_min_score,
+            max_output_tokens=config.max_output_tokens,
         )
 
     async def _resolve_ingestion_config(

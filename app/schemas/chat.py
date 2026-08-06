@@ -220,6 +220,15 @@ class ChatResponse(BaseModel):
     )
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    finish_reason: str | None = Field(
+        default=None,
+        description=(
+            "CORREÇÃO (Bug 1): Razão de término da geração. "
+            "'stop' = completou naturalmente, 'length' = truncado por max_tokens, "
+            "'content_filter' = filtrado por política de conteúdo. "
+            "NULL quando indisponível (ex: modelos locais sem suporte)."
+        ),
+    )
     created_at: datetime = Field(default_factory=_utcnow)
 
 
