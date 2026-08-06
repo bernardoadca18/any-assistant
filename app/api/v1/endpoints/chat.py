@@ -64,6 +64,7 @@ outra mudança necessária.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -111,14 +112,34 @@ router = APIRouter()
 # uma troca mecânica — a função `get_tenant_config_service` abaixo é o
 # único ponto que precisaria mudar.
 _tenant_config_service: TenantConfigService | None = None
+_tenant_config_service_lock = asyncio.Lock()
 
 
-def get_tenant_config_service(redis: Redis = Depends(get_redis_client)) -> TenantConfigService:
-    """Dependency FastAPI — retorna o TenantConfigService singleton do processo."""
+async def get_tenant_config_service(redis: Redis = Depends(get_redis_client)) -> TenantConfigService:
+    """
+    Dependency FastAPI — retorna o TenantConfigService singleton do processo.
+
+    CORREÇÃO (asyncio.Lock): proteção contra condição de corrida na inicialização.
+    Sem o lock, duas requisições simultâneas no início do processo poderiam criar
+    duas instâncias de TenantConfigService, cada uma com seu próprio cache L1 vazio
+    — inutilizando o cache de processo e causando race condition no dict interno.
+
+    O padrão espelha exatamente _get_ranker() em rag_service.py (double-checked
+    locking com asyncio.Lock).
+    """
     global _tenant_config_service
-    if _tenant_config_service is None:
-        _tenant_config_service = TenantConfigService(redis)
-    return _tenant_config_service
+
+    # Fast path: já inicializado — não precisa do lock
+    if _tenant_config_service is not None:
+        return _tenant_config_service
+
+    async with _tenant_config_service_lock:
+        # Re-checa dentro do lock: outra requisição pode ter inicializado
+        # enquanto esperávamos
+        if _tenant_config_service is None:
+            _tenant_config_service = TenantConfigService(redis)
+            log.info("TenantConfigService singleton inicializado.")
+        return _tenant_config_service
 
 
 async def _resolve_tenant_config(
