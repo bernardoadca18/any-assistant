@@ -8,7 +8,7 @@
  * Fase 1 pelo App.tsx original com activeTab).
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { AppLayout, type AppView } from '@/components/layout/AppLayout';
 import { ChatWorkspace } from '@/views/ChatWorkspace';
 import { FolderIngestionView } from '@/views/FolderIngestionView';
@@ -18,20 +18,35 @@ import { CollectionManagerView } from '@/views/CollectionManagerView';
 import { CollectionConfigView } from '@/views/CollectionConfigView';
 import { AdminDashboardView } from '@/views/AdminDashboardView';
 import { DevHubView } from '@/views/DevHubView';
+import { DevAuthPanel } from '@/components/DevAuthPanel';
+import { useAppStore } from '@/store/useAppStore';
 
 export default function App() {
   const [activeView, setActiveView] = useState<AppView>('chat');
+  const [showDevAuth, setShowDevAuth] = useState(false);
+  const { isAuthenticated } = useAppStore();
+
+  // Show dev auth panel if not authenticated in dev mode
+  useEffect(() => {
+    const isDev = import.meta.env.DEV;
+    if (isDev && !isAuthenticated) {
+      setShowDevAuth(true);
+    }
+  }, [isAuthenticated]);
 
   return (
-    <AppLayout activeView={activeView} onChangeView={setActiveView}>
-      {activeView === 'chat' && <ChatWorkspace />}
-      {activeView === 'ingestion' && <FolderIngestionView />}
-      {activeView === 'jobs' && <IngestionJobsView />}
-      {activeView === 'tenants' && <TenantManagerView />}
-      {activeView === 'collections' && <CollectionManagerView />}
-      {activeView === 'collection-config' && <CollectionConfigView />}
-      {activeView === 'admin' && <AdminDashboardView />}
-      {activeView === 'devhub' && <DevHubView />}
-    </AppLayout>
+    <>
+      <AppLayout activeView={activeView} onChangeView={setActiveView}>
+        {activeView === 'chat' && <ChatWorkspace />}
+        {activeView === 'ingestion' && <FolderIngestionView />}
+        {activeView === 'jobs' && <IngestionJobsView />}
+        {activeView === 'tenants' && <TenantManagerView />}
+        {activeView === 'collections' && <CollectionManagerView />}
+        {activeView === 'collection-config' && <CollectionConfigView />}
+        {activeView === 'admin' && <AdminDashboardView />}
+        {activeView === 'devhub' && <DevHubView />}
+      </AppLayout>
+      <DevAuthPanel isOpen={showDevAuth} onClose={() => setShowDevAuth(false)} />
+    </>
   );
 }

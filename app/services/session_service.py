@@ -174,7 +174,12 @@ async def get_session_with_messages(
         select(ChatSession)
         .where(ChatSession.id == session_id, ChatSession.tenant_id == tenant_id)
         .options(
-            selectinload(ChatSession.messages).selectinload(ChatMessage.retrieved_chunks)
+            selectinload(ChatSession.messages)
+            .selectinload(ChatMessage.retrieved_chunks)
+            .selectinload(RetrievedChunk.project),
+            selectinload(ChatSession.messages)
+            .selectinload(ChatMessage.retrieved_chunks)
+            .selectinload(RetrievedChunk.doc_type),
         )
     )
     result = await db.execute(stmt)
