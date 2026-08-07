@@ -412,6 +412,23 @@ class Godot4IngestionStrategy:
     def __init__(self, documenter_model: str | None = None) -> None:
         self._documenter_model = documenter_model or settings.ingestion_documenter_model
 
+    @staticmethod
+    def _safe_unpack_llm_response(response: Any) -> tuple[str, dict, bool]:
+        """
+        Desempacota a resposta da LLM de forma defensiva para conter exatamente
+        (summary, metadata, success), ignorando elementos extras se existirem.
+        """
+        if not response:
+            return "", {}, False
+
+        if isinstance(response, (tuple, list)):
+            summary = response[0] if len(response) > 0 and isinstance(response[0], str) else ""
+            metadata = response[1] if len(response) > 1 and isinstance(response[1], dict) else {}
+            success = response[2] if len(response) > 2 and isinstance(response[2], bool) else False
+            return summary, metadata, success
+
+        return "", {}, False
+
     async def discover_files(self, root: Path) -> list[Path]:
         def _walk() -> list[Path]:
             found: list[Path] = []
