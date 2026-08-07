@@ -1713,7 +1713,8 @@ async def _post_chat_completion(
 async def call_litellm(
     messages: list[dict],
     model: str,
-) -> tuple[str, int | None, int | None]:
+    resolved_config: ResolvedCollectionConfig | None = None,
+) -> tuple[str, int | None, int | None, str | None]:
     """
     Chama o LiteLLM proxy com o histórico de mensagens e retorna a resposta.
 

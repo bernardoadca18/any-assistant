@@ -235,11 +235,15 @@ async def chat(
     # Garante a sessão no Postgres (cria na primeira mensagem) e persiste a
     # mensagem do usuário ANTES de gerar a resposta — assim, mesmo que a
     # geração falhe, a pergunta do usuário não se perde.
+    # FALLBACK: se tenant_id não informado, usa o tenant default
+    # (00000000-0000-0000-0000-000000000001) para compatibilidade com dev mode
+    tenant_id = request.tenant_id or uuid.UUID("00000000-0000-0000-0000-000000000001")
+
     session = await session_service.get_or_create_session(
         db=db,
         session_id=request.session_id,
-        tenant_id=request.tenant_id,
-        domain_id=request.domain_id,
+        tenant_id=tenant_id,
+        domain_id=request.domain_id or "godot_4",
         default_model=request.model,
         default_top_k=request.top_k,
         project_source_filter=request.project_source_filter,
@@ -294,6 +298,7 @@ async def _sync_chat_response(
             db,
             session_id,
             content="O assistente está temporariamente indisponível.",
+            domain_id=request.domain_id,
             status="error",
             error_detail=str(exc),
             model_used=None,
@@ -310,6 +315,7 @@ async def _sync_chat_response(
             db,
             session_id,
             content="Erro interno ao processar a busca de documentação.",
+            domain_id=request.domain_id,
             status="error",
             error_detail=str(exc),
             model_used=None,

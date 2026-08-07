@@ -18,21 +18,12 @@ import { CollectionManagerView } from '@/views/CollectionManagerView';
 import { CollectionConfigView } from '@/views/CollectionConfigView';
 import { AdminDashboardView } from '@/views/AdminDashboardView';
 import { DevHubView } from '@/views/DevHubView';
-import { DevAuthPanel } from '@/components/DevAuthPanel';
+import { AuthView } from '@/views/AuthView';
 import { useAppStore } from '@/store/useAppStore';
 
 export default function App() {
-  const [activeView, setActiveView] = useState<AppView>('chat');
-  const [showDevAuth, setShowDevAuth] = useState(false);
+  const [activeView, setActiveView] = useState<AppView>('auth');
   const { isAuthenticated } = useAppStore();
-
-  // Show dev auth panel if not authenticated in dev mode
-  useEffect(() => {
-    const isDev = import.meta.env.DEV;
-    if (isDev && !isAuthenticated) {
-      setShowDevAuth(true);
-    }
-  }, [isAuthenticated]);
 
   return (
     <>
@@ -45,8 +36,8 @@ export default function App() {
         {activeView === 'collection-config' && <CollectionConfigView />}
         {activeView === 'admin' && <AdminDashboardView />}
         {activeView === 'devhub' && <DevHubView />}
+        {activeView === 'auth' && <AuthView />}
       </AppLayout>
-      <DevAuthPanel isOpen={showDevAuth} onClose={() => setShowDevAuth(false)} />
     </>
   );
 }

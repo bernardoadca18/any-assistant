@@ -59,12 +59,16 @@ async def chat(
     session = await session_service.get_or_create_session(
         db,
         request.session_id,
+        tenant_id=request.tenant_id or uuid.UUID("00000000-0000-0000-0000-000000000001"),
         default_model=request.model,
         default_top_k=request.top_k,
         project_source_filter=request.project_source_filter,
+        domain_id=request.domain_id or "godot_4",
     )
     await session_service.touch_session_title_if_needed(db, session, request.message)
-    await session_service.append_user_message(db, session.id, request.message, request.model_dump())
+    await session_service.append_user_message(
+        db, session.id, request.message, request.model_dump(), domain_id=request.domain_id or "godot_4"
+    )
     await db.commit()
 
     if request.stream:
@@ -103,6 +107,7 @@ async def _sync_chat_response(
             completion_tokens=None,
             retrieved_chunks=[],
             request_payload=request.model_dump(),
+            domain_id=request.domain_id or "godot_4",
         )
         await db.commit()
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
@@ -119,6 +124,7 @@ async def _sync_chat_response(
             completion_tokens=None,
             retrieved_chunks=[],
             request_payload=request.model_dump(),
+            domain_id=request.domain_id or "godot_4",
         )
         await db.commit()
         raise HTTPException(
@@ -137,6 +143,7 @@ async def _sync_chat_response(
         completion_tokens=result.completion_tokens,
         retrieved_chunks=result.retrieved_chunks,
         request_payload=request.model_dump(),
+        domain_id=request.domain_id or "godot_4",
     )
     await db.commit()
 
@@ -209,6 +216,7 @@ async def _stream_chat_response(
             completion_tokens=final_completion_tokens,
             retrieved_chunks=final_chunks,
             request_payload=request.model_dump(),
+            domain_id=request.domain_id or "godot_4",
         )
         await db.commit()
 
@@ -228,6 +236,7 @@ async def _stream_chat_response(
             completion_tokens=None,
             retrieved_chunks=final_chunks,
             request_payload=request.model_dump(),
+            domain_id=request.domain_id or "godot_4",
         )
         await db.commit()
 

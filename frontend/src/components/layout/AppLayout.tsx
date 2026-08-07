@@ -43,7 +43,8 @@ export type AppView =
   | 'collections'
   | 'collection-config'
   | 'admin'
-  | 'devhub';
+  | 'devhub'
+  | 'auth';
 
 interface NavItem {
   id: AppView;
@@ -54,6 +55,7 @@ interface NavItem {
 }
 
 const NAV_ITEMS: NavItem[] = [
+  { id: 'auth', label: 'Autenticação', icon: Shield, description: 'Configure suas credenciais de acesso' },
   { id: 'chat', label: 'Chat Workspace', icon: MessageSquare, description: 'Converse com o assistente RAG' },
   { id: 'ingestion', label: 'Ingestão ETL', icon: Boxes, description: 'Processar pastas de código/docs' },
   { id: 'jobs', label: 'Jobs', icon: FileText, description: 'Histórico de ingestão' },
