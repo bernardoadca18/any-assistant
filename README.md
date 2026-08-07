@@ -2,7 +2,7 @@ English | [Português (BR)](./README.pt-BR.md)
 
 ---
 
-# UE5 AI Assistant
+# Any Assistant AI
 
 ![Version](https://img.shields.io/badge/version-0.2.0-blue)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
@@ -10,7 +10,7 @@ English | [Português (BR)](./README.pt-BR.md)
 ![React](https://img.shields.io/badge/React-19-61DAFB)
 ![Status](https://img.shields.io/badge/status-active--development-yellow)
 
-> An AI-powered technical assistant for **Unreal Engine 5**, built on an Advanced Retrieval-Augmented Generation (RAG) pipeline. It answers gameplay and engine-architecture questions by grounding LLM responses in a semantically curated knowledge base derived directly from UE5 C++ source, official Epic documentation, and exported Blueprint logic.
+> An AI-powered technical assistant for **Unreal Engine 5**, built on an Advanced Retrieval-Augmented Generation (RAG) pipeline. It answers gameplay and engine-architecture questions by grounding LLM responses in a semantically curated knowledge base derived directly from source, official documentation, and exported logic.
 
 Unlike a naive "embed the raw source code" RAG system, this project's core design principle is that **raw C++ and Blueprint graphs are not semantically dense enough for reliable retrieval**. A dedicated ingestion engine transforms code and visual scripting into LLM-generated, human-readable technical documentation *before* it ever reaches the vector store — while preserving the original raw content as a secondary, authoritative reference layer for exact syntax.
 
