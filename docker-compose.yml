@@ -37,6 +37,11 @@ services:
         VITE_QDRANT_DASHBOARD_URL: ${VITE_QDRANT_DASHBOARD_URL:-http://localhost:6333/dashboard}
         VITE_LITELLM_PROXY_URL: ${VITE_LITELLM_PROXY_URL:-http://localhost:4000}
     container_name: ue5-frontend
+    env_file:
+      - .env
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     restart: unless-stopped
     ports:
       - "3001:80"
