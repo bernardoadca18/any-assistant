@@ -257,7 +257,7 @@ async def _document_via_llm(system_prompt: str, code_block: str, model: str) -> 
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": truncated},
     ]
-    answer, _prompt_tok, _completion_tok = await call_litellm(messages, model=model)
+    answer, _prompt_tok, _completion_tok, _finish_reason = await call_litellm(messages, model=model)
     return answer
 
 

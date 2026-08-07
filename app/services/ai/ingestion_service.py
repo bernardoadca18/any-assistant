@@ -946,7 +946,7 @@ async def _process_script_file(
         ]
 
         try:
-            markdown, _pt, _ct = await call_litellm(
+            markdown, _pt, _ct, _finish_reason = await call_litellm(
                 messages=messages,
                 model=settings.ingestion_documenter_model,
             )
@@ -1029,7 +1029,7 @@ async def _process_header_file(
     ]
 
     try:
-        markdown, _prompt_tokens, _completion_tokens = await call_litellm(
+        markdown, _prompt_tokens, _completion_tokens, _finish_reason = await call_litellm(
             messages=messages,
             model=settings.ingestion_documenter_model,
         )
@@ -1309,7 +1309,7 @@ async def _process_tscn_file(
     ]
 
     try:
-        markdown, _pt, _ct = await call_litellm(
+        markdown, _pt, _ct, _finish_reason = await call_litellm(
             messages=messages,
             model=settings.ingestion_documenter_model,
         )
