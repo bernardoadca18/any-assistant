@@ -5,30 +5,42 @@ English | [Português (BR)](./README.pt-BR.md)
 # Any Assistant AI
 
 ![Version](https://img.shields.io/badge/version-0.2.0-blue)
-![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![Python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-async-009688)
 ![React](https://img.shields.io/badge/React-19-61DAFB)
 ![Status](https://img.shields.io/badge/status-active--development-yellow)
 
-> An AI-powered technical assistant for **Unreal Engine 5**, built on an Advanced Retrieval-Augmented Generation (RAG) pipeline. It answers gameplay and engine-architecture questions by grounding LLM responses in a semantically curated knowledge base derived directly from source, official documentation, and exported logic.
+> A multi-tenant, multi-domain AI assistant platform powered by Advanced Retrieval-Augmented Generation (RAG). Currently supports **Unreal Engine 5** and **Godot 4** with extensible architecture for additional game engines and technical domains.
 
-Unlike a naive "embed the raw source code" RAG system, this project's core design principle is that **raw C++ and Blueprint graphs are not semantically dense enough for reliable retrieval**. A dedicated ingestion engine transforms code and visual scripting into LLM-generated, human-readable technical documentation *before* it ever reaches the vector store — while preserving the original raw content as a secondary, authoritative reference layer for exact syntax.
+## Overview
+
+Any Assistant AI is a production-ready system designed to answer technical questions about game engine architecture, APIs, and best practices by grounding LLM responses in a semantically curated knowledge base. Unlike naive RAG systems that embed raw code directly, this project transforms source code and documentation into LLM-generated technical documentation before indexing—ensuring semantic density for reliable retrieval while preserving original content as an authoritative reference layer.
+
+### Key Differentiators
+
+- **Code-to-Doc Transformation** — Raw C++, Blueprints, and GDScript are never embedded directly. Instead, LLM-generated documentation is used for semantic retrieval, with original source preserved for exact syntax reference.
+- **Advanced RAG Pipeline** — Query decomposition, hybrid search (dense + sparse vectors), cross-encoder reranking, and multi-language support deliver high-precision responses.
+- **Multi-Tenant Architecture** — Isolated collections per tenant with hierarchical configuration (collection → tenant → global) and API key authentication.
+- **Multi-Domain Support** — Extensible domain profiles enable support for multiple game engines. Currently ships with Godot 4 and Unreal Engine 5 profiles.
+- **Production-Ready Infrastructure** — Docker Compose orchestration with health checks, resource limits, and persistent storage.
 
 ---
 
 ## Table of Contents
 
 - [Features](#features)
-- [Architecture & Tech Stack](#architecture--tech-stack)
+- [Architecture Overview](#architecture-overview)
+- [Technology Stack](#technology-stack)
 - [Core Components](#core-components)
   - [Advanced RAG Pipeline](#1-advanced-rag-pipeline)
-  - [Code-to-Doc Ingestion Engine](#2-code-to-doc-ingestion-engine-multi-channel-etl)
-  - [Idempotency & Resilience](#3-idempotency--resilience)
-  - [Web Interface](#4-web-interface)
-- [API Endpoints](#api-endpoints)
+  - [Code-to-Doc Ingestion Engine](#2-code-to-doc-ingestion-engine)
+  - [Multi-Tenancy System](#3-multi-tenancy-system)
+  - [Multi-Domain Architecture](#4-multi-domain-architecture)
+  - [Web Interface](#5-web-interface)
+- [API Reference](#api-reference)
+- [Database Schema](#database-schema)
 - [Quick Start](#quick-start)
-- [Environment Configuration](#environment-configuration)
-- [Usage Examples](#usage-examples)
+- [Configuration](#configuration)
 - [Development](#development)
 - [Project Structure](#project-structure)
 - [Roadmap](#roadmap)
@@ -39,26 +51,47 @@ Unlike a naive "embed the raw source code" RAG system, this project's core desig
 
 ## Features
 
-- **Multi-Engine Support** — Designed for Unreal Engine 5 with extensible architecture for Godot 4
-- **Advanced RAG Pipeline** — Query decomposition, cross-encoder reranking, and multi-language support
-- **Code-to-Doc Transformation** — LLM-generated documentation from C++ headers, Blueprints, and Epic's `.udn` files
-- **Conversation Memory** — Persistent chat history with Redis and PostgreSQL backing
-- **Streaming Responses** — Real-time response streaming for better UX
-- **Multi-Tenant Ready** — Project-scoped retrieval and isolated collections
-- **Web Interface** — Modern React frontend with dark theme and responsive design
-- **Production Ready** — Docker Compose orchestration with health checks and resource limits
+### RAG Pipeline
+- **Query Decomposition** — Complex questions are broken into focused sub-queries for comprehensive retrieval
+- **Multi-Language Support** — Queries in any language are translated to English for vector search, with language-aware response generation
+- **Hybrid Search** — Combines dense vector similarity with sparse/BM25-like keyword matching via Reciprocal Rank Fusion (RRF)
+- **Cross-Encoder Reranking** — FlashRank ONNX-based reranker scores chunks against full query intent (CPU-only, ~10-50ms)
+- **Streaming Responses** — Server-Sent Events (SSE) for real-time response streaming
+- **Token Tracking** — Accurate prompt/completion token counts with finish reasons
+
+### Ingestion Engine
+- **Multi-Format Support** — `.h`, `.cpp`, `.udn`, `.gd`, `.cs`, `.rst`, `.tscn`, `.tres`, `.xml`, and Blueprint JSON exports
+- **LLM-Powered Documentation** — Code headers and implementations are transformed into gameplay-oriented technical guides
+- **Idempotent Re-Ingestion** — Content hash checking prevents reprocessing unchanged files
+- **Failure Quarantine** — Files with consecutive processing errors are automatically quarantined
+- **Distributed Locking** — Prevents concurrent ingestion runs from corrupting data
+
+### Multi-Tenancy
+- **Isolated Collections** — Each tenant has isolated Qdrant collections
+- **Hierarchical Configuration** — Settings cascade from collection → tenant → global with fallback
+- **API Key Management** — Secure bcrypt-hashed API keys with admin and read-only roles
+- **Rate Limiting** — Application-enforced rate limits (RPM/TPM) per tenant
+
+### Web Interface
+- **Modern Stack** — React 19, TypeScript 5.8, Vite 6, Tailwind CSS v4
+- **Real-Time Streaming** — SSE-powered streaming responses
+- **Session Management** — Persistent conversation history with citation tracking
+- **Dark Theme** — Optimized for long coding sessions
+- **Responsive Design** — Works on desktop and mobile devices
 
 ---
 
-## Architecture & Tech Stack
+## Architecture Overview
 
-The system is composed of a stateless FastAPI service surrounded by specialized infrastructure. **No component ever talks to an LLM provider directly** — every model call (chat, embeddings, query decomposition, documentation generation) is routed through a single **LiteLLM Proxy**, which abstracts the underlying provider (local Ollama models or cloud models like Gemini).
+The system follows a microservices architecture with clear separation between frontend, backend API, and infrastructure services. All LLM interactions are routed through a single LiteLLM Proxy, abstracting providers (local Ollama or cloud services like Gemini).
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              FRONTEND LAYER                                  │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │  React 19 + Vite + TypeScript + Tailwind CSS (Port 3001)            │   │
+│  │  • ChatWorkspace with streaming    • Session management             │   │
+│  │  • Tenant/Collection switching    • Admin dashboard                 │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
@@ -67,8 +100,9 @@ The system is composed of a stateless FastAPI service surrounded by specialized 
 │                              API LAYER                                       │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │  FastAPI (Port 8000)                                                │   │
-│  │  • /v1/chat          • /v1/ingest/process-folder                   │   │
-│  │  • /v1/health        • /v1/sessions                                │   │
+│  │  • /v1/chat              • /v1/sessions                             │   │
+│  │  • /v1/ingest/*          • /v1/admin/*                              │   │
+│  │  • /v1/health            • /v1/chat/models                          │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
@@ -76,31 +110,69 @@ The system is composed of a stateless FastAPI service surrounded by specialized 
           ▼                           ▼                           ▼
 ┌──────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
 │  Qdrant          │    │  Redis               │    │  PostgreSQL          │
-│  Vector DB       │    │  • Session cache     │    │  • Chat history      │
+│  Vector DB       │    │  • Session cache     │    │  • Chat sessions     │
 │  (Port 6333)     │    │  • Ingestion locks   │    │  • Messages          │
-│                  │    │  • Checkpoints       │    │  • Citations         │
+│  • Dense vectors │    │  • Checkpoint manifest│   │  • Retrieved chunks  │
+│  • Sparse vectors│    │  • Tenant config cache│   │  • Multi-tenant data │
 └──────────────────┘    └──────────────────────┘    └──────────────────────┘
           │
           ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          LLM ORCHESTRATION                                   │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  LiteLLM Proxy (Port 4000)                                          │   │
-│  │  • Routes to Ollama (local) or Gemini (cloud)                       │   │
+│  │  LiteLLM Proxy (Port 4000 - External)                               │   │
 │  │  • Unified API for chat, embeddings, decompositions                 │   │
+│  │  • Routes to Ollama (local) or Gemini/OpenAI (cloud)                │   │
+│  │  • Master key authentication                                        │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Component Responsibilities
+
 | Component | Role |
-|---|---|
-| **FastAPI** | Async API layer exposing `/v1/chat`, `/v1/ingest/process-folder`, and `/v1/health`. Runs ingestion as `BackgroundTasks` on the same event loop, using `asyncio.to_thread()` to offload blocking disk I/O. |
-| **React Frontend** | Modern SPA built with React 19, Vite, TypeScript, and Tailwind CSS. Features real-time streaming responses, session management, and responsive dark-theme UI. |
-| **LiteLLM Proxy** | Single entry point for *all* model traffic — chat completions, embeddings, query decomposition, and ingestion-time documentation generation. Routes internally to Ollama or Gemini depending on model alias. Authenticated via a master key. |
-| **Qdrant** | Vector database storing documentation chunks with enriched payloads (`project_source`, `doc_type`, `ue_version`, `raw_content`). Supports payload-filtered search (e.g., restricting retrieval to a specific project). |
-| **Redis** | Multi-purpose backing store: conversation session history (with TTL), the ingestion **checkpoint manifest** (SHA-256 content hashes per file), a **failure/quarantine tracker**, and **distributed locks** that serialize ingestion runs per collection. |
-| **PostgreSQL** | Durable persistence for chat sessions, messages, and cited chunks — the authoritative source of conversation history, with Redis serving as a short-term context cache. |
-| **FlashRank** | Lightweight, CPU-only Cross-Encoder reranker (ONNX runtime, no GPU required) used to reorder retrieved chunks by true semantic relevance before they reach the final prompt. |
+|-----------|------|
+| **FastAPI** | Async API layer exposing REST endpoints. Runs ingestion as BackgroundTasks, uses `asyncio.to_thread()` for disk I/O. Handles tenant resolution, authentication, and request validation. |
+| **React Frontend** | Single-page application with Zustand state management, Axios HTTP client, and real-time SSE streaming. Includes views for chat, ingestion management, tenant/collection admin, and system health. |
+| **LiteLLM Proxy** | Single entry point for all model interactions—chat completions, embeddings, query decomposition, and documentation generation. Abstracts provider differences and centralizes API key management. |
+| **Qdrant** | Vector database storing documentation chunks with enriched payloads. Supports dense vectors (1024-dim default), sparse vectors (BM25-like), and payload-filtered search. |
+| **Redis** | Multi-purpose: session cache (TTL), ingestion checkpoint manifest (SHA-256 hashes), failure tracker, distributed locks, and L2 tenant configuration cache. |
+| **PostgreSQL** | Durable persistence for multi-tenant data: tenants, collections, chat sessions, messages, retrieved chunks, and configuration tables. Primary source of truth for conversation history. |
+| **FlashRank** | ONNX-based cross-encoder reranker (CPU-only). Scores retrieved chunks against full query intent for semantic relevance ranking. |
+
+---
+
+## Technology Stack
+
+### Backend
+- **Python 3.12** — Core language
+- **FastAPI 0.115.5** — Async web framework
+- **SQLAlchemy 2.0.36** — Async ORM with asyncpg driver
+- **Pydantic 2.10.3** — Data validation and settings management
+- **Alembic 1.14.0** — Database migrations
+- **Uvicorn 0.32.1** — ASGI server with uvloop
+- **Qdrant Client 1.12.1** — Vector database client
+- **Redis 5.2.1** — Cache and distributed state
+- **FlashRank 0.2.9** — Cross-encoder reranking
+- **HTTPX 0.28.1** — Async HTTP client
+- **Tenacity 9.0.0** — Retry logic
+
+### Frontend
+- **React 19.0.1** — UI framework
+- **TypeScript 5.8** — Type-safe development
+- **Vite 6.2.3** — Build tool with HMR
+- **Tailwind CSS 4.1.14** — Utility-first styling
+- **Zustand 5.0.14** — State management
+- **Axios 1.19.0** — HTTP client
+- **Lucide React 0.546.0** — Icon library
+- **Motion 12.23.24** — Animation library
+
+### Infrastructure
+- **PostgreSQL 16 Alpine** — Primary database
+- **Redis 7 Alpine** — Cache and distributed state
+- **Qdrant 1.18.0** — Vector database
+- **Docker & Docker Compose** — Container orchestration
+- **Nginx** — Frontend static file serving and reverse proxy
 
 ---
 
@@ -108,88 +180,224 @@ The system is composed of a stateless FastAPI service surrounded by specialized 
 
 ### 1. Advanced RAG Pipeline
 
-The pipeline (`app/services/ai/rag_service.py`) runs in three phases designed to maximize both **recall** (finding all relevant documentation for multi-topic questions) and **precision** (filtering out noise before it reaches the final prompt):
+Location: `app/services/ai/rag_service.py`
 
-**Phase 1 — Query Decomposition & Translation**
+The RAG pipeline operates in three phases to maximize both **recall** (finding all relevant documentation) and **precision** (filtering noise):
 
-The vector corpus is indexed entirely in **technical English** (both the LLM-generated documentation and Epic's official `.udn` docs). Because a Portuguese query would suffer a cross-lingual embedding mismatch, `decompose_query()` calls a fast LLM (`gemini-3.1-flash-lite`, with a distinct fallback model on failure) to:
+#### Phase 1 — Query Decomposition & Translation
 
-1. Produce a literal English **translation** of the user's question (`translated_query`) — this is always used as the search anchor, never the original-language query.
-2. Decompose the question into up to **3 additional technical sub-queries**, each focused on a single UE5 concept (e.g., splitting "how do I code jumping in C++ and set up the landing animation?" into a C++ input-binding query and a separate Animation Blueprint query).
+The vector corpus is indexed in **technical English**. User queries in any language are processed by a fast LLM to:
 
-The response parser is deliberately defensive, with layered fallback strategies (direct JSON → JSON in markdown fences → embedded JSON → quoted-string extraction → original-question fallback) to guarantee the pipeline never crashes on a malformed LLM response.
+1. **Translate** the query to English (`translated_query`) — this is the search anchor
+2. **Decompose** into up to 3 focused sub-queries for comprehensive retrieval
 
-**Phase 2 — Expanded Retrieval + Cross-Encoder Reranking**
+Example: "How do I implement jumping in C++ and set up the landing animation?" decomposes into:
+- Input binding query (C++)
+- Animation Blueprint query (separate)
 
-1. Every query (translation + sub-queries) is embedded and searched against Qdrant independently, each pulling up to `rag_retrieval_limit_per_query` candidates (default 15) — favoring recall over precision at this stage.
-2. Results across all queries are **deduplicated** in-memory by `(source_file, chunk_id)`.
-3. The deduplicated pool is reranked by `rerank_with_flashrank()`, a Cross-Encoder (`ms-marco-MiniLM-L-12-v2` by default) that scores each chunk directly against the translated English query — never the sub-queries individually — to judge relevance against the full intent of the question. Reranking runs on CPU via ONNX and is dispatched to a thread to avoid blocking the event loop.
-4. An optional quality floor (`rag_rerank_min_score`) can discard low-scoring chunks post-rerank, while always preserving at least the top-1 result so the prompt is never empty.
-5. Retrieval can optionally be scoped to a single `project_source` (e.g., only Lyra, or only base Engine code) via a Qdrant payload filter.
+The response parser uses layered fallback strategies (JSON → markdown fences → embedded JSON → quoted strings → original query) to handle malformed LLM responses gracefully.
 
-**Phase 3 — Generation**
+#### Phase 2 — Hybrid Search & Reranking
 
-The final context is formatted into a dual-layer prompt per chunk:
+1. Each query (translation + sub-queries) is embedded and searched independently
+2. Results are deduplicated by `(source_file, chunk_id)`
+3. **Hybrid Search** — Dense vectors combined with sparse/BM25-like vectors via Reciprocal Rank Fusion
+4. **Cross-Encoder Reranking** — FlashRank scores each chunk against the full translated query (not sub-queries)
+5. Optional quality floor (`rag_rerank_min_score`) discards low-scoring chunks while preserving top-1
+6. Retrieval can be scoped to a specific `project_source` via Qdrant payload filters
 
-- **Semantic Analysis** — the LLM-generated conceptual summary (what the code *does* and *why*).
-- **Direct Reference** — the original, unmodified raw source (`raw_content`: the cleaned C++ header, sanitized `.udn`, or formatted Blueprint JSON), which the system prompt explicitly instructs the model to treat as the **sovereign source of truth** for exact signatures, types, and property names.
+#### Phase 3 — Context-Augmented Generation
 
-Conversation history is loaded from Redis, the augmented message is sent to the chat model via `call_litellm()`, and the turn is persisted back to Redis. Every phase has isolated error handling with fallback to a simpler Naive RAG path (`retrieve_chunks()`), so a failure in decomposition or reranking never surfaces as an HTTP 500.
+Each chunk is formatted into a dual-layer prompt:
+- **Semantic Analysis** — LLM-generated conceptual summary (what the code *does* and *why*)
+- **Direct Reference** — Original unmodified source (`raw_content`) — the sovereign source of truth for exact syntax
 
-### 2. Code-to-Doc Ingestion Engine (Multi-Channel ETL)
+Conversation history is loaded from Redis, the augmented message is sent via LiteLLM, and the turn is persisted. Each phase has isolated error handling with fallback to naive RAG.
 
-The ingestion engine (`app/services/ai/ingestion_service.py`) is triggered via `POST /v1/ingest/process-folder` and runs entirely as a **FastAPI `BackgroundTask`**, inside the same container and event loop as the chat API. Because a recursive scan over an engine-scale source tree can involve tens of thousands of files, all disk-bound work (`os.walk`, file reads) is dispatched to worker threads via `asyncio.to_thread()` so it never blocks concurrent `/v1/chat` requests.
+### 2. Code-to-Doc Ingestion Engine
 
-Its core architectural principle: **raw code is never embedded directly**. Each channel transforms its source material into semantically dense Markdown before it is chunked and embedded — this is what allows a small local model to answer accurately instead of getting lost in raw syntax.
+Location: `app/services/ai/ingestion_service.py`
 
-| Channel | Source | Processing |
-|---|---|---|
-| **A — `.h` headers** | UE5 C++ headers | Cleans includes/boilerplate, filters for gameplay relevance (strict keyword allowlist for Engine code; disabled entirely in `sample_mode` or for strategic modern-gameplay modules like Mover/Network Prediction), then sends the cleaned header to an LLM acting as a "Senior Technical Documenter" to produce a gameplay-oriented Markdown guide. |
-| **B — `.udn`** | Epic's official documentation format | Pure regex-based sanitization (strips proprietary macros/metadata) — **no LLM call**. Lower cost, since the source is already human-written prose. |
-| **C — `.cpp` (Sample Mode only)** | Implementation logic in sample projects (Lyra, City Sample, Vehicle Sample) | Splits the file into function-level blocks via signature detection + brace-balancing, groups small functions together to avoid wasteful LLM calls, and documents the grouped implementation logic — capturing *how* a mechanic works, not just its public API. |
-| **D — `.bp.json` (Sample Mode only)** | Blueprint graphs, exported via a companion Unreal Editor Python script (`BP_GraphExporter.py`) | Consumes an already-structured JSON representation (`ParentClass`, `Variables`, linearized `ExecutionFlow` with branch/loop resolution) — no regex parsing of raw text — and documents the Blueprint's gameplay behavior, key variables, main event flows, and integration points with other systems. |
+Triggered via `POST /v1/ingest/process-folder` and runs as a FastAPI BackgroundTask. All disk I/O is dispatched to worker threads via `asyncio.to_thread()` to avoid blocking concurrent chat requests.
 
-All four channels converge on the same downstream pipeline: **structural Markdown chunking** (split by header hierarchy, with a hard character ceiling as a safety net), **metadata enrichment** (`project_source`, `doc_type`, `ue_version`, `raw_content`), **batched embedding generation**, and **idempotent upsert** into Qdrant.
+**Core Principle**: Raw code is never embedded directly. Each channel transforms source into semantically dense Markdown before chunking and embedding.
 
-### 3. Idempotency & Resilience
+| Channel | Source Files | Processing Strategy |
+|---------|--------------|---------------------|
+| **A** | `.h` C++ headers | Cleans boilerplate, filters for gameplay relevance, LLM generates gameplay-oriented documentation |
+| **B** | `.udn` Epic docs | Pure regex sanitization (no LLM call) — already human-written prose |
+| **C** | `.cpp` implementations (sample mode) | Function-level splitting, grouping, LLM documents implementation logic |
+| **D** | `.bp.json` Blueprint exports (sample mode) | Consumes structured JSON, documents behavior and event flows |
+| **E** | `.gd`, `.cs`, `.tscn`, `.tres`, `.xml` | Domain-specific processing for Godot and other engines |
 
-Redis underpins every safety mechanism in the ingestion pipeline:
+All channels converge on: structural Markdown chunking → metadata enrichment → batched embedding → idempotent Qdrant upsert.
 
-- **Checkpoint Manifest** — a Redis hash (`manifest:{collection_name}`) maps each source file's relative path to a SHA-256 content hash. On re-ingestion, unchanged files are skipped entirely (no re-reading, no LLM call, no re-embedding), and modified files are automatically detected and reprocessed. A file's entry is only committed to the manifest once *every* chunk it produced has been **confirmed persisted** in Qdrant — never based on in-memory generation counts alone — so an interrupted run never leaves a false "success" checkpoint.
-- **Failure Tracking & Quarantine** — files that fail processing (read errors, LLM failures, embedding failures) are tracked in a dedicated Redis failures hash. After `ingestion_max_consecutive_failures` consecutive failures, a file is quarantined and skipped on future runs until manually cleared, preventing wasted LLM/embedding calls on a permanently broken file.
-- **Distributed Locking** — a Redis-based distributed lock (`ingestion_lock_key`) ensures only one ingestion run per collection can execute at a time, preventing two concurrent runs from corrupting the checkpoint manifest. The lock is periodically renewed (heartbeat) for the duration of long-running ingestions so it never expires mid-run due to TTL, while still self-expiring safely if the process dies unexpectedly.
-- **Orphan Cleanup** — when a previously-indexed file changes, its old chunks are deleted from Qdrant only *after* the new chunks are confirmed committed, avoiding any window where valid data is missing from the index.
+**Resilience Features**:
+- **Checkpoint Manifest** — Redis hash maps file paths to SHA-256 content hashes; unchanged files skipped
+- **Failure Quarantine** — Files with `max_consecutive_failures` errors are quarantined
+- **Distributed Locking** — Only one ingestion per collection at a time, with heartbeat renewal
+- **Orphan Cleanup** — Old chunks deleted only after new chunks confirmed committed
 
-### 4. Web Interface
+### 3. Multi-Tenancy System
 
-A modern single-page application built with:
+Location: `app/services/tenant_config_service.py`, `app/db/models/`
 
-- **React 19** — Latest React with concurrent rendering
-- **Vite** — Fast build tooling with HMR
-- **TypeScript** — Type-safe development
-- **Tailwind CSS v4** — Utility-first styling with dark theme
-- **Zustand** — Lightweight state management
-- **Lucide React** — Beautiful icon set
-- **Motion** — Smooth animations
+Supports isolated collections per tenant with hierarchical configuration:
 
-Features:
-- Real-time streaming responses
-- Session management with conversation history
-- Responsive design for desktop and mobile
-- Dark theme optimized for long coding sessions
+```
+Collection Config → Tenant Default → Global Settings
+```
+
+**Database Schema**:
+- `tenants` — Tenant metadata, rate limits, active status
+- `collections` — Qdrant collection config per tenant (domain, project filters)
+- `api_keys` — Secure bcrypt-hashed API keys with admin/read-only roles
+- `collection_configs` — Junction table linking collections to embedding/rag/ingestion configs
+
+**Tenant Resolution**:
+- L1 cache (process-level, 60s TTL)
+- L2 cache (Redis, 300s TTL)
+- Fallback to global settings on resolution failure (never crashes)
+
+### 4. Multi-Domain Architecture
+
+Location: `app/core/domains/`
+
+Domain profiles encapsulate engine-specific knowledge:
+- File extensions and MIME types
+- Ingestion strategies and prompts
+- Tokenization patterns (CamelCase/snake_case splitting for sparse vectors)
+- Sanitization logic
+- Version detection
+
+**Available Domains**:
+- `godot_4` — Godot Engine 4.x (GDScript, scene files, C#)
+- `ue5` — Unreal Engine 5 (C++ headers, Blueprints, `.udn`)
+
+**Adding a New Domain**:
+1. Create domain profile in `app/core/domains/<engine>.py`
+2. Register in `app/core/domains/registry.py`
+3. Add ingestion strategies in `app/services/ai/ingestion/` if needed
+
+### 5. Web Interface
+
+Location: `frontend/src/`
+
+Modern SPA built with React 19, TypeScript, and Tailwind CSS v4.
+
+**Key Views**:
+- `ChatWorkspace.tsx` — Main chat interface with streaming support
+- `FolderIngestionView.tsx` — Submit ingestion jobs
+- `IngestionJobsView.tsx` — Monitor job status
+- `TenantManagerView.tsx` — Multi-tenant management
+- `CollectionManagerView.tsx` — Qdrant collection management
+- `AdminDashboardView.tsx` — Admin panel
+- `DevHubView.tsx` — System health dashboard
+
+**State Management**:
+- Zustand store with localStorage persistence
+- Manages: auth state, active tenant/collection/domain, system health
 
 ---
 
-## API Endpoints
+## API Reference
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/v1/chat` | Executes the full Advanced RAG pipeline: embeds the question, retrieves and reranks documentation chunks, builds the augmented prompt, and generates a response via the LiteLLM proxy. Conversation history is maintained per `session_id` in Redis. Returns `503` on known operational failures (e.g., LiteLLM/Ollama unavailable) and `500` on unexpected errors. |
-| `POST` | `/v1/ingest/process-folder` | Triggers the Code-to-Doc ETL engine as a background task over a folder path **inside the container**. Accepts `content_type` (`source_code` or `documentation`), `project_source` (provenance label, e.g. `UE5_Engine`, `Lyra`), `sample_mode` (enables Channels C & D), and an optional `ue_version` override. Returns immediately with `202 Accepted` — the task runs asynchronously and progress is tracked via application logs and the Redis manifest. |
-| `GET` | `/v1/health` | Active health check against all dependencies (Qdrant, Redis, LiteLLM), run concurrently. Returns `200` if all dependencies are healthy or degraded, `503` if any dependency is in an error state — including per-dependency latency and status detail. |
-| `GET` | `/v1/sessions` | List all chat sessions with pagination support. |
-| `GET` | `/v1/sessions/{session_id}` | Retrieve a specific session with its message history. |
-| `DELETE` | `/v1/sessions/{session_id}` | Delete a session and its history. |
+### Base URL: `/v1`
+
+#### Chat
+
+```http
+POST /v1/chat
+Content-Type: application/json
+
+{
+  "message": "How do I implement a double jump in C++?",
+  "session_id": "optional-session-uuid",
+  "tenant_id": "optional-tenant-uuid",
+  "collection_id": "optional-collection-uuid",
+  "model": "optional-model-override",
+  "top_k": 5,
+  "project_source_filter": "optional-project-filter",
+  "stream": true
+}
+```
+
+**Response**: Streaming SSE or JSON with retrieved chunks, token counts, and citations.
+
+#### Health
+
+```http
+GET /v1/health
+```
+
+Returns health status of Qdrant, Redis, and LiteLLM with latency metrics.
+
+#### Ingestion
+
+```http
+POST /v1/ingest/process-folder
+Content-Type: application/json
+
+{
+  "folder_path": "/data/Engine/Source",
+  "content_type": "source_code",
+  "project_source": "UE5_Engine",
+  "sample_mode": false,
+  "collection_id": "optional-collection-uuid"
+}
+```
+
+**Response**: `202 Accepted` — runs as background task.
+
+#### Sessions
+
+```http
+GET /v1/sessions?page=1&page_size=20
+GET /v1/sessions/{session_id}
+DELETE /v1/sessions/{session_id}
+```
+
+#### Admin
+
+```http
+GET /v1/admin/tenants
+POST /v1/admin/tenants
+GET /v1/admin/tenants/{id}/collections
+POST /v1/admin/collections
+```
+
+#### Models
+
+```http
+GET /v1/chat/models
+```
+
+Lists available models from LiteLLM proxy.
+
+---
+
+## Database Schema
+
+### PostgreSQL Core Tables
+
+| Table | Purpose |
+|-------|---------|
+| `tenants` | Multi-tenant isolation (slug, name, rate limits, is_active) |
+| `collections` | Qdrant collection config per tenant (domain_id, project filters) |
+| `chat_sessions` | Conversation sessions (title, default_model, project_filter) |
+| `chat_messages` | Individual messages (role, content, tokens, sequence_number) |
+| `retrieved_chunks` | Citations (qdrant_chunk_id, score, title, source_file) |
+| `api_keys` | Secure API key storage (key_hash bcrypt, is_admin, expires_at) |
+| `embedding_configs` | Embedding model settings |
+| `rag_configs` | RAG pipeline settings (decomposition, retrieval, reranking) |
+| `ingestion_configs` | Ingestion pipeline settings |
+| `litellm_configs` | LiteLLM proxy settings |
+
+### Qdrant Collection Structure
+
+- **Dense vectors**: 1024 dimensions (configurable)
+- **Sparse vectors**: BM25-like keyword vectors
+- **Payload fields**: `summary_markdown`, `raw_content`, `title`, `source_file`, `doc_type`, `project_source`, `ue_version`/`godot_version`, `keywords_exact`
 
 ---
 
@@ -200,17 +408,17 @@ Features:
 - Docker and Docker Compose
 - Git
 - (Optional) Ollama for local models
-- (Optional) Gemini API key for cloud models
+- (Optional) Gemini/OpenAI API key for cloud models
 
 ### 1. Clone and Configure
 
 ```bash
 git clone <repository-url>
-cd ue5-ai-assistant
+cd any-assistant
 cp .env.example .env
 ```
 
-Edit `.env` and fill in the required values:
+Edit `.env`:
 
 ```bash
 # Required
@@ -218,27 +426,26 @@ AGENT_REDIS_PASSWORD=your-secure-password
 AGENT_POSTGRES_PASSWORD=your-secure-password
 LITELLM_MASTER_KEY=your-master-key
 
-# Optional (for Gemini models)
+# Optional (for cloud models)
 GEMINI_API_KEY=your-gemini-api-key
 ```
 
-### 2. Start the Stack
+### 2. Start Services
 
 ```bash
-# Using Docker Compose directly
-docker compose up -d --build
-
-# Or using the Makefile
+# Using Makefile (recommended)
 make up
+
+# Or using Docker Compose directly
+docker compose up -d --build
 ```
 
-This brings up:
-- `ue5-frontend` — React web interface (port 3001)
+Services started:
+- `frontend` — React web interface (port 3001)
 - `ue5-agent` — FastAPI backend (port 8000)
 - `qdrant` — Vector database (port 6333)
 - `agent-redis` — Session cache and ingestion locks
 - `agent-postgres` — Persistent message storage
-- `litellm-proxy` — LLM gateway (requires external network)
 
 ### 3. Verify Health
 
@@ -250,35 +457,31 @@ Or open http://localhost:3001 in your browser.
 
 ### 4. Ingest Documentation
 
-Ingest UE5 Engine source:
-
 ```bash
+# UE5 Engine source
 curl -X POST http://localhost:8000/v1/ingest/process-folder \
   -H "Content-Type: application/json" \
   -d '{
-        "folder_path": "/data/ue5_engine_root/Engine/Source",
-        "content_type": "source_code",
-        "project_source": "UE5_Engine",
-        "sample_mode": false
-      }'
-```
+    "folder_path": "/data/ue5_engine_root/Engine/Source",
+    "content_type": "source_code",
+    "project_source": "UE5_Engine",
+    "sample_mode": false
+  }'
 
-Ingest a sample project (Lyra, City Sample, etc.):
-
-```bash
+# Godot 4 source
 curl -X POST http://localhost:8000/v1/ingest/process-folder \
   -H "Content-Type: application/json" \
   -d '{
-        "folder_path": "/data/sample_projects/Lyra",
-        "content_type": "source_code",
-        "project_source": "Lyra",
-        "sample_mode": true
-      }'
+    "folder_path": "/data/godot_source",
+    "content_type": "source_code",
+    "project_source": "Godot_4",
+    "sample_mode": false
+  }'
 ```
 
 ### 5. Chat
 
-Via the Web UI:
+Via Web UI:
 - Open http://localhost:3001
 - Start a new conversation
 
@@ -288,22 +491,23 @@ Via API:
 curl -X POST http://localhost:8000/v1/chat \
   -H "Content-Type: application/json" \
   -d '{
-        "message": "How do I implement a double jump in C++ and hook it up to an Animation Blueprint?",
-        "session_id": "test-session-001"
-      }'
+    "message": "How do I implement a double jump in C++ and connect it to an Animation Blueprint?",
+    "session_id": "test-session-001"
+  }'
 ```
 
 ---
 
-## Environment Configuration
+## Configuration
 
-Configuration is centralized in `app/core/config.py` via Pydantic Settings, loaded from a `.env` file.
+Configuration is centralized in `app/core/config.py` via Pydantic Settings, loaded from `.env` file.
 
 ### Application
 
 ```env
 APP_ENV=production               # production | development | test
 LOG_LEVEL=INFO                   # DEBUG | INFO | WARNING | ERROR
+ACTIVE_DOMAIN=godot_4            # godot_4 | ue5
 ```
 
 ### Databases
@@ -319,7 +523,7 @@ REDIS_HOST=agent-redis
 REDIS_PORT=6379
 REDIS_PASSWORD=                  # required
 REDIS_DB=0
-REDIS_SESSION_TTL=3600           # session TTL in seconds
+REDIS_SESSION_TTL=3600
 
 # PostgreSQL
 POSTGRES_HOST=agent-postgres
@@ -332,13 +536,13 @@ POSTGRES_DB=ue5_rag_assistant
 ### LLM Configuration
 
 ```env
-# LiteLLM Proxy (single entry point for all model calls)
+# LiteLLM Proxy (single entry point)
 LITELLM_BASE_URL=http://litellm-proxy:4000
 LITELLM_MASTER_KEY=              # required
 LITELLM_MAX_RETRIES=4
 
 # Embeddings
-EMBEDDING_MODEL=ollama-embed     # must be configured in LiteLLM config.yml
+EMBEDDING_MODEL=ollama-embed     # must be in LiteLLM config.yml
 EMBEDDING_DIM=1024               # 384 | 768 | 1024 | 1536 | 3072
 ```
 
@@ -347,15 +551,15 @@ EMBEDDING_DIM=1024               # 384 | 768 | 1024 | 1536 | 3072
 ```env
 # General
 RAG_TOP_K=5
-RAG_SCORE_THRESHOLD=0.6          # Naive RAG only
+RAG_SCORE_THRESHOLD=0.6
 
 # Query Decomposition
 RAG_DECOMPOSITION_ENABLED=true
-RAG_DECOMPOSITION_MODEL=gemini/gemini-3.1-flash-lite
+RAG_DECOMPOSITION_MODEL=gemini/gemini-2.0-flash-lite
 RAG_DECOMPOSITION_TIMEOUT=12.0
 
-# Retrieval
-RAG_RETRIEVAL_LIMIT_PER_QUERY=15
+# Hybrid Search
+RAG_HYBRID_SEARCH_ENABLED=true
 
 # Reranker
 RAG_RERANKER_ENABLED=true
@@ -379,54 +583,40 @@ INGESTION_MAX_CONSECUTIVE_FAILURES=3
 
 ---
 
-## Usage Examples
+## Development
 
-### Starting a Development Environment
+### Makefile Commands
 
 ```bash
-# Start with hot-reload
-make dev
-
-# Or manually
-docker compose --profile dev up -d
+make help              # Show all available commands
+make dev               # Start development environment with hot-reload
+make up                # Start production environment
+make down              # Stop all services
+make rebuild           # Force rebuild all containers (no cache)
+make logs              # Show logs for all services
+make logs-backend      # Show backend logs only
+make health            # Check service health
+make db-shell          # Open PostgreSQL shell
+make db-backup         # Create database backup
+make redis-shell       # Open Redis CLI
+make test              # Run all tests
+make test-backend      # Run backend tests with coverage
+make lint              # Run linters (ruff + TypeScript)
+make format            # Format code (ruff format)
+make ingest-ue5        # Ingest UE5 Engine documentation
+make ingest-status     # Check ingestion job status
+make shell-backend     # Open backend container shell
+make env-setup         # Copy .env.example to .env
+make deps-install      # Install dependencies locally
 ```
 
-### Running Ingestion Jobs
+### Frontend Development
 
 ```bash
-# Using the Makefile
-make ingest-ue5
-
-# Check ingestion status
-make ingest-status
-
-# Custom ingestion
-make ingest ARGS="folder=/data/custom type=source_code project=MyProject"
-```
-
-### Database Operations
-
-```bash
-# Open Postgres shell
-make db-shell
-
-# Create a backup
-make db-backup
-
-# Open Redis CLI
-make redis-shell
-```
-
-### Viewing Logs
-
-```bash
-# All services
-make logs
-
-# Specific service
-make logs-backend
-make logs-frontend
-make logs-qdrant
+cd frontend
+npm run dev      # Development server on port 3000
+npm run build    # Production build
+npm run lint     # TypeScript type checking
 ```
 
 ### Running Tests
@@ -442,100 +632,100 @@ make test-backend
 make test-frontend
 ```
 
+### Database Migrations
+
+```bash
+# Generate migration
+alembic revision --autogenerate -m "description"
+
+# Apply migrations
+alembic upgrade head
+
+# Rollback
+alembic downgrade -1
+```
+
 ---
 
-## Development
-
-### Available Make Targets
-
-Run `make help` to see all available commands:
+## Project Structure
 
 ```
-make dev           # Start development environment
-make up            # Start production environment
-make down          # Stop all services
-make logs          # Show all logs
-make health        # Check service health
-make test          # Run all tests
-make db-shell      # Open Postgres shell
-make ingest-ue5    # Ingest UE5 documentation
-make shell-backend # Open backend container shell
+any-assistant/
+├── app/                          # FastAPI backend
+│   ├── api/v1/                   # API routes
+│   │   └── endpoints/            # Chat, health, ingestion, sessions, admin
+│   ├── core/                     # Config, logging, auth
+│   │   └── domains/              # Domain profiles (Godot 4, UE5)
+│   ├── db/                       # Database connections
+│   ├── schemas/                  # Pydantic models
+│   └── services/                 # Business logic
+│       ├── ai/                   # RAG, embeddings, ingestion
+│       │   └── ingestion/        # Domain-specific ingestion strategies
+│       └── db/                   # Database services
+├── frontend/                     # React SPA
+│   └── src/
+│       ├── components/           # UI components
+│       ├── services/             # API clients
+│       ├── store/                # Zustand state management
+│       ├── types/                # TypeScript types
+│       └── views/                # Page components
+├── config/                       # Service configurations (Qdrant, Redis)
+├── db/                           # Database initialization scripts
+│   └── init/                     # SQL migration scripts
+├── scripts/                      # Utility scripts
+├── docker-compose.yml            # Service orchestration
+├── Dockerfile                    # Backend container
+├── Makefile                      # Development commands
+└── requirements.txt              # Python dependencies
 ```
-
-### Project Structure
-
-```
-ue5-ai-assistant/
-├── app/                      # FastAPI backend
-│   ├── api/v1/endpoints/     # API route handlers
-│   ├── core/                 # Configuration, auth, logging
-│   ├── core/domains/         # Engine-specific domain configs
-│   ├── db/                   # Database models and connections
-│   ├── schemas/              # Pydantic request/response schemas
-│   ├── services/             # Business logic
-│   │   ├── ai/               # RAG, ingestion, embeddings
-│   │   └── db/               # Database services
-│   └── main.py               # FastAPI application entry point
-├── frontend/                 # React frontend
-│   ├── src/                  # React components and logic
-│   ├── public/               # Static assets
-│   └── package.json          # npm dependencies
-├── config/                   # Service configurations
-│   ├── qdrant/               # Qdrant config
-│   └── redis/                # Redis config
-├── db/                       # Database initialization
-│   └── init/                 # SQL migration scripts
-├── scripts/                  # Utility scripts
-├── docker-compose.yml        # Service orchestration
-├── Dockerfile                # Backend container
-├── Makefile                  # Development commands
-└── requirements.txt          # Python dependencies
-```
-
-### Adding a New Engine Domain
-
-The project supports extensible engine domains. To add a new engine:
-
-1. Create a domain config in `app/core/domains/`
-2. Register it in `app/core/domains/registry.py`
-3. Add ingestion strategies if needed in `app/services/ai/ingestion/`
 
 ---
 
 ## Roadmap
 
-### v0.3.0 (Planned)
+### v0.3.0 (In Progress)
 
-- [ ] Streaming chat responses in API
-- [ ] WebSocket support for real-time updates
+- [x] Streaming chat responses via SSE
 - [ ] Citation highlighting in frontend
-- [ ] Improved error messages and recovery
+- [ ] WebSocket support for real-time ingestion updates
+- [ ] Improved error messages and recovery flows
 
 ### v0.4.0 (Planned)
 
 - [ ] Multi-collection search
 - [ ] Advanced filtering UI
-- [ ] Export conversations
-- [ ] API key management
+- [ ] Export conversations (Markdown, JSON)
+- [ ] API key management UI
+- [ ] Conversation sharing
 
 ### v0.5.0 (Planned)
 
-- [ ] Godot 4 full support
 - [ ] Custom fine-tuned embeddings
 - [ ] Performance dashboard
-- [ ] Rate limiting
+- [ ] Query analytics and insights
+- [ ] Batch ingestion API
+- [ ] Additional domain profiles (Unity, Godot 3)
 
 ---
 
 ## Contributing
 
-Contributions are welcome! Please read our contributing guidelines before submitting PRs.
+Contributions are welcome! Please follow these guidelines:
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'feat: add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+3. Make your changes with tests
+4. Run the test suite (`make test`)
+5. Commit with conventional commits (`git commit -m 'feat: add amazing feature'`)
+6. Push to the branch (`git push origin feature/amazing-feature`)
+7. Open a Pull Request
+
+### Code Style
+
+- Backend: Follow PEP 8, use `ruff format`
+- Frontend: Follow TypeScript best practices, use Prettier
+- Write tests for new functionality
+- Update documentation for API changes
 
 ---
 
@@ -548,6 +738,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Acknowledgments
 
 - [Epic Games](https://www.epicgames.com/) for Unreal Engine 5 and the `.udn` documentation format
+- [Godot Engine](https://godotengine.org/) for the open-source game engine
 - [Qdrant](https://qdrant.tech/) for the excellent vector database
 - [LiteLLM](https://github.com/BerriAI/litellm) for simplifying LLM provider abstraction
 - [FlashRank](https://github.com/PrithivirajDamodaran/FlashRank) for efficient reranking
