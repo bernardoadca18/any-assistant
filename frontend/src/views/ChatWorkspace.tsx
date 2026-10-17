@@ -1,480 +1,147 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- *
- * ChatWorkspace — página principal de chat (Fase 2):
- * - Painel esquerdo: histórico de sessões (GET /v1/sessions, DELETE /v1/sessions/{id})
- * - Área central: mensagens com Markdown, blocos de código copiáveis,
- *   accordion de fontes citadas (retrieved_chunks) e streaming SSE
- * - Barra de input com Popover de parâmetros (modelo, top_k, project_source_filter)
- *
- * Estado de mensagens é local a esta view (sessão selecionada). Ao trocar
- * de sessão ou criar uma nova, o histórico é buscado via GET /v1/sessions/{id}.
- */
-
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import {
-  Bot,
-  Loader2,
-  MessageSquarePlus,
-  RefreshCw,
-  Send,
-  Square,
-  Trash2,
-  User as UserIcon,
-} from 'lucide-react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { ArrowDown, ArrowUp, BookOpen, Check, Copy, History, Loader2, MessageSquare, Plus, RefreshCw, Sparkles, Square, Trash2, X } from 'lucide-react';
 import { useAppStore } from '@/store/useAppStore';
 import * as sessionsService from '@/services/sessionsService';
 import { sendChatMessageStream, listModels } from '@/services/chatService';
 import { MarkdownMessage } from '@/components/chat/MarkdownMessage';
 import { SourcesPanel } from '@/components/chat/SourcesPanel';
 import { ChatSettingsPopover, type ChatSettings } from '@/components/chat/ChatSettingsPopover';
+import { Dialog } from '@/components/ui/Dialog';
 import type { MessageResponse, RetrievedChunk, SessionSummaryResponse, ModelInfo } from '@/types';
 
-interface UiMessage {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  status: 'success' | 'error' | 'pending' | 'streaming';
-  retrieved_chunks?: RetrievedChunk[];
-  model_used?: string | null;
-  created_at: string;
+interface UiMessage { id: string; role: 'user' | 'assistant'; content: string; status: 'success' | 'error' | 'pending' | 'streaming'; retrieved_chunks?: RetrievedChunk[]; model_used?: string | null; created_at: string; }
+const newId = () => crypto.randomUUID();
+function mapMessage(m: MessageResponse): UiMessage {
+  const chunks = (m.retrieved_chunks || []).map(chunk => ({ ...chunk,
+    doc_type: typeof chunk.doc_type === 'string' ? chunk.doc_type : chunk.doc_type?.code,
+    project_source: 'project_source' in chunk ? chunk.project_source : 'project' in chunk ? chunk.project?.code : undefined,
+  }));
+  return { ...m, role: m.role === 'assistant' ? 'assistant' : 'user', status: (m.status as UiMessage['status']) || 'success', retrieved_chunks: chunks };
 }
-
-function newLocalId(): string {
-  return `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+function CopyResponse({ content }: { content: string }) {
+  const [state, setState] = useState('');
+  return <button className="text-button copy-response" onClick={async () => { try { await navigator.clipboard.writeText(content); setState('Copiado'); } catch { setState('Não foi possível copiar'); } }} aria-label="Copiar resposta">{state === 'Copiado' ? <Check size={14} /> : <Copy size={14} />}<span aria-live="polite">{state || 'Copiar resposta'}</span></button>;
 }
-
-function generateSessionId(): string {
-  return `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function mapMessageResponse(m: MessageResponse): UiMessage {
-  return {
-    id: m.id,
-    role: m.role === 'assistant' ? 'assistant' : 'user',
-    content: m.content,
-    status: (m.status as UiMessage['status']) || 'success',
-    retrieved_chunks: (m.retrieved_chunks as RetrievedChunk[]) || [],
-    model_used: m.model_used,
-    created_at: m.created_at,
-  };
-}
-
-export const ChatWorkspace: React.FC = () => {
+export function ChatWorkspace() {
   const { activeDomainId } = useAppStore();
-
+  const domain = activeDomainId === 'ue5' ? 'Unreal Engine 5' : 'Godot 4';
   const [sessions, setSessions] = useState<SessionSummaryResponse[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(false);
-  const [activeSessionId, setActiveSessionId] = useState<string>(() => generateSessionId());
+  const [sessionsError, setSessionsError] = useState('');
+  const [activeSessionId, setActiveSessionId] = useState<string>(newId);
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(false);
-
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-
-  const [chatSettings, setChatSettings] = useState<ChatSettings>({
-    model: '',
-    top_k: 5,
-    project_source_filter: '',
-  });
-
-  const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+  const [notice, setNotice] = useState('');
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const [deleteId, setDeleteId] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [atBottom, setAtBottom] = useState(true);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const followRef = useRef(true);
+  const busyRef = useRef(false);
+  const controllerRef = useRef<AbortController | null>(null);
+  const selectionRef = useRef(0);
+  const mountedRef = useRef(true);
+  const [settings, setSettings] = useState<ChatSettings>({ model: '', top_k: 5, project_source_filter: '' });
+  const [models, setModels] = useState<ModelInfo[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
-
-  const isNewUnsavedSession = useMemo(
-    () => !sessions.some((s) => s.id === activeSessionId),
-    [sessions, activeSessionId]
-  );
-
-  const loadSessions = async () => {
-    setSessionsLoading(true);
-    try {
-      const list = await sessionsService.listSessions();
-      setSessions(list);
-    } catch {
-      // Falha silenciosa: histórico é conveniência, não bloqueia o chat
-      setSessions([]);
-    } finally {
-      setSessionsLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    loadSessions();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  const [modelsError, setModelsError] = useState('');
+  const loadSessions = useCallback(async () => {
+    setSessionsLoading(true); setSessionsError('');
+    try { const result = await sessionsService.listSessions(); if (mountedRef.current) setSessions(result); }
+    catch { if (mountedRef.current) setSessionsError('Não foi possível atualizar o histórico.'); }
+    finally { if (mountedRef.current) setSessionsLoading(false); }
   }, []);
-
-  // Fetch models on mount
-  useEffect(() => {
-    const fetchModels = async () => {
-      setModelsLoading(true);
-      try {
-        const models = await listModels();
-        setAvailableModels(models);
-        // Auto-select first model if none selected
-        if (models.length > 0) {
-          setChatSettings((prev) => {
-            if (!prev.model) {
-              return { ...prev, model: models[0].id };
-            }
-            return prev;
-          });
-        }
-      } catch (err) {
-        console.error('Failed to fetch models:', err);
-      } finally {
-        setModelsLoading(false);
-      }
-    };
-    fetchModels();
+  const loadModels = useCallback(async () => {
+    setModelsLoading(true); setModelsError('');
+    try { const result = await listModels(); if (!mountedRef.current) return; setModels(result); setSettings(s => ({ ...s, model: s.model || result[0]?.id || '' })); if (!result.length) setModelsError('Nenhum modelo disponível no serviço.'); }
+    catch { if (mountedRef.current) setModelsError('Não foi possível carregar os modelos. Verifique o acesso e os serviços.'); }
+    finally { if (mountedRef.current) setModelsLoading(false); }
   }, []);
-
-  useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-  }, [messages]);
-
-  const handleSelectSession = async (sessionId: string) => {
-    if (isStreaming) return;
-    setActiveSessionId(sessionId);
-    setMessagesLoading(true);
+  useEffect(() => { mountedRef.current = true; loadSessions(); loadModels(); return () => { mountedRef.current = false; selectionRef.current++; controllerRef.current?.abort(); }; }, [loadSessions, loadModels]);
+  useEffect(() => { if (followRef.current && scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages]);
+  useEffect(() => { const el = textareaRef.current; if (el) { el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight, 180)}px`; } }, [input]);
+  const newConversation = () => {
+    if (busyRef.current || messagesLoading) return;
+    selectionRef.current++; setActiveSessionId(newId()); setMessages([]); setNotice(''); setInput(''); setHistoryOpen(false); followRef.current = true; setAtBottom(true); textareaRef.current?.focus();
+  };
+  const selectSession = async (id: string) => {
+    if (busyRef.current) return;
+    const selection = ++selectionRef.current; setMessagesLoading(true); setNotice('');
     try {
-      const detail = await sessionsService.getSession(sessionId);
-      setMessages(detail.messages.map(mapMessageResponse));
-      if (detail.default_model) {
-        setChatSettings((s) => ({
-          ...s,
-          model: detail.default_model,
-          project_source_filter: detail.project_source_filter || '',
-        }));
+      const detail = await sessionsService.getSession(id);
+      if (selection !== selectionRef.current) return;
+      setActiveSessionId(id); setMessages(detail.messages.map(mapMessage)); setInput(''); setHistoryOpen(false); followRef.current = true;
+      setSettings(s => ({ ...s, model: detail.default_model || s.model, project_source_filter: detail.project_source_filter || '' }));
+    } catch { if (selection === selectionRef.current) setNotice('Não foi possível abrir a conversa. O conteúdo atual foi preservado. Tente novamente pelo histórico.'); }
+    finally { if (selection === selectionRef.current) setMessagesLoading(false); }
+  };
+  const removeSession = async () => {
+    if (!deleteId || deleting || busyRef.current) return;
+    setDeleting(true);
+    try { await sessionsService.deleteSession(deleteId); setSessions(list => list.filter(s => s.id !== deleteId)); if (deleteId === activeSessionId) newConversation(); setDeleteId(null); }
+    catch { setDeleteId(null); setNotice('Não foi possível excluir a conversa. Ela foi mantida no histórico.'); }
+    finally { setDeleting(false); }
+  };
+  const send = async () => {
+    const text = input.trim();
+    if (!text || busyRef.current || messagesLoading || !settings.model) return;
+    busyRef.current = true; setIsStreaming(true); setNotice(''); setInput(''); followRef.current = true; setAtBottom(true);
+    const assistantId = newId(); const created = new Date().toISOString();
+    setMessages(list => [...list, { id: newId(), role: 'user', content: text, status: 'success', created_at: created }, { id: assistantId, role: 'assistant', content: '', status: 'streaming', retrieved_chunks: [], created_at: created }]);
+    const controller = new AbortController(); controllerRef.current = controller;
+    let failed = false; let finished = false; let accumulated = '';
+    const update = (patch: Partial<UiMessage>) => { if (mountedRef.current) setMessages(list => list.map(m => m.id === assistantId ? { ...m, ...patch } : m)); };
+    const fail = () => { failed = true; update({ status: 'error' }); if (mountedRef.current) { setNotice('A resposta foi interrompida. O conteúdo recebido foi mantido e a pergunta voltou ao campo para você tentar novamente.'); setInput(current => current || text); } };
+    try {
+      await sendChatMessageStream({ session_id: activeSessionId, message: text, model: settings.model, top_k: settings.top_k, project_source_filter: settings.project_source_filter || null, domain_id: activeDomainId, stream: true }, {
+        onSources: chunks => update({ retrieved_chunks: chunks }),
+        onToken: token => { accumulated += token; update({ content: accumulated }); },
+        onDone: summary => { finished = true; update({ status: 'success', model_used: summary.model_used }); },
+        onError: () => fail(),
+      }, controller.signal);
+      if (!finished && !failed && !controller.signal.aborted) fail();
+    } catch { if (!failed && !controller.signal.aborted) fail(); }
+    finally {
+      if (controller.signal.aborted && mountedRef.current) {
+        update({ status: 'error' });
+        setNotice('Recebimento interrompido. O conteúdo foi mantido. O processamento pode continuar no servidor; interromper a leitura não cancela a geração.');
+        setInput(current => current || text);
       }
-    } catch {
-      setMessages([]);
-    } finally {
-      setMessagesLoading(false);
+      busyRef.current = false; controllerRef.current = null;
+      if (mountedRef.current) { setIsStreaming(false); loadSessions(); textareaRef.current?.focus(); }
     }
   };
-
-  const handleNewConversation = () => {
-    if (isStreaming) return;
-    setActiveSessionId(generateSessionId());
-    setMessages([]);
-  };
-
-  const handleDeleteSession = async (e: React.MouseEvent, sessionId: string) => {
-    e.stopPropagation();
-    try {
-      await sessionsService.deleteSession(sessionId);
-      setSessions((prev) => prev.filter((s) => s.id !== sessionId));
-      if (activeSessionId === sessionId) {
-        handleNewConversation();
-      }
-    } catch {
-      // Mantém a sessão na lista se a remoção falhar no backend
-    }
-  };
-
-  const handleStop = () => {
-    abortControllerRef.current?.abort();
-    setIsStreaming(false);
-  };
-
-  const handleSend = async () => {
-    const trimmed = input.trim();
-    if (!trimmed || isStreaming) return;
-
-    // Validate model is selected
-    if (!chatSettings.model) {
-      alert('Selecione um modelo antes de enviar a mensagem.');
-      return;
-    }
-
-    const userMessage: UiMessage = {
-      id: newLocalId(),
-      role: 'user',
-      content: trimmed,
-      status: 'success',
-      created_at: new Date().toISOString(),
-    };
-
-    const assistantId = newLocalId();
-    const assistantPlaceholder: UiMessage = {
-      id: assistantId,
-      role: 'assistant',
-      content: '',
-      status: 'streaming',
-      retrieved_chunks: [],
-      created_at: new Date().toISOString(),
-    };
-
-    setMessages((prev) => [...prev, userMessage, assistantPlaceholder]);
-    setInput('');
-    setIsStreaming(true);
-
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
-
-    let accumulated = '';
-
-    try {
-      await sendChatMessageStream(
-        {
-          session_id: activeSessionId,
-          message: trimmed,
-          model: chatSettings.model,
-          top_k: chatSettings.top_k,
-          project_source_filter: chatSettings.project_source_filter || null,
-          domain_id: activeDomainId,
-          stream: true,
-        },
-        {
-          onSources: (chunks) => {
-            setMessages((prev) =>
-              prev.map((m) => (m.id === assistantId ? { ...m, retrieved_chunks: chunks } : m))
-            );
-          },
-          onToken: (token) => {
-            accumulated += token;
-            setMessages((prev) =>
-              prev.map((m) => (m.id === assistantId ? { ...m, content: accumulated } : m))
-            );
-          },
-          onDone: (summary) => {
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === assistantId
-                  ? { ...m, status: 'success', model_used: summary.model_used }
-                  : m
-              )
-            );
-          },
-          onError: (detail) => {
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === assistantId
-                  ? { ...m, status: 'error', content: m.content || `Erro: ${detail}` }
-                  : m
-              )
-            );
-          },
-        },
-        controller.signal
-      );
-    } catch {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantId && m.status === 'streaming'
-            ? { ...m, status: 'error', content: m.content || 'Falha na conexão com o assistente.' }
-            : m
-        )
-      );
-    } finally {
-      setIsStreaming(false);
-      abortControllerRef.current = null;
-      loadSessions();
-    }
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-  };
-
-  return (
-    <div className="flex w-full h-full overflow-hidden">
-      {/* =========================== SESSIONS PANEL =========================== */}
-      <aside className="w-64 shrink-0 border-r border-[#1F1F22] bg-[#0B0B0D] flex flex-col overflow-hidden">
-        <div className="p-3 border-b border-[#1F1F22]">
-          <button
-            type="button"
-            onClick={handleNewConversation}
-            className="w-full flex items-center justify-center gap-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium py-2 transition-colors"
-          >
-            <MessageSquarePlus className="w-4 h-4" />
-            Nova Conversa
-          </button>
-        </div>
-
-        <div className="flex items-center justify-between px-3 py-2">
-          <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-600">
-            Sessões
-          </span>
-          <button
-            type="button"
-            onClick={loadSessions}
-            className="text-zinc-600 hover:text-zinc-300 transition-colors"
-            title="Atualizar lista"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${sessionsLoading ? 'animate-spin' : ''}`} />
-          </button>
-        </div>
-
-        <div className="flex-1 overflow-y-auto px-2 pb-3 space-y-1">
-          {isNewUnsavedSession && (
-            <div className="flex items-center gap-2 px-2.5 py-2 rounded-lg bg-indigo-600/15 text-indigo-300 text-xs">
-              <MessageSquarePlus className="w-3.5 h-3.5 shrink-0" />
-              <span className="truncate">Nova conversa (ainda não salva)</span>
-            </div>
-          )}
-
-          {sessions.length === 0 && !sessionsLoading && !isNewUnsavedSession && (
-            <div className="px-2.5 py-4 text-center text-xs text-zinc-600">
-              Nenhuma sessão encontrada.
-            </div>
-          )}
-
-          {sessions.map((session) => {
-            const active = session.id === activeSessionId;
-            return (
-              <button
-                key={session.id}
-                type="button"
-                onClick={() => handleSelectSession(session.id)}
-                className={`w-full group flex items-start gap-2 px-2.5 py-2 rounded-lg text-left transition-colors ${
-                  active ? 'bg-[#1C1C1F] text-zinc-100' : 'text-zinc-400 hover:bg-[#141416] hover:text-zinc-200'
-                }`}
-              >
-                <div className="flex-1 min-w-0">
-                  <div className="text-xs font-medium truncate">{session.title || 'Sem título'}</div>
-                  <div className="text-[10px] text-zinc-600 truncate mt-0.5">
-                    {session.default_model}
-                  </div>
-                </div>
-                <span
-                  role="button"
-                  onClick={(e) => handleDeleteSession(e, session.id)}
-                  className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-rose-400 transition-all shrink-0 p-0.5"
-                  title="Excluir sessão"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      </aside>
-
-      {/* =========================== CHAT AREA =========================== */}
-      <div className="flex-1 flex flex-col min-w-0">
-        <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 md:px-8 py-6">
-          {messagesLoading ? (
-            <div className="h-full flex items-center justify-center text-zinc-600 text-sm gap-2">
-              <Loader2 className="w-4 h-4 animate-spin" />
-              Carregando histórico...
-            </div>
-          ) : messages.length === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center text-center gap-3">
-              <div className="w-12 h-12 rounded-2xl bg-indigo-600/15 flex items-center justify-center">
-                <Bot className="w-6 h-6 text-indigo-400" />
-              </div>
-              <div>
-                <p className="text-sm font-medium text-zinc-300">Comece uma conversa</p>
-                <p className="text-xs text-zinc-600 mt-1">
-                  Pergunte algo sobre {activeDomainId === 'ue5' ? 'Unreal Engine 5' : 'Godot 4.x'}.
-                </p>
-              </div>
-            </div>
-          ) : (
-            <div className="max-w-3xl mx-auto space-y-6">
-              {messages.map((msg) => (
-                <div key={msg.id} className="flex gap-3">
-                  <div
-                    className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 mt-0.5 ${
-                      msg.role === 'user' ? 'bg-[#27272A]' : 'bg-indigo-600/20'
-                    }`}
-                  >
-                    {msg.role === 'user' ? (
-                      <UserIcon className="w-3.5 h-3.5 text-zinc-300" />
-                    ) : (
-                      <Bot className="w-3.5 h-3.5 text-indigo-400" />
-                    )}
-                  </div>
-
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className="text-xs font-semibold text-zinc-200">
-                        {msg.role === 'user' ? 'Você' : 'Assistente'}
-                      </span>
-                      {msg.model_used && (
-                        <span className="text-[10px] font-mono text-zinc-600">{msg.model_used}</span>
-                      )}
-                      {msg.status === 'streaming' && (
-                        <span className="flex items-center gap-1 text-[10px] text-indigo-400">
-                          <Loader2 className="w-2.5 h-2.5 animate-spin" />
-                          digitando...
-                        </span>
-                      )}
-                      {msg.status === 'error' && (
-                        <span className="text-[10px] text-rose-400">erro</span>
-                      )}
-                    </div>
-
-                    {msg.role === 'assistant' ? (
-                      <>
-                        <MarkdownMessage content={msg.content || (msg.status === 'streaming' ? '▍' : '')} />
-                        {msg.status !== 'streaming' && msg.retrieved_chunks && msg.retrieved_chunks.length > 0 && (
-                          <SourcesPanel chunks={msg.retrieved_chunks} />
-                        )}
-                      </>
-                    ) : (
-                      <p className="text-sm leading-relaxed text-zinc-200 whitespace-pre-wrap">
-                        {msg.content}
-                      </p>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* =========================== INPUT BAR =========================== */}
-        <div className="border-t border-[#1F1F22] bg-[#0B0B0D] p-4">
-          <div className="max-w-3xl mx-auto">
-            <div className="flex items-end gap-2 bg-[#141416] border border-[#27272A] rounded-xl p-2 focus-within:border-indigo-500 transition-colors">
-              <textarea
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Pergunte sobre Blueprints, GDScript, C++, arquitetura de gameplay..."
-                rows={1}
-                className="flex-1 bg-transparent resize-none outline-none text-sm text-zinc-200 placeholder:text-zinc-600 max-h-40 py-1.5 px-2"
-                style={{ minHeight: '2.25rem' }}
-              />
-
-              <ChatSettingsPopover settings={chatSettings} onChange={setChatSettings} />
-
-              {isStreaming ? (
-                <button
-                  type="button"
-                  onClick={handleStop}
-                  className="flex items-center justify-center w-9 h-9 rounded-lg bg-rose-600 hover:bg-rose-500 text-white transition-colors shrink-0"
-                  title="Parar geração"
-                >
-                  <Square className="w-3.5 h-3.5" />
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={handleSend}
-                  disabled={!input.trim()}
-                  className="flex items-center justify-center w-9 h-9 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:bg-[#27272A] disabled:text-zinc-600 text-white transition-colors shrink-0"
-                  title="Enviar mensagem"
-                >
-                  <Send className="w-3.5 h-3.5" />
-                </button>
-              )}
-            </div>
-            <p className="text-[10px] text-zinc-700 mt-1.5 text-center">
-              top_k={chatSettings.top_k} · modelo={chatSettings.model} · domínio={activeDomainId}
-            </p>
-          </div>
-        </div>
+  const history = <div className="history-content"><div className="history-heading"><h2>Suas conversas</h2><button className="icon-button" onClick={loadSessions} disabled={sessionsLoading} aria-label="Atualizar histórico"><RefreshCw size={15} className={sessionsLoading ? 'animate-spin' : ''} /></button></div>
+    <button className="new-conversation" disabled={isStreaming || messagesLoading} onClick={newConversation}><Plus size={17} />Nova conversa</button>
+    {sessions.length > 0 && <input className="history-search" aria-label="Buscar conversas" placeholder="Buscar no histórico…" value={search} onChange={e => setSearch(e.target.value)} />}
+    {sessionsError && <p role="status" className="history-error">{sessionsError} Use o botão de atualizar para tentar novamente.</p>}
+    <div className="session-list" aria-busy={sessionsLoading}>{!sessions.length && !sessionsLoading && !sessionsError && <div className="history-empty"><MessageSquare size={22} /><p>Seu conhecimento,<br />uma conversa de cada vez.</p><small>As conversas salvas aparecerão aqui.</small></div>}
+      {sessionsLoading && !sessions.length && <p className="muted">Carregando conversas…</p>}
+      {sessions.filter(s => (s.title || 'Sem título').toLocaleLowerCase().includes(search.toLocaleLowerCase())).map(s => <div className={`session-row ${s.id === activeSessionId ? 'selected' : ''}`} key={s.id}><button className="session-select" disabled={isStreaming || messagesLoading} aria-current={s.id === activeSessionId ? 'true' : undefined} onClick={() => selectSession(s.id)}><MessageSquare size={14} /><span>{s.title || 'Sem título'}</span></button><button className="icon-button delete-session" disabled={isStreaming || messagesLoading} onClick={() => setDeleteId(s.id)} aria-label={`Excluir conversa ${s.title || 'Sem título'}`}><Trash2 size={14} /></button></div>)}
+      {sessions.length > 0 && !sessions.some(s => (s.title || 'Sem título').toLocaleLowerCase().includes(search.toLocaleLowerCase())) && <p className="muted">Nenhuma conversa corresponde à busca.</p>}
+    </div><div className="history-context"><BookOpen size={16} /><div>Contexto ativo<strong>{domain}</strong></div></div></div>;
+  return <div className="chat-workspace">
+    <aside className="conversation-sidebar">{history}</aside>
+    <Dialog open={historyOpen} onClose={() => setHistoryOpen(false)} title="Histórico de conversas" className="history-dialog"><button className="icon-button close-nav" onClick={() => setHistoryOpen(false)} aria-label="Fechar histórico"><X size={20} /></button>{history}</Dialog>
+    <Dialog open={!!deleteId} onClose={() => { if (!deleting) setDeleteId(null); }} title="Excluir conversa"><div className="dialog-heading"><h2>Excluir esta conversa?</h2></div><p className="dialog-description">O histórico desta conversa será removido permanentemente. Esta ação não pode ser desfeita.</p><div className="dialog-actions"><button className="text-button" disabled={deleting} onClick={() => setDeleteId(null)}>Cancelar</button><button className="danger-button" disabled={deleting} onClick={removeSession}>{deleting ? 'Excluindo…' : 'Excluir conversa'}</button></div></Dialog>
+    <section className="conversation-main" aria-label="Conversa com o assistente">
+      <div className="conversation-toolbar"><div><span className="context-dot" />{domain}<span className="toolbar-separator">/</span><span className="conversation-title">{sessions.find(s => s.id === activeSessionId)?.title || 'Nova conversa'}</span></div><button className="text-button mobile-history" onClick={() => setHistoryOpen(true)}><History size={17} /><span>Histórico</span></button></div>
+      <div ref={scrollRef} className="message-scroll" onScroll={() => { const el = scrollRef.current; if (el) { const near = el.scrollHeight - el.scrollTop - el.clientHeight < 90; followRef.current = near; setAtBottom(near); } }}>
+        {messagesLoading && <div className="loading-history" role="status"><Loader2 size={17} className="animate-spin" />Abrindo conversa…</div>}
+        {!messages.length ? <div className="chat-welcome"><div className="welcome-symbol"><Sparkles size={31} /></div><p className="eyebrow">CONVERSE. EXPLORE. CONSTRUA.</p><h1>Da pergunta ao<br /><span>próximo passo.</span></h1><p className="welcome-description">Explore {domain} com o apoio da sua base de conhecimento. Consulte os trechos recuperados e confira o contexto de cada resposta.</p><div className="suggestions">{[`Como organizar um projeto em ${domain}?`, `Explique o ciclo de vida de ${activeDomainId === 'ue5' ? 'um Actor' : 'um nó'}.`, 'Como investigar um problema de desempenho?'].map((prompt, i) => <button key={prompt} onClick={() => { setInput(prompt); textareaRef.current?.focus(); }}><span className="suggestion-index">0{i + 1}</span><span>{prompt}</span><ArrowUp size={16} /></button>)}</div><p className="welcome-note"><BookOpen size={14} />A qualidade da resposta depende dos documentos e do modelo disponíveis.</p></div> : <div className="message-list">{messages.map(msg => <article key={msg.id} className={`message message-${msg.role}`}><div className="message-avatar">{msg.role === 'assistant' ? <Sparkles size={17} /> : 'V'}</div><div className="message-body"><div className="message-heading"><strong>{msg.role === 'assistant' ? 'Any Assistant' : 'Você'}</strong>{msg.status === 'streaming' && <span className="generating"><Loader2 size={12} className="animate-spin" />Respondendo</span>}{msg.status === 'error' && <span className="message-error">Resposta interrompida</span>}</div>{msg.role === 'user' ? <p className="user-text">{msg.content}</p> : <><MarkdownMessage content={msg.content} />{!msg.content && msg.status === 'streaming' && <p className="thinking">Consultando o contexto e preparando a resposta…</p>}{msg.status !== 'streaming' && <><SourcesPanel chunks={msg.retrieved_chunks || []} /><div className="response-footer">{msg.content && <CopyResponse content={msg.content} />}{msg.model_used && <span className="response-model">{msg.model_used}</span>}</div></>}</>}</div></article>)}</div>}
       </div>
-    </div>
-  );
-};
+      {!atBottom && messages.length > 0 && <button className="jump-to-bottom" onClick={() => { followRef.current = true; setAtBottom(true); scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }); }}><ArrowDown size={15} />Ir para o final</button>}
+      <div className="composer-area">{notice && <div className="inline-error chat-notice" role="alert">{notice}<button className="icon-button" aria-label="Dispensar aviso" onClick={() => setNotice('')}><X size={15} /></button></div>}
+        {modelsError && <div className="model-warning" role="status">{modelsError}<button className="text-button" onClick={loadModels} disabled={modelsLoading}>Tentar novamente</button></div>}
+        <div className="composer"><label htmlFor="chat-input" className="sr-only">Sua mensagem</label><textarea id="chat-input" ref={textareaRef} rows={2} value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); } }} placeholder={`O que você quer explorar em ${domain}?`} />
+          <div className="composer-controls"><div className="composer-model" title={settings.model || 'Nenhum modelo disponível'}><span className="context-dot" />{modelsLoading ? 'Carregando modelos…' : settings.model || 'Modelo indisponível'}</div><ChatSettingsPopover settings={settings} onChange={setSettings} models={models} loading={modelsLoading} error={modelsError} onRetry={loadModels} disabled={isStreaming} />{isStreaming ? <button className="send-button" onClick={() => controllerRef.current?.abort()} aria-label="Interromper recebimento" title="Interromper leitura da resposta. O processamento pode continuar no servidor."><Square size={15} /></button> : <button className="send-button" disabled={!input.trim() || messagesLoading || !settings.model} onClick={send} aria-label="Enviar mensagem" title={!settings.model ? 'Configure um modelo disponível' : 'Enviar mensagem'}><ArrowUp size={20} /></button>}</div>
+        </div><div className="composer-caption"><span>IA pode cometer erros. Confira as fontes.</span><span>Enter para enviar <span>·</span> Shift + Enter para nova linha</span></div><span className="sr-only" role="status">{isStreaming ? 'Resposta em andamento' : messages.length ? 'Pronto para sua próxima mensagem' : ''}</span>
+      </div>
+    </section>
+  </div>;
+}

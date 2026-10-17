@@ -29,7 +29,9 @@ interface TextBlock {
   content: string;
 }
 
-type Block = CodeBlock | TextBlock;
+interface TableBlock { type: 'table'; headers: string[]; rows: string[][]; }
+type Block = CodeBlock | TextBlock | TableBlock;
+const tableCells = (line: string) => line.trim().replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/).map(cell => cell.trim().replace(/\\\|/g, '|'));
 
 function parseBlocks(markdown: string): Block[] {
   const lines = markdown.replace(/\r\n/g, '\n').split('\n');
@@ -47,6 +49,16 @@ function parseBlocks(markdown: string): Block[] {
 
   while (i < lines.length) {
     const line = lines[i];
+
+    if (line.includes('|') && i + 1 < lines.length && tableCells(lines[i + 1]).every(cell => /^:?-{3,}:?$/.test(cell))) {
+      flushParagraph();
+      const headers = tableCells(line);
+      const rows: string[][] = [];
+      i += 2;
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) { rows.push(tableCells(lines[i])); i++; }
+      blocks.push({ type: 'table', headers, rows });
+      continue;
+    }
 
     // Fenced code block ```lang ... ```
     const fenceMatch = line.match(/^```(\w*)\s*$/);
@@ -114,7 +126,7 @@ function parseBlocks(markdown: string): Block[] {
 /** Renderiza negrito, itálico e código inline dentro de um texto simples. */
 function renderInlineMarkdown(text: string, keyPrefix: string): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
-  const regex = /(\*\*(.+?)\*\*|`([^`]+?)`|\*(.+?)\*)/g;
+  const regex = /(\*\*(.+?)\*\*|`([^`]+?)`|\*(.+?)\*|\[([^\]]+)\]\(([^\s)]+)\))/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   let idx = 0;
@@ -144,6 +156,10 @@ function renderInlineMarkdown(text: string, keyPrefix: string): React.ReactNode[
           {match[4]}
         </em>
       );
+    } else if (match[5] !== undefined) {
+      const href = match[6];
+      const safe = /^https?:\/\//i.test(href);
+      nodes.push(safe ? <a key={`${keyPrefix}-a-${idx}`} href={href} target="_blank" rel="noopener noreferrer">{match[5]}</a> : match[5]);
     }
     lastIndex = regex.lastIndex;
     idx += 1;
@@ -156,14 +172,16 @@ function renderInlineMarkdown(text: string, keyPrefix: string): React.ReactNode[
 
 const CopyableCodeBlock: React.FC<{ language: string; content: string }> = ({ language, content }) => {
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
 
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(content);
       setCopied(true);
+      setCopyError(false);
       setTimeout(() => setCopied(false), 1600);
     } catch {
-      // Clipboard indisponível (ex: contexto não seguro) — falha silenciosa
+      setCopyError(true);
     }
   };
 
@@ -184,7 +202,7 @@ const CopyableCodeBlock: React.FC<{ language: string; content: string }> = ({ la
           ) : (
             <>
               <Copy className="w-3 h-3" />
-              <span>Copiar código</span>
+              <span role="status">{copyError ? 'Não foi possível copiar' : 'Copiar código'}</span>
             </>
           )}
         </button>
@@ -224,6 +242,11 @@ export const MarkdownMessage: React.FC<MarkdownMessageProps> = ({ content, class
   };
 
   blocks.forEach((block, i) => {
+    if (block.type === 'table') {
+      flushList(`list-${i}`);
+      rendered.push(<div key={`table-${i}`} className="markdown-table" role="region" aria-label="Tabela da resposta" tabIndex={0}><table><thead><tr>{block.headers.map((cell, j) => <th key={j} scope="col">{renderInlineMarkdown(cell, `th-${i}-${j}`)}</th>)}</tr></thead><tbody>{block.rows.map((row, j) => <tr key={j}>{block.headers.map((_, k) => <td key={k}>{renderInlineMarkdown(row[k] || '', `td-${i}-${j}-${k}`)}</td>)}</tr>)}</tbody></table></div>);
+      return;
+    }
     if (block.type === 'code') {
       flushList(`list-${i}`);
       rendered.push(<CopyableCodeBlock key={`code-${i}`} language={block.language} content={block.content} />);
@@ -267,5 +290,5 @@ export const MarkdownMessage: React.FC<MarkdownMessageProps> = ({ content, class
   });
   flushList('list-end');
 
-  return <div className={className}>{rendered}</div>;
+  return <div className={`markdown-message ${className}`}>{rendered}</div>;
 };

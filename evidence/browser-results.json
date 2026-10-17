@@ -1,0 +1,34 @@
+{
+  "status": "PASS",
+  "backend": "SKIP: localhost:8000 unavailable; all /v1 routes intercepted",
+  "screenshots": [
+    "before-desktop.png",
+    "before-mobile.png",
+    "desktop-chat.png",
+    "desktop-empty.png",
+    "desktop-sources.png",
+    "mobile-chat.png",
+    "mobile-empty.png",
+    "mobile-offline.png",
+    "mobile-settings.png",
+    "mobile-sources.png"
+  ],
+  "flows": [
+    "empty state",
+    "history search/list/load",
+    "preserve draft across navigation",
+    "preserve current conversation on history errors",
+    "delete confirmation Escape and delete",
+    "SSE sources/token/done",
+    "duplicate prevention",
+    "Shift+Enter and Enter",
+    "HTTP/network and partial stream failures",
+    "copy response/code",
+    "source original and summary",
+    "model settings apply/cancel and focus return",
+    "mobile drawers/Escape/no overflow",
+    "offline models disable send"
+  ],
+  "requests": 6,
+  "runtimeErrors": []
+}

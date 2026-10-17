@@ -102,7 +102,7 @@ export const AuthView: React.FC = () => {
               <span className="text-sm font-medium text-emerald-300">Autenticado</span>
             </div>
             <p className="text-xs text-emerald-200">
-              Logado como <strong>{user.username || 'API Key User'}</strong> no tenant <strong>{activeTenant}</strong>
+              Acesso como <strong>{user.name || 'Usuário de API'}</strong> na organização <strong>{activeTenant}</strong>
             </p>
           </div>
         )}

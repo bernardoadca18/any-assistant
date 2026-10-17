@@ -8,7 +8,7 @@
  * Fase 1 pelo App.tsx original com activeTab).
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useMemo } from 'react';
 import { AppLayout, type AppView } from '@/components/layout/AppLayout';
 import { ChatWorkspace } from '@/views/ChatWorkspace';
 import { FolderIngestionView } from '@/views/FolderIngestionView';
@@ -22,13 +22,17 @@ import { AuthView } from '@/views/AuthView';
 import { useAppStore } from '@/store/useAppStore';
 
 export default function App() {
-  const [activeView, setActiveView] = useState<AppView>('auth');
-  const { isAuthenticated } = useAppStore();
+  const [activeView, setActiveView] = useState<AppView>('chat');
+  const { activeTenant, activeDomainId, token } = useAppStore();
+  // Clear in-memory chat when credentials change without placing credentials in React keys.
+  const credentialContext = useMemo(() => crypto.randomUUID(), [token]);
 
   return (
     <>
       <AppLayout activeView={activeView} onChangeView={setActiveView}>
-        {activeView === 'chat' && <ChatWorkspace />}
+        <div className={activeView === 'chat' ? 'chat-view-container' : 'hidden'}>
+          <ChatWorkspace key={`${activeTenant}:${activeDomainId}:${credentialContext}`} />
+        </div>
         {activeView === 'ingestion' && <FolderIngestionView />}
         {activeView === 'jobs' && <IngestionJobsView />}
         {activeView === 'tenants' && <TenantManagerView />}

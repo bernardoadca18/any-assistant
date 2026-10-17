@@ -69,10 +69,7 @@ export async function sendChatMessageStream(
           ? errorJson.detail
           : JSON.stringify(errorJson.detail);
       }
-    } catch {
-      const errorText = await response.text();
-      if (errorText) errorMessage = errorText;
-    }
+    } catch { /* Keep HTTP status when the error body is not JSON. */ }
     callbacks.onError?.(errorMessage);
     throw new Error(errorMessage);
   }
@@ -129,7 +126,8 @@ export async function sendChatMessageStream(
               break;
           }
         } catch (parseError) {
-          console.warn('Erro ao decodificar evento SSE no chat:', parseError, jsonStr);
+          // Do not log payloads: they can contain private document excerpts.
+          throw new Error('O serviço retornou um evento de resposta inválido.');
         }
       }
     }
